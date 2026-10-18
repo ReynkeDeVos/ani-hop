@@ -12,7 +12,7 @@ use std::fs;
 use std::io::{BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -369,8 +369,41 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
 }
 
 /// Streams one episode with ani-skip; blocks until mpv is closed.
-pub fn stream(src: &Source, ep: &str) -> Result<(), String> {
-    let res = ani_cli()
+/// Feeds the child's output lines to `line` (also the ones redrawn with \r) until it
+/// exits; returns whether it succeeded and what it wrote to stderr.
+fn follow(mut child: Child, mut line: impl FnMut(&str)) -> (bool, Vec<u8>) {
+    let mut stderr = child.stderr.take().unwrap();
+    let err_reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf
+    });
+    let mut buf = Vec::new();
+    for b in BufReader::new(child.stdout.take().unwrap())
+        .bytes()
+        .map_while(Result::ok)
+    {
+        if b != b'\r' && b != b'\n' {
+            buf.push(b);
+            continue;
+        }
+        line(String::from_utf8_lossy(&buf).trim());
+        buf.clear();
+    }
+    let ok = child.wait().is_ok_and(|s| s.success());
+    (ok, err_reader.join().unwrap_or_default())
+}
+
+/// mpv prints "VO: [gpu-next] 1920x1080 ..." once its window opens.
+fn player_up(line: &str, up: &mut impl FnMut()) {
+    if line.starts_with("VO:") {
+        up();
+    }
+}
+
+/// Streams through ani-cli (with ani-skip); `up` is called once mpv shows the episode.
+pub fn stream(src: &Source, ep: &str, mut up: impl FnMut()) -> Result<(), String> {
+    let child = ani_cli()
         .args([
             "--skip",
             "--exit-after-play",
@@ -380,16 +413,17 @@ pub fn stream(src: &Source, ep: &str) -> Result<(), String> {
             ep,
             &src.query,
         ])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("ani-cli: {e}"))?;
-    if res.status.success() {
-        Ok(())
-    } else {
-        Err(last_error(&res.stderr))
+    match follow(child, |l| player_up(l, &mut up)) {
+        (true, _) => Ok(()),
+        (false, stderr) => Err(last_error(&stderr)),
     }
 }
 
-pub fn play_file(m: &Media, ep: &str, file: &Path) -> Result<(), String> {
+pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Result<(), String> {
     let mut mpv = Command::new("mpv");
     mpv.arg(format!("--force-media-title={} Episode {ep}", m.name()));
     let vtt = file.with_extension("vtt");
@@ -405,16 +439,16 @@ pub fn play_file(m: &Media, ep: &str, file: &Path) -> Result<(), String> {
             mpv.args(String::from_utf8_lossy(&o.stdout).split_whitespace());
         }
     }
-    let res = mpv
+    let child = mpv
         .arg(file)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output();
-    match res {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(last_error(&o.stderr)),
-        Err(e) => Err(format!("mpv: {e}")),
+        .spawn()
+        .map_err(|e| format!("mpv: {e}"))?;
+    match follow(child, |l| player_up(l, &mut up)) {
+        (true, _) => Ok(()),
+        (false, stderr) => Err(last_error(&stderr)),
     }
 }
 
@@ -471,12 +505,41 @@ pub fn ep_num(ep: &str) -> f64 {
 pub fn delete_episode(file: &Path) -> std::io::Result<()> {
     let _ = fs::remove_file(file.with_extension("vtt"));
     fs::remove_file(file)?;
-    // drop the show folder once only our metadata is left
-    let dir = file.parent().unwrap();
-    if local_episodes(dir).is_empty() && fs::read_dir(dir)?.count() <= 1 {
-        fs::remove_dir_all(dir)?;
+    drop_if_empty(file.parent().unwrap())
+}
+
+/// Drops a show folder of ours once only its metadata is left. A folder without it may be
+/// the user's own with the same name.
+fn drop_if_empty(dir: &Path) -> std::io::Result<()> {
+    let meta = dir.join(".media.json");
+    if meta.is_file() && fs::read_dir(dir)?.count() == 1 {
+        fs::remove_file(meta)?;
+        fs::remove_dir(dir)?;
     }
     Ok(())
+}
+
+/// Deletes what unfinished downloads of `eps` left in a show folder (yt-dlp's .part
+/// files, subtitles), and the folder if that was all it held.
+pub fn discard(dir: &Path, eps: &[String]) {
+    if !dir.join(".media.json").is_file() {
+        return; // not a folder ani-hop made
+    }
+    let done: Vec<String> = local_episodes(dir).into_iter().map(|(e, _)| e).collect();
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for p in rd.flatten().map(|e| e.path()) {
+        let name = p.file_name().unwrap_or_default().to_string_lossy();
+        let partial = eps.iter().filter(|ep| !done.contains(ep)).any(|ep| {
+            name.contains(&format!(" Episode {ep}.mp4."))
+                || name.ends_with(&format!(" Episode {ep}.vtt"))
+        });
+        if partial {
+            let _ = fs::remove_file(&p);
+        }
+    }
+    let _ = drop_if_empty(dir);
 }
 
 /// Downloads one episode, calling `progress` with yt-dlp's status lines.
@@ -490,7 +553,7 @@ pub fn download(
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     fs::write(dir.join(".media.json"), serde_json::to_vec(m).unwrap())
         .map_err(|e| e.to_string())?;
-    let mut child = {
+    let child = {
         let mut dl = DOWNLOAD.lock().unwrap();
         if dl.0 {
             return Err("stopped".into());
@@ -506,33 +569,12 @@ pub fn download(
         dl.1 = Some(child.id());
         child
     };
-    let mut stderr = child.stderr.take().unwrap();
-    let err_reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr.read_to_end(&mut buf);
-        buf
-    });
-    // yt-dlp redraws its progress line with \r (or ends lines with \n under --newline)
-    let mut line = Vec::new();
-    for b in BufReader::new(child.stdout.take().unwrap())
-        .bytes()
-        .map_while(Result::ok)
-    {
-        if b != b'\r' && b != b'\n' {
-            line.push(b);
-            continue;
-        }
-        if let Some(rest) = String::from_utf8_lossy(&line)
-            .trim()
-            .strip_prefix("[download]")
-        {
+    let (_, stderr) = follow(child, |l| {
+        if let Some(rest) = l.strip_prefix("[download]") {
             progress(rest.trim());
         }
-        line.clear();
-    }
-    let _ = child.wait();
+    });
     DOWNLOAD.lock().unwrap().1 = None;
-    let stderr = err_reader.join().unwrap_or_default();
     // ani-cli exits 0 even if yt-dlp failed, so the file is the only reliable signal
     if local_episodes(&dir).iter().any(|(e, _)| e == ep) {
         Ok(())
@@ -547,10 +589,22 @@ pub fn stop_download() {
     let mut dl = DOWNLOAD.lock().unwrap();
     dl.0 = true;
     if let Some(pid) = dl.1.take().map(|p| p.to_string()) {
-        // yt-dlp doesn't die with the ani-cli shell, so take its children first
-        let _ = Command::new("pkill").args(["-TERM", "-P", &pid]).status();
+        // The ani-cli shell first: it holds the signal until yt-dlp is gone and then exits.
+        // Signalled after yt-dlp, it falls back to ffmpeg, which writes a partial .mp4 that
+        // looks finished and keeps downloading after we quit.
         let _ = Command::new("kill").args(["-TERM", &pid]).status();
+        let _ = Command::new("pkill").args(["-TERM", "-P", &pid]).status();
     }
+}
+
+/// Whether downloads were stopped by quitting, so a failed one was cut short, not broken.
+pub fn stopped() -> bool {
+    DOWNLOAD.lock().unwrap().0
+}
+
+/// Whether `pid` is a running ani-hop (pids get reused, so the name has to match too).
+pub fn running(pid: &str) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim_end() == "ani-hop")
 }
 
 #[cfg(test)]
@@ -635,6 +689,45 @@ mod tests {
         assert_eq!(videos_dir(disabled, home), Path::new("/home/a/Videos"));
         let unquoted = "XDG_VIDEOS_DIR=$HOME/Clips";
         assert_eq!(videos_dir(unquoted, home), Path::new("/home/a/Videos"));
+    }
+
+    #[test]
+    fn discards_only_unfinished_leftovers() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-discard-{}", std::process::id()));
+        let files = [
+            ".media.json",
+            "Show Episode 1.mp4",
+            "Show Episode 1.vtt",
+            "Show Episode 2.mp4.part-Frag7",
+            "Show Episode 2.mp4.ytdl",
+            "Show Episode 2.vtt",
+            "Show Episode 12.mp4.part",
+        ];
+        fs::create_dir_all(&dir).unwrap();
+        files
+            .iter()
+            .for_each(|f| fs::write(dir.join(f), "").unwrap());
+        discard(&dir, &["1".into(), "2".into()]);
+        let mut left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, [files[0], files[1], files[2], files[6]]);
+        // nothing finished and nothing else left: the folder goes
+        fs::remove_file(dir.join(files[1])).unwrap();
+        discard(&dir, &["12".into()]);
+        assert!(dir.exists(), "episode 1's subtitles are still there");
+        fs::remove_file(dir.join(files[2])).unwrap();
+        discard(&dir, &[]);
+        assert!(!dir.exists());
+        // a same-named folder of the user's own stays as it is
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(files[5]), "").unwrap();
+        discard(&dir, &["2".into()]);
+        assert!(dir.join(files[5]).exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

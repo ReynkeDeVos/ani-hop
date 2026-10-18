@@ -15,11 +15,13 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::Size;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -68,6 +70,8 @@ pub enum Pending {
     Delete(Vec<PathBuf>),
     Progress(Media, String),
     Quit,
+    /// unfinished downloads of ani-hops that are gone, and their queue files
+    Resume(Vec<Job>, Vec<PathBuf>),
 }
 
 pub struct Screen {
@@ -92,11 +96,13 @@ enum Want {
     Play(String),
 }
 
-struct Job {
-    media: Media,
+#[derive(Clone, Serialize, Deserialize)]
+pub struct Job {
+    pub media: Media,
+    #[serde(skip)]
     source: Option<Source>,
     /// None = everything after the AniList progress
-    eps: Option<Vec<String>>,
+    pub eps: Option<Vec<String>>,
 }
 
 enum Msg {
@@ -107,11 +113,24 @@ enum Msg {
     Cover(u64, CoverKey, Result<(PathBuf, u32, u32, Size), String>),
     Resolved(Media, Result<Source, String>),
     Saved(Media, Result<Option<Entry>, String>),
+    /// (media, episode, what it waits on now; None = the player is up)
+    PlayStep(u64, String, Option<&'static str>),
     Played(Media, String, Result<(), String>),
     DlAdd(isize),
     DlProgress(String),
     DlDone(String, Result<(), String>),
 }
+
+/// The episode being started or watched.
+pub struct Playing {
+    pub id: u64,
+    pub ep: String,
+    pub title: String,
+    /// what it waits on, None once mpv shows it
+    pub step: Option<&'static str>,
+}
+
+const SEARCHING: &str = "searching ani-cli";
 
 pub struct App {
     pub stack: Vec<Screen>,
@@ -141,7 +160,7 @@ pub struct App {
     dl_tx: Sender<Job>,
     pub dl_pending: isize,
     pub dl_line: String,
-    pub playing: Option<String>,
+    pub playing: Option<Playing>,
     pub toast: Option<(String, bool, Instant)>,
     pub started: Instant,
     /// media whose title glint plays, and since when
@@ -154,6 +173,15 @@ pub struct App {
 
 fn main() -> std::io::Result<()> {
     ani::setup()?;
+    // every way out stops the download, panics too: a left-behind ani-cli would finish the
+    // episode with ffmpeg, as a file that looks complete
+    struct StopDownload;
+    impl Drop for StopDownload {
+        fn drop(&mut self) {
+            ani::stop_download();
+        }
+    }
+    let _stop = StopDownload;
     kitty::init();
     let mut terminal = ratatui::init();
     execute!(std::io::stdout(), EnableBracketedPaste)?;
@@ -198,7 +226,6 @@ fn main() -> std::io::Result<()> {
         }
         Ok(())
     })();
-    ani::stop_download();
     app.forget_posters();
     kitty::shutdown();
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
@@ -283,14 +310,96 @@ fn load_cover(
     kitty::prepare(&bytes, size, cell)
 }
 
+/// Downloads an ani-hop still has to do, kept on disk so the next start can resume them
+/// after quitting early, a crash or a closed terminal. One file per process, as several
+/// can run at once.
+fn queue_file(pid: &str) -> PathBuf {
+    ani::cache_dir().join("queue").join(format!("{pid}.json"))
+}
+
+fn read_queue(path: &Path) -> Vec<Job> {
+    fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Changes this process's saved queue; jobs with nothing left fall out.
+fn edit_queue(f: impl FnOnce(&mut Vec<Job>)) {
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let path = queue_file(&std::process::id().to_string());
+    let mut q = read_queue(&path);
+    f(&mut q);
+    q.retain(|j| j.eps.as_ref().is_none_or(|e| !e.is_empty()));
+    if q.is_empty() {
+        let _ = fs::remove_file(&path);
+        return;
+    }
+    // written aside and renamed, so quitting mid-write can't leave half a file
+    let tmp = path.with_extension("tmp");
+    let _ = fs::create_dir_all(path.parent().unwrap());
+    let _ = fs::write(&tmp, serde_json::to_vec(&q).unwrap_or_default())
+        .and_then(|()| fs::rename(&tmp, &path));
+}
+
+fn queue_files() -> Vec<PathBuf> {
+    let Ok(dir) = fs::read_dir(ani::cache_dir().join("queue")) else {
+        return Vec::new();
+    };
+    dir.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .collect()
+}
+
+/// Saved queues of ani-hops that are gone. Our own pid can only be a leftover too.
+fn orphaned_queues() -> (Vec<Job>, Vec<PathBuf>) {
+    let me = std::process::id().to_string();
+    let files: Vec<PathBuf> = queue_files()
+        .into_iter()
+        .filter(|p| {
+            let pid = p.file_stem().unwrap_or_default().to_string_lossy();
+            pid == me || !ani::running(&pid)
+        })
+        .collect();
+    (files.iter().flat_map(|p| read_queue(p)).collect(), files)
+}
+
+/// Takes over saved queues. Another ani-hop may have asked too: whoever deletes a file
+/// gets its jobs.
+fn claim(files: &[PathBuf]) -> Vec<Job> {
+    files
+        .iter()
+        .flat_map(|f| {
+            let jobs = read_queue(f);
+            fs::remove_file(f).map_or(Vec::new(), |()| jobs)
+        })
+        .collect()
+}
+
 fn spawn_downloader(tx: Sender<Msg>) -> Sender<Job> {
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     thread::spawn(move || {
         for job in job_rx {
             let m = job.media;
+            // the saved copy of the job follows what's left of it
+            let mut saved = job.eps.clone();
+            let mut left = |eps: &[String]| {
+                edit_queue(|q| {
+                    if let Some(j) = q.iter_mut().find(|j| j.media.id == m.id && j.eps == saved) {
+                        j.eps = Some(eps.to_vec());
+                    }
+                });
+                saved = Some(eps.to_vec());
+            };
             let src = match job.source.map_or_else(|| ani::resolve(&m), Ok) {
                 Ok(s) => s,
                 Err(e) => {
+                    left(&[]);
+                    // counted as its episodes, it ends as one
+                    let n = job.eps.as_ref().map_or(1, Vec::len) as isize;
+                    let _ = tx.send(Msg::DlAdd(1 - n));
                     let _ = tx.send(Msg::DlDone(m.name().to_string(), Err(e)));
                     continue;
                 }
@@ -303,14 +412,19 @@ fn spawn_downloader(tx: Sender<Msg>) -> Sender<Job> {
                     .cloned()
                     .collect();
                 let _ = tx.send(Msg::DlAdd(eps.len() as isize - 1)); // the job itself was counted as one
+                left(&eps);
                 eps
             });
-            for ep in eps {
+            for (i, ep) in eps.iter().enumerate() {
                 let label = format!("{} E{ep}", m.name());
                 let _ = tx.send(Msg::DlProgress(format!("{label} · starting")));
-                let res = ani::download(&m, &src, &ep, |p| {
+                let res = ani::download(&m, &src, ep, |p| {
                     _ = tx.send(Msg::DlProgress(format!("{label} · {p}")))
                 });
+                // cut short by quitting: stays saved for the next start
+                if res.is_ok() || !ani::stopped() {
+                    left(&eps[i + 1..]);
+                }
                 let _ = tx.send(Msg::DlDone(label, res));
             }
         }
@@ -371,6 +485,17 @@ impl App {
             let _ = fs::write(&welcomed, "");
             app.push(if first { "Welcome" } else { "Setup" }, View::Setup);
         }
+        // on top, so it's answered before anything can log in and reset the screens
+        match orphaned_queues() {
+            (jobs, files) if jobs.is_empty() => files.iter().for_each(|f| _ = fs::remove_file(f)),
+            (jobs, files) => {
+                app.push(
+                    "Resume the downloads that didn't finish last time?",
+                    View::Confirm(Pending::Resume(jobs, files)),
+                );
+                app.top().menu.select_key("yes");
+            }
+        }
         if app.client.token.is_some() {
             let c = app.client.clone();
             app.spawn(move || Msg::Viewer(c.viewer()));
@@ -388,8 +513,21 @@ impl App {
         self.refresh();
     }
 
+    /// Back to the main menu; an unanswered resume question stays.
+    fn back_to_main(&mut self) {
+        self.stack
+            .retain(|s| matches!(s.view, View::Main | View::Confirm(Pending::Resume(..))));
+    }
+
     pub fn top(&mut self) -> &mut Screen {
         self.stack.last_mut().unwrap()
+    }
+
+    /// Queues a download, saved first so quitting early doesn't lose it.
+    fn download(&mut self, job: Job) {
+        self.dl_pending += job.eps.as_ref().map_or(1, Vec::len) as isize;
+        edit_queue(|q| q.push(job.clone()));
+        let _ = self.dl_tx.send(job);
     }
 
     fn spawn(&self, f: impl FnOnce() -> Msg + Send + 'static) {
@@ -484,6 +622,7 @@ impl App {
         ui::effects_running(self)
             || self.stack.last().unwrap().loading
             || self.dl_pending > 0
+            || self.playing.as_ref().is_some_and(|p| p.step.is_some())
             || self
                 .toast
                 .as_ref()
@@ -859,12 +998,11 @@ impl App {
                             .contains(&m.id)
                             .then(|| self.sources.get(&m.id).cloned())
                             .flatten();
-                        let _ = self.dl_tx.send(Job {
+                        self.download(Job {
                             media: m,
                             source,
                             eps: Some(keys),
                         });
-                        self.dl_pending += n as isize;
                         self.toast(format!("Queued {}", plural(n, "episode")), false);
                         self.pop(1);
                     }
@@ -909,12 +1047,11 @@ impl App {
                 let list = list.clone();
                 if key == "download" {
                     for m in list {
-                        let _ = self.dl_tx.send(Job {
+                        self.download(Job {
                             media: m,
                             source: None,
                             eps: None,
                         });
-                        self.dl_pending += 1;
                     }
                     self.toast("Queued, looking up episodes…", false);
                     self.pop(1);
@@ -932,10 +1069,44 @@ impl App {
             }
             View::Confirm(p) => {
                 if key != "yes" {
+                    if let Pending::Resume(_, files) = p {
+                        let jobs = claim(files);
+                        // a show another running ani-hop downloads keeps its files
+                        let busy: Vec<u64> = queue_files()
+                            .iter()
+                            .flat_map(|f| read_queue(f))
+                            .map(|j| j.media.id)
+                            .collect();
+                        for j in jobs.iter().filter(|j| !busy.contains(&j.media.id)) {
+                            let eps = j.eps.as_deref().unwrap_or_default();
+                            ani::discard(&ani::folder(&j.media), eps);
+                        }
+                        self.toast(
+                            match jobs.is_empty() {
+                                true => "Another ani-hop took these over already",
+                                false => "Dropped the unfinished downloads",
+                            },
+                            false,
+                        );
+                    }
                     return self.pop(1);
                 }
                 match p {
                     Pending::Quit => self.quit = true,
+                    Pending::Resume(_, files) => {
+                        let jobs = claim(files);
+                        self.toast(
+                            match jobs.is_empty() {
+                                true => "Another ani-hop took these over already",
+                                false => "Resuming the unfinished downloads",
+                            },
+                            false,
+                        );
+                        for job in jobs {
+                            self.download(job);
+                        }
+                        self.pop(1);
+                    }
                     Pending::Delete(paths) => {
                         let mut failed = 0;
                         for p in paths {
@@ -1124,22 +1295,42 @@ impl App {
     }
 
     fn play(&mut self, m: Media, ep: String) {
+        // a second enter would open a second player
+        if let Some(p) = &self.playing
+            && p.step.is_some()
+        {
+            return self.toast(format!("Still starting {}…", p.title), false);
+        }
         let local = ani::local_episodes(&ani::folder(&m))
             .into_iter()
             .find(|(e, _)| *e == ep);
         let src = self.sources.get(&m.id).cloned();
+        let cached = !self.fresh.contains(&m.id);
+        let step = match (&local, &src) {
+            (Some(_), _) => "opening the player",
+            (None, None) => SEARCHING,
+            (_, Some(_)) if cached => "checking the source",
+            _ => "fetching the stream",
+        };
+        self.playing = Some(Playing {
+            id: m.id,
+            ep: ep.clone(),
+            title: format!("{} · Episode {ep}", m.name()),
+            step: Some(step),
+        });
         if local.is_none() && src.is_none() {
             return self.resolve(&m, Some(Want::Play(ep)));
         }
-        self.playing = Some(format!("{} · Episode {ep}", m.name()));
-        let cached = !self.fresh.contains(&m.id);
+        let (tx, id, e) = (self.tx.clone(), m.id, ep.clone());
+        let step = move |s| _ = tx.send(Msg::PlayStep(id, e.clone(), s));
         self.spawn(move || {
             let res = match (&local, src) {
-                (Some((_, file)), _) => ani::play_file(&m, &ep, file),
-                (_, Some(src)) if cached => {
-                    ani::locate(&m, &src).and_then(|s| ani::stream(&s, &ep))
-                }
-                (_, Some(src)) => ani::stream(&src, &ep),
+                (Some((_, file)), _) => ani::play_file(&m, &ep, file, || step(None)),
+                (_, Some(src)) if cached => ani::locate(&m, &src).and_then(|s| {
+                    step(Some("fetching the stream"));
+                    ani::stream(&s, &ep, || step(None))
+                }),
+                (_, Some(src)) => ani::stream(&src, &ep, || step(None)),
                 _ => unreachable!(),
             };
             Msg::Played(m, ep, res)
@@ -1219,7 +1410,7 @@ impl App {
                         format!("Logged in as {}", self.user.as_ref().unwrap().1),
                         false,
                     );
-                    self.stack.truncate(1);
+                    self.back_to_main();
                     self.top().menu.edit(String::clear);
                 }
                 self.refresh();
@@ -1233,7 +1424,7 @@ impl App {
                     let _ = fs::remove_file(token_path());
                     let _ = fs::remove_file(user_path());
                     (self.client.token, self.user) = (None, None);
-                    self.stack.truncate(1);
+                    self.back_to_main();
                 }
                 self.toast(format!("AniList login failed: {e}"), true);
                 self.refresh();
@@ -1259,6 +1450,14 @@ impl App {
             }
             Msg::Resolved(m, res) => {
                 let want = self.resolving.remove(&m.id).flatten();
+                // the wait is over either way; playing it starts anew below
+                if self
+                    .playing
+                    .as_ref()
+                    .is_some_and(|p| p.id == m.id && p.step == Some(SEARCHING))
+                {
+                    self.playing = None;
+                }
                 let here = matches!(&self.top().view, View::Show(s) | View::Episodes(s, _) if s.id == m.id);
                 match res {
                     Ok(src) => {
@@ -1289,8 +1488,22 @@ impl App {
                     Err(e) => self.toast(e, true),
                 }
             }
+            Msg::PlayStep(id, ep, step) => {
+                if let Some(p) = &mut self.playing
+                    && p.id == id
+                    && p.ep == ep
+                {
+                    p.step = step;
+                }
+            }
             Msg::Played(m, ep, res) => {
-                self.playing = None;
+                if self
+                    .playing
+                    .as_ref()
+                    .is_some_and(|p| p.id == m.id && p.ep == ep)
+                {
+                    self.playing = None;
+                }
                 match res {
                     Err(e) => self.toast(e, true),
                     Ok(()) if self.user.is_some() && ani::ep_num(&ep) > m.progress() as f64 => {

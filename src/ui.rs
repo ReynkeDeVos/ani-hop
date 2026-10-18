@@ -1,6 +1,6 @@
 use crate::anilist::Media;
 use crate::kitty;
-use crate::{App, Cover, Input, PIN_REDIRECT, Pending, View, ani, list_label};
+use crate::{App, Cover, EpMode, Input, PIN_REDIRECT, Pending, View, ani, list_label};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 
@@ -220,6 +220,21 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     ));
     f.render_widget(Line::from(info), info_area);
 
+    // the episode being started shows it right where enter was pressed
+    let busy = app.playing.as_ref().and_then(|p| {
+        let key = match &screen.view {
+            View::Episodes(m, EpMode::Play) if m.id == p.id => p.ep.clone(),
+            View::Show(m) if m.id == p.id && p.ep == (m.progress() + 1).to_string() => {
+                "next".into()
+            }
+            _ => return None,
+        };
+        Some((
+            key,
+            p.step
+                .map_or("▶ playing".into(), |s| format!("{spin} {s}…")),
+        ))
+    });
     let width = list_area.width.saturating_sub(1) as usize; // minus the pointer column
     let rows: Vec<ListItem> = m
         .matches
@@ -243,12 +258,15 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
             }));
             let used: usize = spans.iter().map(|s| s.width()).sum();
             let room = width.saturating_sub(used + 2);
-            if !item.hint.is_empty() && room > 3 {
-                let mut hint = item.hint.clone();
+            let (mut hint, color) = match &busy {
+                Some((key, text)) if *key == item.key => (text.clone(), ACCENT),
+                _ => (item.hint.clone(), DIM),
+            };
+            if !hint.is_empty() && room > 3 {
                 if hint.chars().count() > room {
                     hint = hint.chars().take(room - 1).collect::<String>() + "…";
                 }
-                let hint = Span::styled(hint, DIM);
+                let hint = Span::styled(hint, color);
                 spans.push(" ".repeat(width - used - hint.width()).into());
                 spans.push(hint);
             }
@@ -359,6 +377,17 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
                     "✗ {}",
                     p.file_name().unwrap_or_default().to_string_lossy()
                 ))
+            })
+            .collect(),
+        View::Confirm(Pending::Resume(jobs, _)) => jobs
+            .iter()
+            .map(|j| {
+                let eps = match j.eps.as_deref() {
+                    Some([one]) => format!("episode {one}"),
+                    Some(e @ [first, .., last]) => format!("{} episodes ({first}–{last})", e.len()),
+                    _ => "unwatched episodes".into(),
+                };
+                Line::from(format!("↓ {} · {eps}", j.media.name()))
             })
             .collect(),
         View::Setup => setup(app),
@@ -591,7 +620,14 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
             format!(" {text}"),
             if *err { Color::Red } else { Color::Green },
         ),
-        (_, Some(p)) => Line::from(vec![Span::styled(" ▶ ", ACCENT), p.as_str().into()]),
+        (_, Some(p)) => match p.step {
+            Some(step) => Line::from(vec![
+                Span::styled(format!(" {} ", spinner(app)), ACCENT),
+                p.title.as_str().into(),
+                Span::styled(format!(" · {step}…"), DIM),
+            ]),
+            None => Line::from(vec![Span::styled(" ▶ ", ACCENT), p.title.as_str().into()]),
+        },
         _ if app.dl_pending > 0 => Line::from(vec![
             Span::styled(
                 format!(" {} ↓ {} left ", spinner(app), app.dl_pending),
