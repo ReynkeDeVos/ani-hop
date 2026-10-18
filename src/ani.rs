@@ -401,11 +401,24 @@ fn player_up(line: &str, up: &mut impl FnMut()) {
     }
 }
 
+/// Whether ani-skip jumps over openings and endings (switched in the main menu).
+pub fn skip_on() -> bool {
+    !config_dir().join("no-skip").exists()
+}
+
+pub fn set_skip(on: bool) -> std::io::Result<()> {
+    let off = config_dir().join("no-skip");
+    match on {
+        true => fs::remove_file(off),
+        false => fs::create_dir_all(config_dir()).and_then(|()| fs::write(off, "")),
+    }
+}
+
 /// Streams through ani-cli (with ani-skip); `up` is called once mpv shows the episode.
 pub fn stream(src: &Source, ep: &str, mut up: impl FnMut()) -> Result<(), String> {
     let child = ani_cli()
+        .args(skip_on().then_some("--skip"))
         .args([
-            "--skip",
             "--exit-after-play",
             "-S",
             &src.index.to_string(),
@@ -430,7 +443,7 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
     if vtt.exists() {
         mpv.arg(format!("--sub-file={}", vtt.display()));
     }
-    if let Some(mal) = m.id_mal {
+    if let Some(mal) = m.id_mal.filter(|_| skip_on()) {
         let skip = Command::new("ani-skip")
             .args(["-i", &mal.to_string(), "-e", ep])
             .stderr(Stdio::null())

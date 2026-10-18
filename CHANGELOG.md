@@ -5,6 +5,7 @@
 ### Added
 
 - Watched episodes (up to your AniList progress) are marked with a ✓ and dimmed in the episode, download and delete lists.
+- "Skip openings and endings" in the main menu switches ani-skip on and off, for streams and downloaded episodes alike.
 
 ## 0.2.0 – 2026-10-18
 

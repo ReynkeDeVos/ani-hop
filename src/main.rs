@@ -723,6 +723,11 @@ impl App {
                     "Downloads",
                     plural(self.local.len(), "show"),
                 ));
+                v.push(Item::new(
+                    "skip",
+                    "Skip openings and endings",
+                    if ani::skip_on() { "on" } else { "off" },
+                ));
                 v.push(match (&self.client.token, &self.user) {
                     (Some(_), user) => Item::new(
                         "logout",
@@ -1162,6 +1167,15 @@ impl App {
                     self.push("AniList setup", View::Input(Input::ClientId));
                 }
             },
+            "skip" => {
+                let on = !ani::skip_on();
+                if let Err(e) = ani::set_skip(on) {
+                    return self.toast(e.to_string(), true);
+                }
+                let state = if on { "on" } else { "off" };
+                self.toast(format!("Skipping openings and endings: {state}"), false);
+                self.refresh();
+            }
             "logout" => {
                 let _ = fs::remove_file(token_path());
                 let _ = fs::remove_file(user_path());
