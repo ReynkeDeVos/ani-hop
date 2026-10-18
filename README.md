@@ -1,61 +1,11 @@
 # ani-hop
 
-Anime-TUI in Rust ([ratatui](https://ratatui.rs) + [ratatui-image](https://github.com/ratatui/ratatui-image)), inspiriert von [viu](https://github.com/viu-media/viu), nur deutlich simpler.
-AniList liefert Listen, Infos und Poster; Streamen und Herunterladen übernehmen `ani-cli` und `ani-skip`.
+![ani-hop demo](demo.avif)
 
-- Trending / Top rated / Popular / Suche
-- AniList-Login: Watching, Planning, Completed, … ansehen, Status setzen, Fortschritt nach dem Schauen eintragen
-- Episoden streamen (mit ani-skip) oder heruntergeladene lokal abspielen
-- Episoden herunterladen und löschen, auch in Bulk
-- fzf-Bedienung in jedem Menü, Poster + Infos in der Vorschau (Kitty-Grafikprotokoll)
-- Schnell zuerst: Listen, Login und ani-cli-Quellen sind gecacht und erscheinen sofort, aktualisiert wird im Hintergrund
-- Effekte, die nie Inhalt verstecken: kurze ░▒▓█-Start-Animation, Glanz über dem Titel, Skeleton beim ersten Laden
+A fast terminal UI for anime: browse trending, top rated and search results with posters, then stream or download episodes through [ani-cli](https://github.com/pystardust/ani-cli). Log in with [AniList](https://anilist.co) to get your lists and have your progress tracked after every episode.
 
-## Voraussetzungen
-
-`ani-cli`, `ani-skip`, `mpv`, `yt-dlp`, Terminal: **Ghostty** oder **Kitty**.
+**Needs** [ani-cli](https://github.com/pystardust/ani-cli), [ani-skip](https://github.com/synacktraa/ani-skip), [mpv](https://mpv.io), [yt-dlp](https://github.com/yt-dlp/yt-dlp), ffmpeg, curl, xdg-utils and [Ghostty](https://ghostty.org) or [kitty](https://sw.kovidgoyal.net/kitty/) for the posters.
 
 ```sh
-cargo install --path .
-ani-hop
+cargo install --git https://github.com/ReynkeDeVos/ani-hop
 ```
-
-Beim ersten Start (und immer, wenn etwas fehlt) prüft ani-hop alle Tools und das Kitty-Grafikprotokoll,
-bietet die Installation fehlender Pakete per `yay`/`paru` an und schlägt den AniList-Login vor.
-
-## Bedienung
-
-| Taste | Aktion |
-|---|---|
-| tippen | filtern, fzf-Syntax: `'exakt ^anfang ende$ !nicht` |
-| `↑↓` `^j/^k` `^n/^p` | bewegen |
-| `tab` / `shift-tab` | markieren (Bulk) |
-| `^a` | alle markieren |
-| `enter` | auswählen |
-| `esc` | Filter leeren / zurück |
-| `^w` `^u` | Wort / Filter löschen |
-| `^c` | beenden |
-
-Mehrere Anime markieren + `enter` → alle (ungeschauten) Episoden laden oder Downloads löschen.
-
-## AniList verbinden
-
-Einmalig: unter <https://anilist.co/settings/developer> einen Client anlegen
-(Redirect URL `https://anilist.co/api/v2/oauth/pin`), dann in ani-hop „Log in to AniList“
-wählen, Client-ID und danach das angezeigte Token einfügen.
-
-## Downloads
-
-Landen in `~/Videos/Anime/<Titel>/` (oder `$ANI_CLI_DOWNLOAD_DIR`), eine `.media.json` verknüpft den Ordner mit AniList.
-ani-cli-Variablen wirken wie gewohnt, z. B. `ANI_CLI_QUALITY=720`, `ANI_CLI_MODE=dub`.
-
-## Wie ani-cli angebunden ist
-
-ani-cli hat keine maschinenlesbare Ausgabe. Ohne TTY wechselt es auf rofi als Menü. ani-hop legt
-ein eigenes `rofi`-Skript vorne in dessen `PATH`, das das Menü in eine Datei schreibt statt es anzuzeigen.
-So bleibt das Scraping komplett bei ani-cli: Wechselt der Provider, reicht `ani-cli -U`.
-
-Falls die automatische Zuordnung AniList → Provider danebenliegt: „Change source…“ im Anime-Menü,
-die Wahl wird in `~/.config/ani-hop/sources.json` gespeichert.
-
-Dateien: `~/.config/ani-hop/` (Token, Client-ID, Nutzer, Quellen-Overrides), `~/.cache/ani-hop/` (Poster, Listen, aufgelöste Quellen).
