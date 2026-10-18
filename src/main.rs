@@ -128,6 +128,9 @@ pub struct Playing {
     pub title: String,
     /// what it waits on, None once mpv shows it
     pub step: Option<&'static str>,
+    /// when enter was pressed, for the pop-up
+    pub since: Instant,
+    pub color: Option<String>,
 }
 
 const SEARCHING: &str = "searching ani-cli";
@@ -1332,6 +1335,8 @@ impl App {
             ep: ep.clone(),
             title: format!("{} · Episode {ep}", m.name()),
             step: Some(step),
+            since: Instant::now(),
+            color: m.cover_image.color.clone(),
         });
         if local.is_none() && src.is_none() {
             return self.resolve(&m, Some(Want::Play(ep)));
@@ -1466,13 +1471,9 @@ impl App {
             Msg::Resolved(m, res) => {
                 let want = self.resolving.remove(&m.id).flatten();
                 // the wait is over either way; playing it starts anew below
-                if self
+                let waited = self
                     .playing
-                    .as_ref()
-                    .is_some_and(|p| p.id == m.id && p.step == Some(SEARCHING))
-                {
-                    self.playing = None;
-                }
+                    .take_if(|p| p.id == m.id && p.step == Some(SEARCHING));
                 let here = matches!(&self.top().view, View::Show(s) | View::Episodes(s, _) if s.id == m.id);
                 match res {
                     Ok(src) => {
@@ -1485,6 +1486,12 @@ impl App {
                     }
                     Err(e) if want.is_some() || here => self.toast(format!("ani-cli: {e}"), true),
                     Err(_) => {}
+                }
+                // same pop-up, it doesn't pop in a second time
+                if let (Some(w), Some(p)) = (waited, &mut self.playing)
+                    && p.id == w.id
+                {
+                    p.since = w.since;
                 }
                 self.refresh();
             }
