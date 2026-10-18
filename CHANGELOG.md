@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 – 2026-10-18
 
 ### Added
 
+- Pressing enter on an episode pops up a box at once: the episode, what it is waiting on and a running bar, until mpv shows it.
 - Watched episodes (up to your AniList progress) are marked with a ✓ and dimmed in the episode, download and delete lists.
 - "Skip openings and endings" in the main menu switches ani-skip on and off, for streams and downloaded episodes alike.
 
