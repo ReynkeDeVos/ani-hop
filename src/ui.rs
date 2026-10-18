@@ -1,9 +1,8 @@
 use crate::anilist::Media;
+use crate::kitty;
 use crate::{App, Cover, Input, PIN_REDIRECT, Pending, View, ani, list_label};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, HighlightSpacing, List, ListItem, Paragraph, Wrap};
-use ratatui_image::Image;
-use ratatui_image::picker::Capability;
 
 // ANSI colors on purpose: they follow the terminal (and Omarchy) theme.
 const ACCENT: Color = Color::Magenta;
@@ -16,6 +15,7 @@ const BOOT_MS: u128 = 500;
 const GLINT_MS: u128 = 450;
 
 pub fn render(app: &mut App, f: &mut Frame) {
+    app.cell = kitty::cell_px();
     let [head, body, foot] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -79,6 +79,14 @@ fn logo() -> impl Iterator<Item = Line<'static>> {
         .map(|l| Line::styled(*l, Style::new().fg(ACCENT).bold()))
 }
 
+/// Short name for breadcrumbs and the panel border; questions are shown in full below.
+fn crumb(s: &crate::Screen) -> &str {
+    match s.view {
+        View::Confirm(_) => "Confirm",
+        _ => &s.title,
+    }
+}
+
 fn panel() -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
@@ -101,13 +109,25 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
     let [crumbs_area, user_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(user.width() as u16)])
             .areas(area);
+    // newest crumbs first; whatever doesn't fit folds into "…" (the current one never does)
+    let mut room = (crumbs_area.width as usize).saturating_sub(10);
+    let mut shown = Vec::new();
+    for t in app.stack.iter().skip(1).rev().map(crumb) {
+        let w = Span::raw(t).width() + 3;
+        if w > room && !shown.is_empty() {
+            shown.push("…");
+            break;
+        }
+        room = room.saturating_sub(w);
+        shown.push(t);
+    }
     let mut crumbs = vec![Span::styled(
         " ani-hop ",
         Style::new().fg(Color::Black).bg(ACCENT).bold(),
     )];
-    for s in app.stack.iter().skip(1) {
+    for t in shown.into_iter().rev() {
         crumbs.push(Span::styled(" › ", DIM));
-        crumbs.push(Span::raw(s.title.as_str()));
+        crumbs.push(Span::raw(t));
     }
     f.render_widget(Line::from(crumbs), crumbs_area);
     f.render_widget(user, user_area);
@@ -118,13 +138,18 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let shimmer = (app.started.elapsed().as_millis() / 30) as usize;
     let screen = app.stack.last_mut().unwrap();
     let block = panel().title(Span::styled(
-        format!(" {} ", screen.title),
+        format!(" {} ", crumb(screen)),
         Style::new().fg(Color::Reset).bold(),
     ));
     let inner = block.inner(area).inner(Margin::new(1, 0));
     f.render_widget(block, area);
+    // a confirmation shows its question where the filter prompt would be, wrapped
+    let question = matches!(screen.view, View::Confirm(_)).then_some(screen.title.as_str());
+    let rows = question.map_or(1, |q| {
+        (Line::raw(q).width() as u16 / inner.width.max(1) + 1).min(4)
+    });
     let [prompt_area, info_area, list_area] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(rows),
         Constraint::Length(1),
         Constraint::Fill(1),
     ])
@@ -144,8 +169,16 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     ]);
     let cursor_x =
         (prompt_area.x + prompt.width() as u16).min(prompt_area.right().saturating_sub(1));
-    f.render_widget(prompt, prompt_area);
-    f.set_cursor_position((cursor_x, prompt_area.y));
+    match question {
+        Some(q) => f.render_widget(
+            Paragraph::new(Line::styled(q, Style::new().bold())).wrap(Wrap { trim: true }),
+            prompt_area,
+        ),
+        None => {
+            f.render_widget(prompt, prompt_area);
+            f.set_cursor_position((cursor_x, prompt_area.y));
+        }
+    }
 
     if let View::Input(input) = &screen.view {
         f.render_widget(
@@ -312,7 +345,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
     };
     if let Some(m) = media {
         media_preview(app, f, inner, &m);
-        return ahead.iter().for_each(|m| app.want_cover(m));
+        return ahead.iter().for_each(|m| app.want_cover(m, false));
     }
     let lines: Vec<Line> = match &screen.view {
         View::Bulk(list) => list
@@ -351,8 +384,11 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     for (bin, _, what) in ani::DEPS {
         v.push(row(!app.missing.iter().any(|d| d.0 == bin), bin, what));
     }
-    let kitty = app.picker.capabilities().contains(&Capability::Kitty);
-    v.push(row(kitty, "graphics", "posters need Ghostty or Kitty"));
+    v.push(row(
+        kitty::supported(),
+        "graphics",
+        "posters need Ghostty or Kitty",
+    ));
     let pkgs: Vec<&str> = app.missing.iter().map(|d| d.1).collect();
     if !pkgs.is_empty() && ani::install_command(&pkgs).is_none() {
         v.push("".into());
@@ -412,11 +448,11 @@ fn banner(app: &App) -> Vec<Line<'static>> {
 }
 
 fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media) {
-    let font = app.picker.font_size();
+    let (fw, fh) = app.cell;
     let rows = (area.height * 3 / 5).clamp(6, 26).min(area.height);
-    let cols = ((rows as f32 * font.height as f32 * 0.7) / font.width.max(1) as f32).round() as u16;
+    let cols = ((rows as f32 * fh as f32 * 0.7) / fw.max(1) as f32).round() as u16;
     app.poster = Size::new(cols.min(area.width / 2), rows);
-    app.want_cover(m);
+    app.want_cover(m, true);
 
     let [top, _, bottom] = Layout::vertical([
         Constraint::Length(rows),
@@ -440,7 +476,7 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media) {
         app.glint = (m.id, std::time::Instant::now());
     }
     match app.covers.get(&m.id) {
-        Some(Cover::Ready(_, p)) => f.render_widget(Image::new(p), poster),
+        Some(Cover::Ready(_, p)) => kitty::render(p, poster, f.buffer_mut()),
         // the cover's dominant color stands in while it loads
         _ => f.render_widget(Block::new().bg(accent), poster),
     }

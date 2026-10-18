@@ -85,7 +85,7 @@ pub const DEPS: [(&str, &str, &str); 7] = [
     ("ani-skip", "ani-skip-git", "skips openings and endings"),
     ("yt-dlp", "yt-dlp", "downloads episodes"),
     ("ffmpeg", "ffmpeg", "finishes downloads"),
-    ("curl", "curl", "AniList, posters and ani-cli"),
+    ("curl", "curl", "ani-cli's requests"),
     ("xdg-open", "xdg-utils", "opens the AniList login"),
 ];
 
@@ -152,6 +152,9 @@ fn last_error(stderr: &[u8]) -> String {
 /// `None` means ani-cli never asked (it went on to "play" with the debug player).
 fn probe(args: &[&str]) -> Result<Option<(String, Vec<String>)>, String> {
     static N: AtomicU64 = AtomicU64::new(0);
+    // one at a time: the provider shouldn't see a burst when several shows are opened
+    static TURN: Mutex<()> = Mutex::new(());
+    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
     let dir = cache_dir().join("probe");
     let out = dir.join(format!(
         "menu-{}-{}",

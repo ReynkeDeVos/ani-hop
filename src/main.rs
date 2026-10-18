@@ -2,6 +2,7 @@
 
 mod ani;
 mod anilist;
+mod kitty;
 mod menu;
 mod ui;
 
@@ -14,9 +15,6 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::Size;
-use ratatui_image::Resize;
-use ratatui_image::picker::{Picker, ProtocolType};
-use ratatui_image::protocol::Protocol;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
@@ -80,9 +78,12 @@ pub struct Screen {
     pub loading: bool,
 }
 
+/// A poster is made for a size in cells and the pixels per cell (font zoom changes those).
+pub type CoverKey = (Size, (u16, u16));
+
 pub enum Cover {
-    Loading(Size),
-    Ready(Size, Protocol),
+    Loading(CoverKey),
+    Ready(CoverKey, kitty::Poster),
     Failed,
 }
 
@@ -102,7 +103,8 @@ enum Msg {
     Shows(u64, Result<Vec<Media>, String>),
     Hits(u64, Result<Vec<String>, String>),
     Viewer(Result<(u64, String), String>),
-    Cover(u64, Size, Result<Protocol, String>),
+    /// prepared poster: pixel file, pixel size, size in cells
+    Cover(u64, CoverKey, Result<(PathBuf, u32, u32, Size), String>),
     Resolved(Media, Result<Source, String>),
     Saved(Media, Result<Option<Entry>, String>),
     Played(Media, String, Result<(), String>),
@@ -118,7 +120,15 @@ pub struct App {
     rx: Receiver<Msg>,
     client: Client,
     pub user: Option<(u64, String)>,
-    pub picker: Picker,
+    /// pixels per cell, read from the terminal every frame (font zoom changes it)
+    pub cell: (u16, u16),
+    next_image: u32,
+    /// posters handed over as files: (file, when, media id); still there later = unreadable
+    sent: Vec<(PathBuf, Instant, u64)>,
+    /// the terminal didn't read a poster file, so posters are off for this session
+    no_graphics: bool,
+    /// AniList list changes not answered yet
+    saves_pending: usize,
     pub covers: HashMap<u64, Cover>,
     /// poster size in cells, set by the last layout
     pub poster: Size,
@@ -144,13 +154,12 @@ pub struct App {
 
 fn main() -> std::io::Result<()> {
     ani::setup()?;
+    kitty::init();
     let mut terminal = ratatui::init();
     execute!(std::io::stdout(), EnableBracketedPaste)?;
     // Kitty graphics only (Kitty and Ghostty); the query is just for font size and o=z support.
-    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
-    picker.set_protocol_type(ProtocolType::Kitty);
 
-    let mut app = App::new(picker);
+    let mut app = App::new();
     let res = (|| -> std::io::Result<()> {
         let mut dirty = true;
         while !app.quit {
@@ -176,6 +185,7 @@ fn main() -> std::io::Result<()> {
                 app.on_msg(msg);
                 dirty = true;
             }
+            dirty |= app.check_sent();
             if let Some(cmd) = app.external.take() {
                 execute!(std::io::stdout(), DisableBracketedPaste)?;
                 ratatui::restore();
@@ -189,6 +199,8 @@ fn main() -> std::io::Result<()> {
         Ok(())
     })();
     ani::stop_download();
+    app.forget_posters();
+    kitty::shutdown();
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     res
@@ -203,6 +215,9 @@ fn run_in_terminal(cmd: &str) {
     let _ = std::io::stdout().flush();
     let _ = std::io::stdin().read_line(&mut String::new());
 }
+
+/// Bumped on every list change, so refreshes that started before it don't count as fresh.
+static LIST_CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn token_path() -> PathBuf {
     ani::config_dir().join("token")
@@ -252,7 +267,12 @@ fn open_url(url: &str) {
 }
 
 /// Cover from the disk cache (or AniList), scaled and encoded for the terminal.
-fn load_cover(picker: &Picker, id: u64, url: &str, size: Size) -> Result<Protocol, String> {
+/// Cover from the disk cache (or AniList), scaled and written out for the terminal.
+fn load_cover(
+    id: u64,
+    url: &str,
+    (size, cell): CoverKey,
+) -> Result<(PathBuf, u32, u32, Size), String> {
     let path = ani::cache_dir().join("covers").join(format!("{id}.jpg"));
     let bytes = fs::read(&path).or_else(|_| {
         let bytes = anilist::fetch(url)?;
@@ -260,11 +280,7 @@ fn load_cover(picker: &Picker, id: u64, url: &str, size: Size) -> Result<Protoco
         let _ = fs::write(&path, &bytes);
         Ok::<_, String>(bytes)
     })?;
-    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
-    let resize = Resize::Scale(Some(image::imageops::FilterType::Triangle));
-    picker
-        .new_protocol(img, size, resize)
-        .map_err(|e| e.to_string())
+    kitty::prepare(&bytes, size, cell)
 }
 
 fn spawn_downloader(tx: Sender<Msg>) -> Sender<Job> {
@@ -303,7 +319,7 @@ fn spawn_downloader(tx: Sender<Msg>) -> Sender<Job> {
 }
 
 impl App {
-    fn new(picker: Picker) -> Self {
+    fn new() -> Self {
         let (tx, rx) = mpsc::channel();
         let token = fs::read_to_string(token_path())
             .ok()
@@ -324,7 +340,12 @@ impl App {
             rx,
             client,
             user: user.map(|(id, name, _)| (id, name)),
-            picker,
+            cell: kitty::cell_px(),
+            // instances sharing one terminal (tmux panes) must not reuse each other's ids
+            next_image: std::process::id().wrapping_mul(2_654_435_761) & 0xFF_FFFF,
+            sent: Vec::new(),
+            no_graphics: false,
+            saves_pending: 0,
             covers: HashMap::new(),
             poster: Size::new(0, 0),
             sources: ani::load_resolved(),
@@ -409,13 +430,27 @@ impl App {
         let cached = path
             .as_ref()
             .and_then(|p| serde_json::from_slice(&fs::read(p).ok()?).ok());
+        // fetched less than 2 minutes ago: good enough, saves AniList requests
+        let age = path
+            .as_ref()
+            .and_then(|p| fs::metadata(p).ok()?.modified().ok()?.elapsed().ok());
+        let recent = cached.is_some() && age.is_some_and(|a| a < Duration::from_secs(120));
         let id = self.push(title, View::Shows(cached.unwrap_or_default(), false));
+        if recent {
+            return;
+        }
         self.top().loading = true;
+        let changes = LIST_CHANGES.load(std::sync::atomic::Ordering::Relaxed);
         self.spawn(move || {
             let res = f();
             if let (Ok(list), Some(p)) = (&res, path) {
                 let _ = fs::create_dir_all(p.parent().unwrap());
-                let _ = fs::write(p, serde_json::to_vec(list).unwrap_or_default());
+                let _ = fs::write(&p, serde_json::to_vec(list).unwrap_or_default());
+                // a save landed while this was in flight: keep it, but not as fresh
+                if LIST_CHANGES.load(std::sync::atomic::Ordering::Relaxed) != changes {
+                    let file = fs::File::options().write(true).open(&p);
+                    let _ = file.map(|f| f.set_modified(std::time::UNIX_EPOCH));
+                }
             }
             Msg::Shows(id, res)
         });
@@ -455,38 +490,73 @@ impl App {
                 .is_some_and(|t| t.2.elapsed().as_secs() < 5)
     }
 
-    pub fn want_cover(&mut self, m: &Media) {
-        let size = self.poster;
+    /// Starts loading a poster at the current size. `urgent` (the one on screen) skips the
+    /// queue; look-ahead ones wait while 4 are in flight and get asked for again next frame.
+    pub fn want_cover(&mut self, m: &Media, urgent: bool) {
+        let (size, key) = (self.poster, (self.poster, self.cell));
         let fresh = match self.covers.get(&m.id) {
-            Some(Cover::Loading(s) | Cover::Ready(s, _)) => *s == size,
+            Some(Cover::Loading(k) | Cover::Ready(k, _)) => *k == key,
             Some(Cover::Failed) => true,
             None => false,
         };
-        if fresh || size.width == 0 {
-            return;
-        }
-        // at most 4 posters in flight; the frame after one arrives asks again for the rest
-        if self
+        let busy = self
             .covers
             .values()
             .filter(|c| matches!(c, Cover::Loading(_)))
-            .count()
-            >= 4
-        {
+            .count();
+        if fresh || size.width == 0 || (busy >= 4 && !urgent) {
             return;
         }
-        // ponytail: drop everything past ~100 posters (~40 MB); they reload from disk cache in ms
-        if self.covers.len() > 100 {
-            self.covers.clear();
+        // nobody would read (and delete) the pixel files; the cover color stands in
+        if !kitty::supported() || self.no_graphics {
+            self.covers.insert(m.id, Cover::Failed);
+            return;
+        }
+        // ponytail: the terminal keeps ~3 MB per poster; past 60 they all go and reload from
+        // the disk cache in ms
+        if self.covers.len() > 60 {
+            self.forget_posters();
+        }
+        if let Some(Cover::Ready(_, p)) = self.covers.get(&m.id) {
+            kitty::delete(p.id); // resized: the old one is never drawn again
         }
         match m.cover_image.extra_large.clone() {
             Some(url) => {
-                self.covers.insert(m.id, Cover::Loading(size));
-                let (id, picker) = (m.id, self.picker.clone());
-                self.spawn(move || Msg::Cover(id, size, load_cover(&picker, id, &url, size)));
+                self.covers.insert(m.id, Cover::Loading(key));
+                let id = m.id;
+                self.spawn(move || Msg::Cover(id, key, load_cover(id, &url, key)));
             }
             None => _ = self.covers.insert(m.id, Cover::Failed),
         }
+    }
+
+    /// Frees every poster in the terminal.
+    fn forget_posters(&mut self) {
+        for c in self.covers.values() {
+            if let Cover::Ready(_, p) = c {
+                kitty::delete(p.id);
+            }
+        }
+        self.covers.clear();
+        self.sent.clear();
+        kitty::cleanup(); // files of the in-flight ones come back unwanted and go too
+    }
+
+    /// The terminal deletes a poster file once it read it. One still around after 2 s means
+    /// it never will (tmux without passthrough, ssh, ...): fall back to the cover colors.
+    fn check_sent(&mut self) -> bool {
+        let old = |s: &(PathBuf, Instant, u64)| s.1.elapsed() > Duration::from_secs(2);
+        if !self.sent.iter().any(|s| old(s) && s.0.exists()) {
+            self.sent.retain(|s| !old(s));
+            return false;
+        }
+        self.no_graphics = true;
+        self.forget_posters();
+        self.toast(
+            "This terminal didn't take the posters, showing colors instead",
+            true,
+        );
+        true
     }
 
     fn items(&self, view: &View) -> Vec<Item> {
@@ -716,12 +786,17 @@ impl App {
     }
 
     fn request_quit(&mut self) {
-        if self.dl_pending > 0 && !matches!(self.top().view, View::Confirm(Pending::Quit)) {
+        let busy = self.dl_pending > 0 || self.saves_pending > 0;
+        if busy && !matches!(self.top().view, View::Confirm(Pending::Quit)) {
+            let mut left = Vec::new();
+            if self.dl_pending > 0 {
+                left.push(plural(self.dl_pending as usize, "download"));
+            }
+            if self.saves_pending > 0 {
+                left.push(plural(self.saves_pending, "AniList save"));
+            }
             self.push(
-                format!(
-                    "{} left, quit anyway?",
-                    plural(self.dl_pending as usize, "download")
-                ),
+                format!("{} still running, quit anyway?", left.join(" and ")),
                 View::Confirm(Pending::Quit),
             );
         } else {
@@ -806,10 +881,12 @@ impl App {
                 let (m, c) = (m.clone(), self.client.clone());
                 match (key.as_str(), m.media_list_entry.as_ref().map(|e| e.id)) {
                     ("remove", Some(entry)) => {
+                        self.saves_pending += 1;
                         self.spawn(move || Msg::Saved(m, c.remove(entry).map(|_| None)))
                     }
                     (status, _) => {
                         let status = status.to_string();
+                        self.saves_pending += 1;
                         self.spawn(move || {
                             Msg::Saved(m.clone(), c.save(m.id, Some(&status), None).map(Some))
                         })
@@ -880,6 +957,7 @@ impl App {
                             Some("REPEATING") => "REPEATING",
                             _ => "CURRENT",
                         };
+                        self.saves_pending += 1;
                         self.spawn(move || {
                             Msg::Saved(m.clone(), c.save(m.id, Some(status), Some(ep)).map(Some))
                         });
@@ -895,7 +973,9 @@ impl App {
         let c = self.client.clone();
         if let Some(sort) = key.strip_prefix("browse:") {
             let sort = sort.to_string();
-            return self.push_loading(label, Some(sort.clone()), move || c.browse(&sort, None));
+            // per user: entries carry that user's list status and progress
+            let cache = format!("{}-{sort}", self.user.as_ref().map_or(0, |u| u.0));
+            return self.push_loading(label, Some(cache), move || c.browse(&sort, None));
         }
         match key {
             "search" => _ = self.push("Search", View::Input(Input::Search)),
@@ -1088,6 +1168,19 @@ impl App {
         }
     }
 
+    /// Marks this user's cached lists as old, so the next visit shows them and refreshes.
+    fn outdate_lists(&self) {
+        LIST_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Ok(dir) = fs::read_dir(ani::cache_dir().join("lists")) else {
+            return;
+        };
+        for e in dir.flatten() {
+            if let Ok(f) = fs::File::options().write(true).open(e.path()) {
+                let _ = f.set_modified(std::time::UNIX_EPOCH);
+            }
+        }
+    }
+
     fn update_media(&mut self, id: u64, entry: Option<Entry>) {
         for s in &mut self.stack {
             let media: Vec<&mut Media> = match &mut s.view {
@@ -1145,10 +1238,23 @@ impl App {
                 self.toast(format!("AniList login failed: {e}"), true);
                 self.refresh();
             }
-            Msg::Cover(id, size, res) => {
-                if matches!(self.covers.get(&id), Some(Cover::Loading(s)) if *s == size) {
-                    self.covers
-                        .insert(id, res.map_or(Cover::Failed, |p| Cover::Ready(size, p)));
+            Msg::Cover(id, key, res) => {
+                let wanted = matches!(self.covers.get(&id), Some(Cover::Loading(k)) if *k == key);
+                match res {
+                    // sent now, even for look-ahead posters: showing one later is free
+                    Ok((file, w, h, cells)) if wanted => {
+                        self.next_image = self.next_image % 0xFF_FFFF + 1; // 24-bit ids, never 0
+                        kitty::transmit(self.next_image, &file, (w, h), cells);
+                        self.sent.push((file, Instant::now(), id));
+                        let poster = kitty::Poster {
+                            id: self.next_image,
+                            size: cells,
+                        };
+                        self.covers.insert(id, Cover::Ready(key, poster));
+                    }
+                    Ok((file, ..)) => _ = fs::remove_file(file), // stale, never sent
+                    Err(_) if wanted => _ = self.covers.insert(id, Cover::Failed),
+                    Err(_) => {}
                 }
             }
             Msg::Resolved(m, res) => {
@@ -1168,17 +1274,21 @@ impl App {
                 }
                 self.refresh();
             }
-            Msg::Saved(m, res) => match res {
-                Ok(entry) => {
-                    self.toast(format!("Saved {}", m.name()), false);
-                    self.update_media(m.id, entry);
-                    if matches!(self.top().view, View::Status(_)) {
-                        self.stack.pop();
+            Msg::Saved(m, res) => {
+                self.saves_pending -= 1;
+                match res {
+                    Ok(entry) => {
+                        self.toast(format!("Saved {}", m.name()), false);
+                        self.update_media(m.id, entry);
+                        self.outdate_lists();
+                        if matches!(self.top().view, View::Status(_)) {
+                            self.stack.pop();
+                        }
+                        self.refresh();
                     }
-                    self.refresh();
+                    Err(e) => self.toast(e, true),
                 }
-                Err(e) => self.toast(e, true),
-            },
+            }
             Msg::Played(m, ep, res) => {
                 self.playing = None;
                 match res {
