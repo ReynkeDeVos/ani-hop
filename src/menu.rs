@@ -10,6 +10,8 @@ pub struct Item {
     pub label: String,
     pub hint: String,
     pub key: String,
+    /// already watched: shown with a check and dimmed
+    pub done: bool,
 }
 
 impl Item {
@@ -18,6 +20,7 @@ impl Item {
             key: key.into(),
             label: label.into(),
             hint: hint.into(),
+            done: false,
         }
     }
 }

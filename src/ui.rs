@@ -2,7 +2,9 @@ use crate::anilist::Media;
 use crate::kitty;
 use crate::{App, Cover, EpMode, Input, PIN_REDIRECT, Pending, View, ani, list_label};
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, BorderType, HighlightSpacing, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap,
+};
 
 // ANSI colors on purpose: they follow the terminal (and Omarchy) theme.
 const ACCENT: Color = Color::Magenta;
@@ -13,6 +15,7 @@ const LOGO: [&str; 2] = ["▄▀█ █▄ █ █ ▄▄ █ █ █▀█ █�
 const SHADES: [&str; 4] = ["░", "▒", "▓", "█"];
 const BOOT_MS: u128 = 500;
 const GLINT_MS: u128 = 450;
+const POP_MS: u128 = 160;
 
 pub fn render(app: &mut App, f: &mut Frame) {
     app.cell = kitty::cell_px();
@@ -28,12 +31,66 @@ pub fn render(app: &mut App, f: &mut Frame) {
     menu(app, f, left);
     preview(app, f, right);
     footer(app, f, foot);
+    starting(app, f);
     boot(app, f.buffer_mut());
 }
 
 // Effects never hide content for long: speed first, the shine comes on top.
 pub fn effects_running(app: &App) -> bool {
-    app.started.elapsed().as_millis() < BOOT_MS || app.glint.1.elapsed().as_millis() < GLINT_MS
+    app.started.elapsed().as_millis() < BOOT_MS
+        || app.glint.1.elapsed().as_millis() < GLINT_MS
+        || app.playing.as_ref().is_some_and(|p| p.step.is_some())
+}
+
+/// While an episode starts, a box pops up in the middle with a running bar, so enter
+/// visibly did something at once. It goes when mpv shows the episode.
+fn starting(app: &App, f: &mut Frame) {
+    let Some((p, step)) = app.playing.as_ref().and_then(|p| Some((p, p.step?))) else {
+        return;
+    };
+    // the cover color, unless it's too dark to see
+    let color = match p.color.as_deref().and_then(hex) {
+        Some(Color::Rgb(r, g, b)) if r as u16 + g as u16 + b as u16 > 180 => Color::Rgb(r, g, b),
+        _ => ACCENT,
+    };
+    // grows out of the middle, fast at first
+    let t = (p.since.elapsed().as_millis() as f32 / POP_MS as f32).min(1.0);
+    let grow = 1.0 - (1.0 - t).powi(3);
+    let (w, h) = (f.area().width.min(56) as f32, f.area().height.min(7) as f32);
+    let area = f.area().centered(
+        Constraint::Length((w * (0.5 + 0.5 * grow)) as u16),
+        Constraint::Length((h * (0.4 + 0.6 * grow)).max(3.0) as u16),
+    );
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(color)
+        .title(Span::styled(" ▶ Starting ", Style::new().fg(color).bold()));
+    let inner = block.inner(area).inner(Margin::new(2, 1));
+    // a light band runs over the bar, like over the loading lists
+    let band = (app.started.elapsed().as_millis() / 20) as usize % (inner.width as usize + 10);
+    let bar: Vec<Span> = (0..inner.width as usize)
+        .map(|x| {
+            Span::styled(
+                "━",
+                if (x + 5).abs_diff(band) < 5 {
+                    color
+                } else {
+                    DIM
+                },
+            )
+        })
+        .collect();
+    let lines = vec![
+        Line::styled(p.title.as_str(), Style::new().bold()),
+        Line::from(vec![
+            Span::styled(format!("{} ", spinner(app)), color),
+            Span::styled(format!("{step}…"), DIM),
+        ]),
+        Line::from(bar),
+    ];
+    f.render_widget(Clear, area);
+    f.render_widget(block, area);
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// How far a left-to-right front with a `band`-wide tail has passed `x`, at progress `t`.
@@ -241,18 +298,20 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         .iter()
         .map(|(i, hits)| {
             let item = &m.items[*i];
-            let mut spans = vec![
-                Span::styled(if m.marked.contains(i) { "●" } else { " " }, Color::Green),
-                " ".into(),
-            ];
+            let mark = match (m.marked.contains(i), item.done) {
+                (true, _) => "●",
+                (false, true) => "✓",
+                _ => " ",
+            };
+            let mut spans = vec![Span::styled(mark, Color::Green), " ".into()];
             spans.extend(item.label.chars().enumerate().map(|(ci, ch)| {
                 let hit = hits.binary_search(&(ci as u32)).is_ok();
                 Span::styled(
                     ch.to_string(),
-                    if hit {
-                        Style::new().fg(MATCH).bold()
-                    } else {
-                        Style::new()
+                    match (hit, item.done) {
+                        (true, _) => Style::new().fg(MATCH).bold(),
+                        (false, true) => Style::new().fg(DIM),
+                        _ => Style::new(),
                     },
                 )
             }));

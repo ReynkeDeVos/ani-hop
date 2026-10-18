@@ -128,6 +128,9 @@ pub struct Playing {
     pub title: String,
     /// what it waits on, None once mpv shows it
     pub step: Option<&'static str>,
+    /// when enter was pressed, for the pop-up
+    pub since: Instant,
+    pub color: Option<String>,
 }
 
 const SEARCHING: &str = "searching ani-cli";
@@ -723,6 +726,11 @@ impl App {
                     "Downloads",
                     plural(self.local.len(), "show"),
                 ));
+                v.push(Item::new(
+                    "skip",
+                    "Skip openings and endings",
+                    if ani::skip_on() { "on" } else { "off" },
+                ));
                 v.push(match (&self.client.token, &self.user) {
                     (Some(_), user) => Item::new(
                         "logout",
@@ -820,16 +828,20 @@ impl App {
             }
             View::Episodes(m, mode) => {
                 let local = ani::local_episodes(&ani::folder(m));
+                // AniList progress: everything up to it counts as watched
+                let watched = |ep: &str| m.progress() > 0 && ani::ep_num(ep) <= m.progress() as f64;
                 if *mode == EpMode::Delete {
                     return local
                         .into_iter()
                         .map(|(ep, p)| {
                             let mb = fs::metadata(&p).map_or(0, |md| md.len() >> 20);
-                            Item::new(
+                            let mut it = Item::new(
                                 p.to_string_lossy(),
                                 format!("Episode {ep}"),
                                 format!("{mb} MB"),
-                            )
+                            );
+                            it.done = watched(&ep);
+                            it
                         })
                         .collect();
                 }
@@ -850,14 +862,11 @@ impl App {
                 }
                 eps.into_iter()
                     .map(|ep| {
-                        let mut hint = Vec::new();
-                        if local.iter().any(|(e, _)| *e == ep) {
-                            hint.push("on disk");
-                        }
-                        if ani::ep_num(&ep) <= m.progress() as f64 {
-                            hint.push("watched");
-                        }
-                        Item::new(ep.clone(), format!("Episode {ep}"), hint.join(" · "))
+                        let on_disk = local.iter().any(|(e, _)| *e == ep);
+                        let label = format!("Episode {ep}");
+                        let mut it = Item::new(&ep, label, if on_disk { "on disk" } else { "" });
+                        it.done = watched(&ep);
+                        it
                     })
                     .collect()
             }
@@ -1161,6 +1170,15 @@ impl App {
                     self.push("AniList setup", View::Input(Input::ClientId));
                 }
             },
+            "skip" => {
+                let on = !ani::skip_on();
+                if let Err(e) = ani::set_skip(on) {
+                    return self.toast(e.to_string(), true);
+                }
+                let state = if on { "on" } else { "off" };
+                self.toast(format!("Skipping openings and endings: {state}"), false);
+                self.refresh();
+            }
             "logout" => {
                 let _ = fs::remove_file(token_path());
                 let _ = fs::remove_file(user_path());
@@ -1317,6 +1335,8 @@ impl App {
             ep: ep.clone(),
             title: format!("{} · Episode {ep}", m.name()),
             step: Some(step),
+            since: Instant::now(),
+            color: m.cover_image.color.clone(),
         });
         if local.is_none() && src.is_none() {
             return self.resolve(&m, Some(Want::Play(ep)));
@@ -1451,13 +1471,9 @@ impl App {
             Msg::Resolved(m, res) => {
                 let want = self.resolving.remove(&m.id).flatten();
                 // the wait is over either way; playing it starts anew below
-                if self
+                let waited = self
                     .playing
-                    .as_ref()
-                    .is_some_and(|p| p.id == m.id && p.step == Some(SEARCHING))
-                {
-                    self.playing = None;
-                }
+                    .take_if(|p| p.id == m.id && p.step == Some(SEARCHING));
                 let here = matches!(&self.top().view, View::Show(s) | View::Episodes(s, _) if s.id == m.id);
                 match res {
                     Ok(src) => {
@@ -1470,6 +1486,12 @@ impl App {
                     }
                     Err(e) if want.is_some() || here => self.toast(format!("ani-cli: {e}"), true),
                     Err(_) => {}
+                }
+                // same pop-up, it doesn't pop in a second time
+                if let (Some(w), Some(p)) = (waited, &mut self.playing)
+                    && p.id == w.id
+                {
+                    p.since = w.since;
                 }
                 self.refresh();
             }
