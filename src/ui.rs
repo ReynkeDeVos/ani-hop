@@ -241,18 +241,20 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         .iter()
         .map(|(i, hits)| {
             let item = &m.items[*i];
-            let mut spans = vec![
-                Span::styled(if m.marked.contains(i) { "●" } else { " " }, Color::Green),
-                " ".into(),
-            ];
+            let mark = match (m.marked.contains(i), item.done) {
+                (true, _) => "●",
+                (false, true) => "✓",
+                _ => " ",
+            };
+            let mut spans = vec![Span::styled(mark, Color::Green), " ".into()];
             spans.extend(item.label.chars().enumerate().map(|(ci, ch)| {
                 let hit = hits.binary_search(&(ci as u32)).is_ok();
                 Span::styled(
                     ch.to_string(),
-                    if hit {
-                        Style::new().fg(MATCH).bold()
-                    } else {
-                        Style::new()
+                    match (hit, item.done) {
+                        (true, _) => Style::new().fg(MATCH).bold(),
+                        (false, true) => Style::new().fg(DIM),
+                        _ => Style::new(),
                     },
                 )
             }));

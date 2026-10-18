@@ -820,16 +820,20 @@ impl App {
             }
             View::Episodes(m, mode) => {
                 let local = ani::local_episodes(&ani::folder(m));
+                // AniList progress: everything up to it counts as watched
+                let watched = |ep: &str| m.progress() > 0 && ani::ep_num(ep) <= m.progress() as f64;
                 if *mode == EpMode::Delete {
                     return local
                         .into_iter()
                         .map(|(ep, p)| {
                             let mb = fs::metadata(&p).map_or(0, |md| md.len() >> 20);
-                            Item::new(
+                            let mut it = Item::new(
                                 p.to_string_lossy(),
                                 format!("Episode {ep}"),
                                 format!("{mb} MB"),
-                            )
+                            );
+                            it.done = watched(&ep);
+                            it
                         })
                         .collect();
                 }
@@ -850,14 +854,11 @@ impl App {
                 }
                 eps.into_iter()
                     .map(|ep| {
-                        let mut hint = Vec::new();
-                        if local.iter().any(|(e, _)| *e == ep) {
-                            hint.push("on disk");
-                        }
-                        if ani::ep_num(&ep) <= m.progress() as f64 {
-                            hint.push("watched");
-                        }
-                        Item::new(ep.clone(), format!("Episode {ep}"), hint.join(" · "))
+                        let on_disk = local.iter().any(|(e, _)| *e == ep);
+                        let label = format!("Episode {ep}");
+                        let mut it = Item::new(&ep, label, if on_disk { "on disk" } else { "" });
+                        it.done = watched(&ep);
+                        it
                     })
                     .collect()
             }

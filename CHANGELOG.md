@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Watched episodes (up to your AniList progress) are marked with a ✓ and dimmed in the episode, download and delete lists.
+
 ## 0.2.0 – 2026-10-18
 
 ### Added
