@@ -20,10 +20,9 @@ use ratatui_image::protocol::Protocol;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -121,7 +120,6 @@ pub struct App {
     pub user: Option<(u64, String)>,
     pub picker: Picker,
     pub covers: HashMap<u64, Cover>,
-    cover_tx: Sender<(u64, String, Size)>,
     /// poster size in cells, set by the last layout
     pub poster: Size,
     pub sources: HashMap<u64, Source>,
@@ -136,10 +134,8 @@ pub struct App {
     pub playing: Option<String>,
     pub toast: Option<(String, bool, Instant)>,
     pub started: Instant,
-    pub fx: tachyonfx::EffectManager<ui::Fx>,
-    /// media whose title glint already played
-    pub fx_media: u64,
-    pub last_frame: Instant,
+    /// media whose title glint plays, and since when
+    pub glint: (u64, Instant),
     pub missing: Vec<(&'static str, &'static str, &'static str)>,
     /// shell command to run in the real terminal (TUI paused), e.g. installing packages
     external: Option<String>,
@@ -158,12 +154,15 @@ fn main() -> std::io::Result<()> {
     let res = (|| -> std::io::Result<()> {
         let mut dirty = true;
         while !app.quit {
+            let (fx, glint) = (ui::effects_running(&app), app.glint.1);
             if dirty || app.animating() {
                 terminal.draw(|f| ui::render(&mut app, f))?;
             }
-            dirty = false;
+            // one more frame after an effect ends (or starts in a slow frame), so it never
+            // freezes mid-sweep
+            dirty = fx || app.glint.1 != glint;
             // ~60 fps while an effect plays, otherwise just often enough for spinners
-            let fps = if app.fx.is_running() { 16 } else { 80 };
+            let fps = if ui::effects_running(&app) { 16 } else { 80 };
             let mut wait = Duration::from_millis(fps);
             while event::poll(wait)? {
                 match event::read()? {
@@ -219,14 +218,13 @@ fn list_cache(key: &str) -> PathBuf {
 }
 
 fn client_id() -> Option<String> {
-    std::env::var("ANIHOP_CLIENT_ID")
+    fs::read_to_string(ani::config_dir().join("client_id"))
         .ok()
-        .or_else(|| fs::read_to_string(ani::config_dir().join("client_id")).ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
 
-fn write_private(path: &PathBuf, text: &str) -> std::io::Result<()> {
+fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     fs::create_dir_all(ani::config_dir())?;
     use std::io::Write;
     fs::OpenOptions::new()
@@ -253,38 +251,20 @@ fn open_url(url: &str) {
         .spawn();
 }
 
-fn spawn_covers(picker: Picker, client: Client, tx: Sender<Msg>) -> Sender<(u64, String, Size)> {
-    let (req_tx, req_rx) = mpsc::channel::<(u64, String, Size)>();
-    let req_rx = Arc::new(Mutex::new(req_rx));
-    for _ in 0..4 {
-        let (rx, tx, picker, client) = (req_rx.clone(), tx.clone(), picker.clone(), client.clone());
-        thread::spawn(move || {
-            loop {
-                let Ok((id, url, size)) = rx.lock().unwrap().recv() else {
-                    return;
-                };
-                let path = ani::cache_dir().join("covers").join(format!("{id}.jpg"));
-                let res = fs::read(&path)
-                    .or_else(|_| {
-                        let bytes = client.fetch(&url)?;
-                        let _ = fs::create_dir_all(path.parent().unwrap());
-                        let _ = fs::write(&path, &bytes);
-                        Ok(bytes)
-                    })
-                    .and_then(|b| image::load_from_memory(&b).map_err(|e| e.to_string()))
-                    .and_then(|img| {
-                        let resize = Resize::Scale(Some(image::imageops::FilterType::Triangle));
-                        picker
-                            .new_protocol(img, size, resize)
-                            .map_err(|e| e.to_string())
-                    });
-                if tx.send(Msg::Cover(id, size, res)).is_err() {
-                    return;
-                }
-            }
-        });
-    }
-    req_tx
+/// Cover from the disk cache (or AniList), scaled and encoded for the terminal.
+fn load_cover(picker: &Picker, id: u64, url: &str, size: Size) -> Result<Protocol, String> {
+    let path = ani::cache_dir().join("covers").join(format!("{id}.jpg"));
+    let bytes = fs::read(&path).or_else(|_| {
+        let bytes = anilist::fetch(url)?;
+        let _ = fs::create_dir_all(path.parent().unwrap());
+        let _ = fs::write(&path, &bytes);
+        Ok::<_, String>(bytes)
+    })?;
+    let img = image::load_from_memory(&bytes).map_err(|e| e.to_string())?;
+    let resize = Resize::Scale(Some(image::imageops::FilterType::Triangle));
+    picker
+        .new_protocol(img, size, resize)
+        .map_err(|e| e.to_string())
 }
 
 fn spawn_downloader(tx: Sender<Msg>) -> Sender<Job> {
@@ -335,11 +315,10 @@ impl App {
         if let Some((_, _, english)) = &user {
             anilist::ENGLISH_TITLES.store(*english, std::sync::atomic::Ordering::Relaxed);
         }
-        let client = Client::new(token);
+        let client = Client { token };
         let mut app = App {
             stack: Vec::new(),
             next_id: 0,
-            cover_tx: spawn_covers(picker.clone(), client.clone(), tx.clone()),
             dl_tx: spawn_downloader(tx.clone()),
             tx,
             rx,
@@ -357,14 +336,11 @@ impl App {
             playing: None,
             toast: None,
             started: Instant::now(),
-            fx: Default::default(),
-            fx_media: 0,
-            last_frame: Instant::now(),
+            glint: (0, Instant::now()),
             missing: ani::missing_deps(),
             external: None,
             quit: false,
         };
-        app.fx.add_unique_effect(ui::Fx::Boot, ui::boot_fx());
         app.scan_local();
         app.push("ani-hop", View::Main);
         let welcomed = ani::config_dir().join("welcomed");
@@ -446,9 +422,8 @@ impl App {
     }
 
     fn pop(&mut self, n: usize) {
-        for _ in 0..n.min(self.stack.len() - 1) {
-            self.stack.pop();
-        }
+        self.stack
+            .truncate(self.stack.len().saturating_sub(n).max(1));
         self.refresh();
     }
 
@@ -471,7 +446,7 @@ impl App {
 
     /// Something on screen changes without input (spinner, progress, fading toast).
     fn animating(&self) -> bool {
-        self.fx.is_running()
+        ui::effects_running(self)
             || self.stack.last().unwrap().loading
             || self.dl_pending > 0
             || self
@@ -490,14 +465,25 @@ impl App {
         if fresh || size.width == 0 {
             return;
         }
+        // at most 4 posters in flight; the frame after one arrives asks again for the rest
+        if self
+            .covers
+            .values()
+            .filter(|c| matches!(c, Cover::Loading(_)))
+            .count()
+            >= 4
+        {
+            return;
+        }
         // ponytail: drop everything past ~100 posters (~40 MB); they reload from disk cache in ms
         if self.covers.len() > 100 {
             self.covers.clear();
         }
-        match &m.cover_image.extra_large {
+        match m.cover_image.extra_large.clone() {
             Some(url) => {
                 self.covers.insert(m.id, Cover::Loading(size));
-                let _ = self.cover_tx.send((m.id, url.clone(), size));
+                let (id, picker) = (m.id, self.picker.clone());
+                self.spawn(move || Msg::Cover(id, size, load_cover(&picker, id, &url, size)));
             }
             None => _ = self.covers.insert(m.id, Cover::Failed),
         }
@@ -515,9 +501,9 @@ impl App {
                     v.extend(LISTS[..2].iter().map(list));
                 }
                 v.extend([
-                    Item::new("trending", "Trending now", ""),
-                    Item::new("top", "Top rated", ""),
-                    Item::new("popular", "All-time popular", ""),
+                    Item::new("browse:TRENDING_DESC", "Trending now", ""),
+                    Item::new("browse:SCORE_DESC", "Top rated", ""),
+                    Item::new("browse:POPULARITY_DESC", "All-time popular", ""),
                     Item::new("search", "Search…", ""),
                 ]);
                 if self.user.is_some() {
@@ -528,15 +514,14 @@ impl App {
                     "Downloads",
                     plural(self.local.len(), "show"),
                 ));
-                match &self.user {
-                    Some((_, name)) => {
-                        v.push(Item::new("logout", "Log out of AniList", name.clone()))
-                    }
-                    None if self.client.token.is_some() => {
-                        v.push(Item::new("logout", "Log out of AniList", ""))
-                    }
-                    None => v.push(Item::new("login", "Log in to AniList", "")),
-                }
+                v.push(match (&self.client.token, &self.user) {
+                    (Some(_), user) => Item::new(
+                        "logout",
+                        "Log out of AniList",
+                        user.as_ref().map_or("", |u| u.1.as_str()),
+                    ),
+                    (None, _) => Item::new("login", "Log in to AniList", ""),
+                });
                 v.push(Item::new("quit", "Quit", ""));
                 v
             }
@@ -760,11 +745,15 @@ impl App {
         else {
             return;
         };
+        let label = screen
+            .menu
+            .current()
+            .map_or(String::new(), |i| i.label.clone());
         match &screen.view {
-            View::Main => self.main_action(&key),
+            View::Main => self.main_action(&key, &label),
             View::Setup => match key.as_str() {
                 "install" => self.external = screen.menu.current().map(|i| i.hint.clone()),
-                "login" => self.main_action("login"),
+                "login" => self.main_action("login", ""),
                 _ => self.pop(1),
             },
             View::Shows(list, _) => {
@@ -902,18 +891,13 @@ impl App {
         }
     }
 
-    fn main_action(&mut self, key: &str) {
+    fn main_action(&mut self, key: &str, label: &str) {
         let c = self.client.clone();
+        if let Some(sort) = key.strip_prefix("browse:") {
+            let sort = sort.to_string();
+            return self.push_loading(label, Some(sort.clone()), move || c.browse(&sort, None));
+        }
         match key {
-            "trending" => self.push_loading("Trending", Some(key.into()), move || {
-                c.browse("TRENDING_DESC", None)
-            }),
-            "top" => self.push_loading("Top rated", Some(key.into()), move || {
-                c.browse("SCORE_DESC", None)
-            }),
-            "popular" => self.push_loading("Popular", Some(key.into()), move || {
-                c.browse("POPULARITY_DESC", None)
-            }),
             "search" => _ = self.push("Search", View::Input(Input::Search)),
             "downloads" => {
                 let list = ani::local_shows().into_iter().map(|(m, _)| m).collect();
@@ -936,10 +920,11 @@ impl App {
             "quit" => self.request_quit(),
             list => {
                 let status = list.trim_start_matches("list:").to_string();
-                let label = LISTS.iter().find(|l| l.0 == status).map_or("List", |l| l.1);
                 let user = self.user.as_ref().map_or(0, |u| u.0);
                 let cache = format!("{user}-{status}");
-                self.push_loading(label, Some(cache), move || c.list(user, &status));
+                self.push_loading(list_label(&status), Some(cache), move || {
+                    c.list(user, &status)
+                });
             }
         }
     }
@@ -1081,6 +1066,28 @@ impl App {
         });
     }
 
+    /// Fills a screen that waited on a background result. On failure it goes away, unless
+    /// it already shows something (cached entries stay usable offline).
+    fn fill<T>(&mut self, id: u64, res: Result<T, String>, set: impl FnOnce(&mut View, T)) {
+        let Some(pos) = self.stack.iter().position(|s| s.id == id) else {
+            return;
+        };
+        self.stack[pos].loading = false;
+        match res {
+            Ok(data) => {
+                set(&mut self.stack[pos].view, data);
+                let items = self.items(&self.stack[pos].view);
+                self.stack[pos].menu.set_items(items);
+            }
+            Err(e) => {
+                if self.stack[pos].menu.items.is_empty() {
+                    self.stack.truncate(pos);
+                }
+                self.toast(e, true);
+            }
+        }
+    }
+
     fn update_media(&mut self, id: u64, entry: Option<Entry>) {
         for s in &mut self.stack {
             let media: Vec<&mut Media> = match &mut s.view {
@@ -1100,44 +1107,12 @@ impl App {
 
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Shows(id, res) => {
-                let Some(pos) = self.stack.iter().position(|s| s.id == id) else {
-                    return;
-                };
-                self.stack[pos].loading = false;
-                match res {
-                    Ok(list) => {
-                        self.stack[pos].view = View::Shows(list, false);
-                        let items = self.items(&self.stack[pos].view);
-                        self.stack[pos].menu.set_items(items);
-                    }
-                    // cached entries stay usable offline
-                    Err(e) if !self.stack[pos].menu.items.is_empty() => self.toast(e, true),
-                    Err(e) => {
-                        self.toast(e, true);
-                        self.stack.truncate(pos);
-                    }
+            Msg::Shows(id, res) => self.fill(id, res, |v, list| *v = View::Shows(list, false)),
+            Msg::Hits(id, res) => self.fill(id, res, |v, hits| {
+                if let View::Sources(_, _, h) = v {
+                    *h = hits;
                 }
-            }
-            Msg::Hits(id, res) => {
-                let Some(pos) = self.stack.iter().position(|s| s.id == id) else {
-                    return;
-                };
-                match res {
-                    Ok(hits) => {
-                        if let View::Sources(_, _, h) = &mut self.stack[pos].view {
-                            *h = hits;
-                        }
-                        self.stack[pos].loading = false;
-                        let items = self.items(&self.stack[pos].view);
-                        self.stack[pos].menu.set_items(items);
-                    }
-                    Err(e) => {
-                        self.toast(e, true);
-                        self.stack.truncate(pos);
-                    }
-                }
-            }
+            }),
             Msg::Viewer(Ok(user)) => {
                 let english = anilist::ENGLISH_TITLES.load(std::sync::atomic::Ordering::Relaxed);
                 let _ = write_private(

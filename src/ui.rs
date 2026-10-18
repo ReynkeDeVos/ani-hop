@@ -4,10 +4,6 @@ use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 use ratatui_image::Image;
 use ratatui_image::picker::Capability;
-use std::time::{Duration, Instant};
-use tachyonfx::fx::{self, EvolveSymbolSet};
-use tachyonfx::pattern::SweepPattern;
-use tachyonfx::{CellFilter, Effect, Interpolation};
 
 // ANSI colors on purpose: they follow the terminal (and Omarchy) theme.
 const ACCENT: Color = Color::Magenta;
@@ -15,6 +11,9 @@ const MATCH: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const LOGO: [&str; 2] = ["▄▀█ █▄ █ █ ▄▄ █ █ █▀█ █▀█", "█▀█ █ ▀█ █    █▀█ █▄█ █▀▀"];
+const SHADES: [&str; 4] = ["░", "▒", "▓", "█"];
+const BOOT_MS: u128 = 500;
+const GLINT_MS: u128 = 450;
 
 pub fn render(app: &mut App, f: &mut Frame) {
     let [head, body, foot] = Layout::vertical([
@@ -29,43 +28,55 @@ pub fn render(app: &mut App, f: &mut Frame) {
     menu(app, f, left);
     preview(app, f, right);
     footer(app, f, foot);
-    // effects run on top of the finished frame; long idle gaps count as one frame
-    let dt = app.last_frame.elapsed().min(Duration::from_millis(50));
-    app.last_frame = Instant::now();
-    let screen = f.area();
-    app.fx.process_effects(dt.into(), f.buffer_mut(), screen);
+    boot(app, f.buffer_mut());
 }
 
-// Effects never hide content: speed first, the shine comes on top.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Fx {
-    #[default]
-    Boot,
-    Glint,
+// Effects never hide content for long: speed first, the shine comes on top.
+pub fn effects_running(app: &App) -> bool {
+    app.started.elapsed().as_millis() < BOOT_MS || app.glint.1.elapsed().as_millis() < GLINT_MS
 }
 
-/// Effects must never touch poster cells: the Kitty image travels inside the first
-/// placeholder cell and is only sent once.
-fn not_image() -> CellFilter {
-    CellFilter::AllOf(vec![
-        CellFilter::NonEmpty,
-        CellFilter::eval_cell(|c| !c.symbol().contains('\u{10EEEE}')),
-    ])
+/// How far a left-to-right front with a `band`-wide tail has passed `x`, at progress `t`.
+fn swept(t: f32, x: u16, width: u16, band: f32) -> f32 {
+    t * (width as f32 + band) - x as f32
 }
 
-/// The UI materializes through ░▒▓█, left to right; the menu is usable from frame one.
-pub fn boot_fx() -> Effect {
-    fx::evolve_into(EvolveSymbolSet::Shaded, (500, Interpolation::QuadOut))
-        .with_pattern(SweepPattern::left_to_right(25))
-        .with_filter(not_image())
+/// Start-up: every glyph runs ░▒▓█ behind a sweeping front, then turns into the real UI.
+/// Image cells stay untouched: the Kitty image travels inside them and is sent only once.
+fn boot(app: &App, buf: &mut Buffer) {
+    let t = app.started.elapsed().as_millis() as f32 / BOOT_MS as f32;
+    let area = buf.area;
+    if t >= 1.0 {
+        return;
+    }
+    for (x, y) in area.positions().map(|p| (p.x, p.y)) {
+        let cell = &mut buf[(x, y)];
+        let d = swept(t, x, area.width, 25.0);
+        if d < 25.0 && cell.symbol() != " " && !cell.symbol().contains('\u{10EEEE}') {
+            cell.set_symbol(SHADES[(d.max(0.0) / 25.0 * 4.0) as usize]);
+        }
+    }
 }
 
-/// A light sweep across the title in its cover color, text readable throughout.
-fn glint(title: Color, area: Rect) -> Effect {
-    fx::fade_from_fg(Color::White, (450, Interpolation::QuadOut))
-        .with_pattern(SweepPattern::left_to_right(12))
-        .with_area(area)
-        .with_filter(CellFilter::FgColor(title))
+/// A white sweep across the title that settles into its cover color.
+fn glint(app: &App, buf: &mut Buffer, area: Rect, (r, g, b): (u8, u8, u8)) {
+    let t = app.glint.1.elapsed().as_millis() as f32 / GLINT_MS as f32;
+    if t >= 1.0 {
+        return;
+    }
+    let lerp = |c: u8, w: f32| (c as f32 + (255.0 - c as f32) * w) as u8;
+    for pos in area.positions() {
+        let cell = &mut buf[pos];
+        if cell.fg == Color::Rgb(r, g, b) {
+            let w = 1.0 - (swept(t, pos.x - area.x, area.width, 12.0) / 12.0).clamp(0.0, 1.0);
+            cell.fg = Color::Rgb(lerp(r, w), lerp(g, w), lerp(b, w));
+        }
+    }
+}
+
+fn logo() -> impl Iterator<Item = Line<'static>> {
+    LOGO.iter()
+        .map(|l| Line::styled(*l, Style::new().fg(ACCENT).bold()))
 }
 
 fn panel() -> Block<'static> {
@@ -335,10 +346,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
             Span::styled(what, DIM),
         ])
     };
-    let mut v: Vec<Line> = LOGO
-        .iter()
-        .map(|l| Line::styled(*l, Style::new().fg(ACCENT).bold()))
-        .collect();
+    let mut v: Vec<Line> = logo().collect();
     v.extend(["".into(), Line::styled("Tools", Style::new().bold())]);
     for (bin, _, what) in ani::DEPS {
         v.push(row(!app.missing.iter().any(|d| d.0 == bin), bin, what));
@@ -375,10 +383,7 @@ fn banner(app: &App) -> Vec<Line<'static>> {
             Span::styled(what, DIM),
         ])
     };
-    let mut v: Vec<Line> = LOGO
-        .iter()
-        .map(|l| Line::styled(*l, Style::new().fg(ACCENT).bold()))
-        .collect();
+    let mut v: Vec<Line> = logo().collect();
     v.push("".into());
     v.push(match &app.user {
         Some((_, n)) => Line::from(vec![
@@ -388,9 +393,7 @@ fn banner(app: &App) -> Vec<Line<'static>> {
         None => Line::styled("○ AniList: not connected", DIM),
     });
     let root = ani::download_root().display().to_string();
-    let home = dirs::home_dir()
-        .map(|h| h.display().to_string())
-        .unwrap_or_default();
+    let home = ani::home().display().to_string();
     v.push(Line::styled(
         format!("↓ {}", root.replacen(&home, "~", 1)),
         DIM,
@@ -433,11 +436,9 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media) {
         .as_deref()
         .and_then(hex)
         .unwrap_or(ACCENT);
-    // only true RGB titles: named colors would snap at the end of the fade
-    if app.fx_media != m.id && matches!(accent, Color::Rgb(..)) {
-        app.fx.add_unique_effect(Fx::Glint, glint(accent, info));
+    if app.glint.0 != m.id {
+        app.glint = (m.id, std::time::Instant::now());
     }
-    app.fx_media = m.id;
     match app.covers.get(&m.id) {
         Some(Cover::Ready(_, p)) => f.render_widget(Image::new(p), poster),
         // the cover's dominant color stands in while it loads
@@ -518,6 +519,10 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media) {
         ));
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), info);
+    // only true RGB titles: a named color has no RGB value to fade back into
+    if let Color::Rgb(r, g, b) = accent {
+        glint(app, f.buffer_mut(), info, (r, g, b));
+    }
 
     let desc = m.description.as_deref().map(strip_html).unwrap_or_default();
     f.render_widget(Paragraph::new(desc).wrap(Wrap { trim: true }), bottom);

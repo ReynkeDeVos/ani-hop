@@ -9,7 +9,7 @@ AniList liefert Listen, Infos und Poster; Streamen und Herunterladen übernehmen
 - Episoden herunterladen und löschen, auch in Bulk
 - fzf-Bedienung in jedem Menü, Poster + Infos in der Vorschau (Kitty-Grafikprotokoll)
 - Schnell zuerst: Listen, Login und ani-cli-Quellen sind gecacht und erscheinen sofort, aktualisiert wird im Hintergrund
-- Effekte mit [tachyonfx](https://github.com/junkdog/tachyonfx), die nie Inhalt verstecken: kurze Start-Animation, Glanz über dem Titel, Skeleton beim ersten Laden
+- Effekte, die nie Inhalt verstecken: kurze ░▒▓█-Start-Animation, Glanz über dem Titel, Skeleton beim ersten Laden
 
 ## Voraussetzungen
 
@@ -42,7 +42,7 @@ Mehrere Anime markieren + `enter` → alle (ungeschauten) Episoden laden oder Do
 
 Einmalig: unter <https://anilist.co/settings/developer> einen Client anlegen
 (Redirect URL `https://anilist.co/api/v2/oauth/pin`), dann in ani-hop „Log in to AniList“
-wählen, Client-ID und danach das angezeigte Token einfügen. Alternativ `ANIHOP_CLIENT_ID` setzen.
+wählen, Client-ID und danach das angezeigte Token einfügen.
 
 ## Downloads
 

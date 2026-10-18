@@ -9,9 +9,9 @@ use crate::anilist::Media;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Read;
+use std::io::{BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,24 +36,45 @@ pub struct Source {
     pub episodes: Vec<String>,
 }
 
+pub fn home() -> PathBuf {
+    std::env::home_dir().unwrap_or_else(std::env::temp_dir)
+}
+
+/// `$var` if it's an absolute path, else `~/fallback` (the XDG base-dir rule).
+fn xdg(var: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home().join(fallback))
+}
+
+/// XDG_VIDEOS_DIR from user-dirs.dirs (may be localized, e.g. "$HOME/Vidéos"). Like the
+/// dirs crate: only quoted values, and "$HOME/" means disabled.
+/// ponytail: no backslash unescaping, xdg-user-dirs-update never needs it for real paths
+fn videos_dir(user_dirs: &str, home: &Path) -> PathBuf {
+    user_dirs
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("XDG_VIDEOS_DIR=\"")?.split_once('"'))
+        .map(|(v, _)| PathBuf::from(v.replace("$HOME", &home.to_string_lossy())))
+        .filter(|p| p.is_absolute() && p != home)
+        .unwrap_or_else(|| home.join("Videos"))
+}
+
 pub fn cache_dir() -> PathBuf {
-    dirs::cache_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("ani-hop")
+    xdg("XDG_CACHE_HOME", ".cache").join("ani-hop")
 }
 
 pub fn config_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("ani-hop")
+    xdg("XDG_CONFIG_HOME", ".config").join("ani-hop")
 }
 
 pub fn download_root() -> PathBuf {
     match std::env::var("ANI_CLI_DOWNLOAD_DIR") {
         Ok(d) if !d.is_empty() && d != "." => PathBuf::from(d),
-        _ => dirs::video_dir()
-            .unwrap_or_else(|| dirs::home_dir().unwrap_or_default().join("Videos"))
-            .join("Anime"),
+        _ => {
+            let user_dirs = xdg("XDG_CONFIG_HOME", ".config").join("user-dirs.dirs");
+            videos_dir(&fs::read_to_string(user_dirs).unwrap_or_default(), &home()).join("Anime")
+        }
     }
 }
 
@@ -64,7 +85,7 @@ pub const DEPS: [(&str, &str, &str); 7] = [
     ("ani-skip", "ani-skip-git", "skips openings and endings"),
     ("yt-dlp", "yt-dlp", "downloads episodes"),
     ("ffmpeg", "ffmpeg", "finishes downloads"),
-    ("curl", "curl", "ani-cli's requests"),
+    ("curl", "curl", "AniList, posters and ani-cli"),
     ("xdg-open", "xdg-utils", "opens the AniList login"),
 ];
 
@@ -365,7 +386,7 @@ pub fn stream(src: &Source, ep: &str) -> Result<(), String> {
     }
 }
 
-pub fn play_file(m: &Media, ep: &str, file: &PathBuf) -> Result<(), String> {
+pub fn play_file(m: &Media, ep: &str, file: &Path) -> Result<(), String> {
     let mut mpv = Command::new("mpv");
     mpv.arg(format!("--force-media-title={} Episode {ep}", m.name()));
     let vtt = file.with_extension("vtt");
@@ -418,7 +439,7 @@ pub fn local_shows() -> Vec<(Media, PathBuf)> {
 }
 
 /// Downloaded episodes as (episode, file), sorted by episode number.
-pub fn local_episodes(dir: &PathBuf) -> Vec<(String, PathBuf)> {
+pub fn local_episodes(dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -444,12 +465,12 @@ pub fn ep_num(ep: &str) -> f64 {
     ep.parse().unwrap_or(f64::MAX)
 }
 
-pub fn delete_episode(file: &PathBuf) -> std::io::Result<()> {
+pub fn delete_episode(file: &Path) -> std::io::Result<()> {
     let _ = fs::remove_file(file.with_extension("vtt"));
     fs::remove_file(file)?;
     // drop the show folder once only our metadata is left
     let dir = file.parent().unwrap();
-    if local_episodes(&dir.to_path_buf()).is_empty() && fs::read_dir(dir)?.count() <= 1 {
+    if local_episodes(dir).is_empty() && fs::read_dir(dir)?.count() <= 1 {
         fs::remove_dir_all(dir)?;
     }
     Ok(())
@@ -488,18 +509,23 @@ pub fn download(
         let _ = stderr.read_to_end(&mut buf);
         buf
     });
-    // yt-dlp redraws its progress line with \r, so split on that too
-    let (mut out, mut line, mut byte) = (child.stdout.take().unwrap(), Vec::new(), [0u8]);
-    while out.read(&mut byte).unwrap_or(0) == 1 {
-        if byte[0] == b'\r' || byte[0] == b'\n' {
-            let l = String::from_utf8_lossy(&line);
-            if let Some(rest) = l.trim().strip_prefix("[download]") {
-                progress(rest.trim());
-            }
-            line.clear();
-        } else {
-            line.push(byte[0]);
+    // yt-dlp redraws its progress line with \r (or ends lines with \n under --newline)
+    let mut line = Vec::new();
+    for b in BufReader::new(child.stdout.take().unwrap())
+        .bytes()
+        .map_while(Result::ok)
+    {
+        if b != b'\r' && b != b'\n' {
+            line.push(b);
+            continue;
         }
+        if let Some(rest) = String::from_utf8_lossy(&line)
+            .trim()
+            .strip_prefix("[download]")
+        {
+            progress(rest.trim());
+        }
+        line.clear();
     }
     let _ = child.wait();
     DOWNLOAD.lock().unwrap().1 = None;
@@ -588,6 +614,24 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn finds_videos_dir_in_user_dirs() {
+        let home = Path::new("/home/a");
+        let file = "# comment\nXDG_MUSIC_DIR=\"$HOME/Musik\"\nXDG_VIDEOS_DIR=\"$HOME/Vidéos\"\n";
+        assert_eq!(videos_dir(file, home), Path::new("/home/a/Vidéos"));
+        assert_eq!(
+            videos_dir("XDG_VIDEOS_DIR=\"relative\"", home),
+            Path::new("/home/a/Videos")
+        );
+        assert_eq!(videos_dir("", home), Path::new("/home/a/Videos"));
+        let commented = "XDG_VIDEOS_DIR=\"$HOME/Vids\" # mine";
+        assert_eq!(videos_dir(commented, home), Path::new("/home/a/Vids"));
+        let disabled = "XDG_VIDEOS_DIR=\"$HOME/\"";
+        assert_eq!(videos_dir(disabled, home), Path::new("/home/a/Videos"));
+        let unquoted = "XDG_VIDEOS_DIR=$HOME/Clips";
+        assert_eq!(videos_dir(unquoted, home), Path::new("/home/a/Videos"));
     }
 
     #[test]

@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 const API: &str = "https://graphql.anilist.co";
 
@@ -97,35 +98,78 @@ impl Media {
     }
 }
 
+/// curl is a hard requirement anyway (ani-cli), so it does our HTTP too.
+fn curl(args: &[&str], stdin: Option<String>) -> Result<Vec<u8>, String> {
+    let mut child = Command::new("curl")
+        // -q must come first: ignore ~/.curlrc (it could log the token or change the output)
+        .args([
+            "-q",
+            "-sS",
+            "-g",
+            "--compressed",
+            "--proto",
+            "=https",
+            "--max-time",
+            "20",
+        ])
+        .args(["-A", "ani-hop"])
+        .args(args)
+        .stdin(if stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("curl: {e}"))?;
+    if let (Some(text), Some(mut pipe)) = (stdin, child.stdin.take()) {
+        let _ = pipe.write_all(text.as_bytes());
+    }
+    let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
+    match out.status.success() {
+        true => Ok(out.stdout),
+        false => Err(String::from_utf8_lossy(&out.stderr).trim().to_string()),
+    }
+}
+
+/// Plain GET, e.g. cover images. URLs can come from a `.media.json` in the download
+/// folder, so only plain https gets through: no "-option", no "@file" URL list.
+pub fn fetch(url: &str) -> Result<Vec<u8>, String> {
+    if !url.starts_with("https://") {
+        return Err(format!("not an https URL: {url}"));
+    }
+    curl(&["--fail", "--max-filesize", "20M", "--url", url], None)
+}
+
+/// A quoted string for curl's config syntax.
+fn quoted(s: &str) -> String {
+    let s = s.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{}\"", s.replace('\n', "\\n").replace('\r', "\\r"))
+}
+
 #[derive(Clone)]
 pub struct Client {
-    agent: ureq::Agent,
     pub token: Option<String>,
 }
 
 impl Client {
-    pub fn new(token: Option<String>) -> Self {
-        let config = ureq::Agent::config_builder()
-            .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(20)))
-            .build();
-        Client {
-            agent: config.into(),
-            token,
-        }
-    }
-
     fn gql(&self, query: &str, variables: Value) -> Result<Value, String> {
-        let mut req = self.agent.post(API).header("Accept", "application/json");
+        // headers and body go through stdin (`--config -`), so the token never shows up in `ps`
+        let body = json!({ "query": query, "variables": variables }).to_string();
+        let mut config = format!(
+            "header = \"Content-Type: application/json\"\nheader = \"Accept: application/json\"\ndata-binary = {}\n",
+            quoted(&body)
+        );
         if let Some(t) = &self.token {
-            req = req.header("Authorization", format!("Bearer {t}"));
+            config += &format!(
+                "header = {}\n",
+                quoted(&format!("Authorization: Bearer {t}"))
+            );
         }
-        let mut res: Value = req
-            .send_json(json!({ "query": query, "variables": variables }))
-            .map_err(|e| e.to_string())?
-            .body_mut()
-            .read_json()
-            .map_err(|e| e.to_string())?;
+        let out = curl(&["--config", "-", "--url", API], Some(config))?;
+        let mut res: Value =
+            serde_json::from_slice(&out).map_err(|_| "AniList: unexpected response".to_string())?;
         if let Some(err) = res["errors"][0]["message"].as_str() {
             return Err(format!("AniList: {err}"));
         }
@@ -163,17 +207,14 @@ impl Client {
                  lists {{ entries {{ media {{ {MEDIA} }} }} }} }} }}"
         );
         let d = self.gql(&q, json!({ "user": user, "status": status }))?;
-        let mut out = Vec::new();
-        for list in d["MediaListCollection"]["lists"]
+        let lists = d["MediaListCollection"]["lists"]
             .as_array()
             .into_iter()
-            .flatten()
-        {
-            for e in list["entries"].as_array().into_iter().flatten() {
-                out.push(serde_json::from_value(e["media"].clone()).map_err(|e| e.to_string())?);
-            }
-        }
-        Ok(out)
+            .flatten();
+        lists
+            .flat_map(|l| l["entries"].as_array().into_iter().flatten())
+            .map(|e| serde_json::from_value(e["media"].clone()).map_err(|e| e.to_string()))
+            .collect()
     }
 
     pub fn save(
@@ -200,16 +241,28 @@ impl Client {
         let q = "mutation($id: Int) { DeleteMediaListEntry(id: $id) { deleted } }";
         self.gql(q, json!({ "id": entry })).map(|_| ())
     }
+}
 
-    pub fn fetch(&self, url: &str) -> Result<Vec<u8>, String> {
-        let mut res = self.agent.get(url).call().map_err(|e| e.to_string())?;
-        if !res.status().is_success() {
-            return Err(format!("HTTP {}", res.status()));
-        }
-        res.body_mut()
-            .with_config()
-            .limit(20 << 20)
-            .read_to_vec()
-            .map_err(|e| e.to_string())
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fetch_only_does_https() {
+        let dir = std::env::temp_dir();
+        let (cfg, out) = (dir.join("ani-hop-test.cfg"), dir.join("ani-hop-test.out"));
+        let evil = format!(
+            "output = \"{}\"\nurl = \"file:///etc/hostname\"\n",
+            out.display()
+        );
+        std::fs::write(&cfg, evil).unwrap();
+        assert!(super::fetch(&format!("-K{}", cfg.display())).is_err());
+        assert!(!out.exists(), "a URL must never be read as a curl option");
+        assert!(super::fetch("file:///etc/hostname").is_err());
+        assert!(super::fetch("@/etc/hostname").is_err());
+        let _ = std::fs::remove_file(cfg);
+    }
+
+    #[test]
+    fn quotes_for_curl_config() {
+        assert_eq!(super::quoted(r#"{"a":"b\nc"}"#), r#""{\"a\":\"b\\nc\"}""#);
     }
 }
