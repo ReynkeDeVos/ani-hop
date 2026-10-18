@@ -46,6 +46,8 @@ pub enum EpMode {
 
 pub enum View {
     Main,
+    /// first start or missing tools: package check + login suggestion
+    Setup,
     /// anime list; `true` = local downloads (rescanned on refresh)
     Shows(Vec<Media>, bool),
     Show(Media),
@@ -138,6 +140,9 @@ pub struct App {
     /// media whose title glint already played
     pub fx_media: u64,
     pub last_frame: Instant,
+    pub missing: Vec<(&'static str, &'static str, &'static str)>,
+    /// shell command to run in the real terminal (TUI paused), e.g. installing packages
+    external: Option<String>,
     quit: bool,
 }
 
@@ -172,6 +177,15 @@ fn main() -> std::io::Result<()> {
                 app.on_msg(msg);
                 dirty = true;
             }
+            if let Some(cmd) = app.external.take() {
+                execute!(std::io::stdout(), DisableBracketedPaste)?;
+                ratatui::restore();
+                run_in_terminal(&cmd);
+                terminal = ratatui::init();
+                execute!(std::io::stdout(), EnableBracketedPaste)?;
+                terminal.clear()?;
+                app.after_install();
+            }
         }
         Ok(())
     })();
@@ -179,6 +193,16 @@ fn main() -> std::io::Result<()> {
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     res
+}
+
+/// Runs `cmd` in the plain terminal (sudo prompts work) and waits for enter.
+fn run_in_terminal(cmd: &str) {
+    use std::io::Write;
+    println!("\n\x1b[1;35m❯\x1b[0m {cmd}\n");
+    let _ = Command::new("sh").args(["-c", cmd]).status();
+    print!("\nPress enter to return to ani-hop ");
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stdin().read_line(&mut String::new());
 }
 
 fn token_path() -> PathBuf {
@@ -336,16 +360,35 @@ impl App {
             fx: Default::default(),
             fx_media: 0,
             last_frame: Instant::now(),
+            missing: ani::missing_deps(),
+            external: None,
             quit: false,
         };
         app.fx.add_unique_effect(ui::Fx::Boot, ui::boot_fx());
         app.scan_local();
         app.push("ani-hop", View::Main);
+        let welcomed = ani::config_dir().join("welcomed");
+        let first = !welcomed.exists();
+        if first || !app.missing.is_empty() {
+            let _ = fs::create_dir_all(ani::config_dir());
+            let _ = fs::write(&welcomed, "");
+            app.push(if first { "Welcome" } else { "Setup" }, View::Setup);
+        }
         if app.client.token.is_some() {
             let c = app.client.clone();
             app.spawn(move || Msg::Viewer(c.viewer()));
         }
         app
+    }
+
+    fn after_install(&mut self) {
+        self.missing = ani::missing_deps();
+        let names: Vec<&str> = self.missing.iter().map(|d| d.0).collect();
+        match names.is_empty() {
+            true => self.toast("All set: every tool is installed", false),
+            false => self.toast(format!("Still missing: {}", names.join(", ")), true),
+        }
+        self.refresh();
     }
 
     pub fn top(&mut self) -> &mut Screen {
@@ -495,6 +538,22 @@ impl App {
                     None => v.push(Item::new("login", "Log in to AniList", "")),
                 }
                 v.push(Item::new("quit", "Quit", ""));
+                v
+            }
+            View::Setup => {
+                let mut v = Vec::new();
+                let pkgs: Vec<&str> = self.missing.iter().map(|d| d.1).collect();
+                if let Some(cmd) = ani::install_command(&pkgs).filter(|_| !pkgs.is_empty()) {
+                    v.push(Item::new("install", "Install missing packages", cmd));
+                }
+                if self.user.is_none() {
+                    v.push(Item::new(
+                        "login",
+                        "Log in to AniList",
+                        "your lists + progress sync",
+                    ));
+                }
+                v.push(Item::new("continue", "Continue", ""));
                 v
             }
             View::Shows(list, _) => list
@@ -703,6 +762,11 @@ impl App {
         };
         match &screen.view {
             View::Main => self.main_action(&key),
+            View::Setup => match key.as_str() {
+                "install" => self.external = screen.menu.current().map(|i| i.hint.clone()),
+                "login" => self.main_action("login"),
+                _ => self.pop(1),
+            },
             View::Shows(list, _) => {
                 let picked: Vec<Media> = keys
                     .iter()

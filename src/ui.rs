@@ -3,6 +3,7 @@ use crate::{App, Cover, Input, PIN_REDIRECT, Pending, View, ani, list_label};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, BorderType, HighlightSpacing, List, ListItem, Paragraph, Wrap};
 use ratatui_image::Image;
+use ratatui_image::picker::Capability;
 use std::time::{Duration, Instant};
 use tachyonfx::fx::{self, EvolveSymbolSet};
 use tachyonfx::pattern::SweepPattern;
@@ -316,9 +317,55 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
                 ))
             })
             .collect(),
+        View::Setup => setup(app),
         _ => banner(app),
     };
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn setup(app: &App) -> Vec<Line<'static>> {
+    let mark = |good: bool| match good {
+        true => Span::styled("  ✓ ", Color::Green),
+        false => Span::styled("  ✗ ", Color::Red),
+    };
+    let row = |good: bool, name: &str, what: &'static str| {
+        Line::from(vec![
+            mark(good),
+            format!("{name:<10}").into(),
+            Span::styled(what, DIM),
+        ])
+    };
+    let mut v: Vec<Line> = LOGO
+        .iter()
+        .map(|l| Line::styled(*l, Style::new().fg(ACCENT).bold()))
+        .collect();
+    v.extend(["".into(), Line::styled("Tools", Style::new().bold())]);
+    for (bin, _, what) in ani::DEPS {
+        v.push(row(!app.missing.iter().any(|d| d.0 == bin), bin, what));
+    }
+    let kitty = app.picker.capabilities().contains(&Capability::Kitty);
+    v.push(row(kitty, "graphics", "posters need Ghostty or Kitty"));
+    let pkgs: Vec<&str> = app.missing.iter().map(|d| d.1).collect();
+    if !pkgs.is_empty() && ani::install_command(&pkgs).is_none() {
+        v.push("".into());
+        v.push(Line::styled(
+            format!("Install: {}", pkgs.join(" ")),
+            Color::Yellow,
+        ));
+        v.push(Line::styled(
+            "ani-cli and ani-skip-git come from the AUR",
+            DIM,
+        ));
+    }
+    v.extend(["".into(), Line::styled("AniList", Style::new().bold())]);
+    v.push(match &app.user {
+        Some((_, name)) => Line::from(vec![mark(true), format!("logged in as {name}").into()]),
+        None => Line::styled(
+            "  Log in to get Watching/Planning first and progress synced after each episode.",
+            DIM,
+        ),
+    });
+    v
 }
 
 fn banner(app: &App) -> Vec<Line<'static>> {

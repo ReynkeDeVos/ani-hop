@@ -20,6 +20,9 @@ cargo install --path .
 ani-hop
 ```
 
+Beim ersten Start (und immer, wenn etwas fehlt) prüft ani-hop alle Tools und das Kitty-Grafikprotokoll,
+bietet die Installation fehlender Pakete per `yay`/`paru` an und schlägt den AniList-Login vor.
+
 ## Bedienung
 
 | Taste | Aktion |

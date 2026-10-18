@@ -57,6 +57,37 @@ pub fn download_root() -> PathBuf {
     }
 }
 
+/// What ani-hop shells out to: (command, Arch package, what it's for).
+pub const DEPS: [(&str, &str, &str); 7] = [
+    ("ani-cli", "ani-cli", "streams and downloads"),
+    ("mpv", "mpv", "plays episodes"),
+    ("ani-skip", "ani-skip-git", "skips openings and endings"),
+    ("yt-dlp", "yt-dlp", "downloads episodes"),
+    ("ffmpeg", "ffmpeg", "finishes downloads"),
+    ("curl", "curl", "ani-cli's requests"),
+    ("xdg-open", "xdg-utils", "opens the AniList login"),
+];
+
+pub fn have(bin: &str) -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
+}
+
+pub fn missing_deps() -> Vec<(&'static str, &'static str, &'static str)> {
+    DEPS.into_iter().filter(|d| !have(d.0)).collect()
+}
+
+/// One command for everything missing. ani-cli and ani-skip live in the AUR, so plain
+/// pacman only qualifies when neither is needed.
+pub fn install_command(pkgs: &[&str]) -> Option<String> {
+    let list = pkgs.join(" ");
+    if let Some(helper) = ["yay", "paru"].into_iter().find(|h| have(h)) {
+        return Some(format!("{helper} -S --needed {list}"));
+    }
+    let aur = pkgs.iter().any(|p| p.starts_with("ani-"));
+    (have("pacman") && !aur).then(|| format!("sudo pacman -S --needed {list}"))
+}
+
 pub fn setup() -> std::io::Result<()> {
     let bin = cache_dir().join("bin");
     fs::create_dir_all(&bin)?;
