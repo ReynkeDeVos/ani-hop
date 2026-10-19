@@ -992,19 +992,6 @@ impl App {
         {
             return self.request_quit();
         }
-        // a switch in the settings flips with ← too, esc goes back
-        let left = k.code == KeyCode::Left
-            || (k.code == KeyCode::Char('h') && k.modifiers.contains(KeyModifiers::CONTROL));
-        if left
-            && matches!(self.top().view, View::Settings)
-            && self
-                .top()
-                .menu
-                .current()
-                .is_some_and(|i| matches!(i.key.as_str(), "skip" | "audio"))
-        {
-            return self.accept();
-        }
         match self.top().menu.key(k) {
             Some(Act::Accept) => self.accept(),
             Some(Act::Back) => self.pop(1),
