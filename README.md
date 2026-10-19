@@ -15,6 +15,7 @@ A fast terminal UI for anime: browse trending, top rated and search results with
 | **AniList built in** | Your lists, watched episodes marked, and progress saved after every episode. |
 | **Find an episode by what happens in it** | Watched episodes show their title and summary, and the filter searches them. Episodes you haven't seen stay blank, so nothing spoils. |
 | **Downloads in the background** | Keep browsing while they run; unfinished ones resume after a restart. |
+| **Sub or dub** | Japanese with English subtitles or the English dub, for all shows or just one. Downloads follow the choice; if an episode has no dub yet, the stream falls back to subtitles. |
 | **Skips openings and endings** | With ani-skip, in streams and downloads alike; switch it off in the menu. |
 
 **Needs** [ani-cli](https://github.com/pystardust/ani-cli), [ani-skip](https://github.com/synacktraa/ani-skip), [mpv](https://mpv.io), [yt-dlp](https://github.com/yt-dlp/yt-dlp), ffmpeg, curl, xdg-utils and [Ghostty](https://ghostty.org) or [kitty](https://sw.kovidgoyal.net/kitty/) for the posters.

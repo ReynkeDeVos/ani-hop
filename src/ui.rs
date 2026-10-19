@@ -10,6 +10,9 @@ use ratatui::widgets::{
 const ACCENT: Color = Color::Magenta;
 const MATCH: Color = Color::Cyan;
 const DIM: Color = Color::DarkGray;
+/// Text to read that steps back: faint main text is easier on the eyes than DIM in most
+/// themes (Omarchy's color 7 is the main text itself, so there's no ANSI shade between).
+const SOFT: Style = Style::new().add_modifier(Modifier::DIM);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const LOGO: [&str; 2] = ["▄▀█ █▄ █ █ ▄▄ █ █ █▀█ █▀█", "█▀█ █ ▀█ █    █▀█ █▄█ █▀▀"];
 const SHADES: [&str; 4] = ["░", "▒", "▓", "█"];
@@ -310,7 +313,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                     ch.to_string(),
                     match (hit, item.done) {
                         (true, _) => Style::new().fg(MATCH).bold(),
-                        (false, true) => Style::new().fg(DIM),
+                        (false, true) => SOFT,
                         _ => Style::new(),
                     },
                 )
@@ -335,7 +338,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let list = List::new(rows)
         .highlight_symbol(Line::styled("▌", ACCENT))
         .highlight_spacing(HighlightSpacing::Always)
-        .highlight_style(Style::new().bold());
+        .highlight_style(Style::new().bold().not_dim());
     f.render_stateful_widget(list, list_area, &mut screen.menu.state);
 }
 
@@ -588,7 +591,7 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
         .flatten()
         .find(|t| t.as_str() != m.name());
     if let Some(alt) = alt {
-        lines.push(Line::styled(alt.clone(), Style::new().fg(DIM).italic()));
+        lines.push(Line::styled(alt.clone(), SOFT.italic()));
     }
     lines.push("".into());
     let mut facts = Vec::new();
@@ -663,7 +666,7 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>();
             lines.push(Line::styled(title.join(" · "), Style::new().bold()));
-            lines.extend(i.about.lines().map(|l| Line::styled(l.to_string(), DIM)));
+            lines.extend(i.about.lines().map(|l| Line::styled(l.to_string(), SOFT)));
         } else {
             lines.push(Line::styled(
                 format!("Episode {ep} · not watched yet, so no summary"),

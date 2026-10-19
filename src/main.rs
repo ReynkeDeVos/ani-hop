@@ -104,6 +104,10 @@ pub struct Job {
     source: Option<Source>,
     /// None = everything after the AniList progress
     pub eps: Option<Vec<String>>,
+    /// audio when queued: yt-dlp resumes a half-done episode in whatever audio it gets
+    /// next, so it must not change in between (None in queues of older versions)
+    #[serde(default)]
+    dub: Option<bool>,
 }
 
 enum Msg {
@@ -419,6 +423,7 @@ fn spawn_downloader(tx: Sender<Msg>) -> Sender<Job> {
     thread::spawn(move || {
         for job in job_rx {
             let m = job.media;
+            let dub = job.dub.unwrap_or_default();
             // the saved copy of the job follows what's left of it
             let mut saved = job.eps.clone();
             let mut left = |eps: &[String]| {
@@ -454,7 +459,7 @@ fn spawn_downloader(tx: Sender<Msg>) -> Sender<Job> {
             for (i, ep) in eps.iter().enumerate() {
                 let label = format!("{} E{ep}", m.name());
                 let _ = tx.send(Msg::DlProgress(format!("{label} · starting")));
-                let res = ani::download(&m, &src, ep, |p| {
+                let res = ani::download(&m, &src, ep, dub, |p| {
                     _ = tx.send(Msg::DlProgress(format!("{label} · {p}")))
                 });
                 // cut short by quitting: stays saved for the next start
@@ -561,7 +566,8 @@ impl App {
     }
 
     /// Queues a download, saved first so quitting early doesn't lose it.
-    fn download(&mut self, job: Job) {
+    fn download(&mut self, mut job: Job) {
+        job.dub.get_or_insert_with(|| ani::dub(Some(job.media.id)));
         self.dl_pending += job.eps.as_ref().map_or(1, Vec::len) as isize;
         edit_queue(|q| q.push(job.clone()));
         let _ = self.dl_tx.send(job);
@@ -774,6 +780,7 @@ impl App {
                     "Skip openings and endings",
                     if ani::skip_on() { "on" } else { "off" },
                 ));
+                v.push(Item::new("audio", "Audio", audio_label(ani::dub(None))));
                 v.push(match (&self.client.token, &self.user) {
                     (Some(_), user) => Item::new(
                         "logout",
@@ -861,6 +868,11 @@ impl App {
                         .unwrap_or("not on list");
                     v.push(Item::new("status", "★  List status…", status));
                 }
+                v.push(Item::new(
+                    "audio",
+                    "♪  Audio for this show",
+                    audio_label(ani::dub(Some(m.id))),
+                ));
                 v.push(Item::new(
                     "source",
                     "⇄  Change source…",
@@ -971,10 +983,17 @@ impl App {
         {
             return self.request_quit();
         }
-        // a switch flips with ← too, there is nothing to go back to
+        // a switch in the main menu flips with ← too, there is nothing to go back to
         let left = k.code == KeyCode::Left
             || (k.code == KeyCode::Char('h') && k.modifiers.contains(KeyModifiers::CONTROL));
-        if left && self.top().menu.current().is_some_and(|i| i.key == "skip") {
+        if left
+            && matches!(self.top().view, View::Main)
+            && self
+                .top()
+                .menu
+                .current()
+                .is_some_and(|i| matches!(i.key.as_str(), "skip" | "audio"))
+        {
             return self.accept();
         }
         match self.top().menu.key(k) {
@@ -1062,6 +1081,7 @@ impl App {
                             media: m,
                             source,
                             eps: Some(keys),
+                            dub: None,
                         });
                         self.toast(format!("Queued {}", plural(n, "episode")), false);
                         self.pop(1);
@@ -1111,6 +1131,7 @@ impl App {
                             media: m,
                             source: None,
                             eps: None,
+                            dub: None,
                         });
                     }
                     self.toast("Queued, looking up episodes…", false);
@@ -1230,6 +1251,14 @@ impl App {
                 self.toast(format!("Skipping openings and endings: {state}"), false);
                 self.refresh();
             }
+            "audio" => {
+                let dub = !ani::dub(None);
+                if let Err(e) = ani::set_dub(None, dub) {
+                    return self.toast(e.to_string(), true);
+                }
+                self.toast(format!("Audio: {}", audio_label(dub)), false);
+                self.refresh();
+            }
             "logout" => {
                 let _ = fs::remove_file(token_path());
                 let _ = fs::remove_file(user_path());
@@ -1313,6 +1342,14 @@ impl App {
                 self.top().menu.paste(&q);
             }
             "web" => open_url(&format!("https://anilist.co/anime/{}", m.id)),
+            "audio" => {
+                let dub = !ani::dub(Some(m.id));
+                if let Err(e) = ani::set_dub(Some(m.id), dub) {
+                    return self.toast(e.to_string(), true);
+                }
+                self.toast(format!("{}: {}", m.name(), audio_label(dub)), false);
+                self.refresh();
+            }
             _ => {}
         }
     }
@@ -1394,14 +1431,23 @@ impl App {
         }
         let (tx, id, e) = (self.tx.clone(), m.id, ep.clone());
         let step = move |s| _ = tx.send(Msg::PlayStep(id, e.clone(), s));
+        let dub = ani::dub(Some(m.id));
         self.spawn(move || {
+            let stream = |s: &Source| match ani::stream(s, &ep, dub, || step(None)) {
+                // dubs come later or not at all, the subtitled one is the next best
+                Err(e) if dub && e.contains("dub") => {
+                    step(Some("no dub yet, fetching it with subtitles"));
+                    ani::stream(s, &ep, false, || step(None))
+                }
+                res => res,
+            };
             let res = match (&local, src) {
                 (Some((_, file)), _) => ani::play_file(&m, &ep, file, || step(None)),
                 (_, Some(src)) if cached => ani::locate(&m, &src).and_then(|s| {
                     step(Some("fetching the stream"));
-                    ani::stream(&s, &ep, || step(None))
+                    stream(&s)
                 }),
-                (_, Some(src)) => ani::stream(&src, &ep, || step(None)),
+                (_, Some(src)) => stream(&src),
                 _ => unreachable!(),
             };
             Msg::Played(m, ep, res)
@@ -1610,6 +1656,14 @@ impl App {
 
 pub fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
+}
+
+pub fn audio_label(dub: bool) -> &'static str {
+    if dub {
+        "English dub"
+    } else {
+        "Japanese · English subtitles"
+    }
 }
 
 pub fn list_label(status: &str) -> &'static str {
