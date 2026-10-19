@@ -185,6 +185,20 @@ pub struct App {
 }
 
 fn main() -> std::io::Result<()> {
+    // no options beyond these, everything else happens in the UI
+    match std::env::args().nth(1).as_deref() {
+        None => {}
+        Some("-V" | "--version") => {
+            println!("ani-hop {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(arg) => {
+            println!(
+                "Usage: ani-hop [--version]\nStarts the terminal UI, everything happens in there."
+            );
+            std::process::exit(if matches!(arg, "-h" | "--help") { 0 } else { 2 });
+        }
+    }
     ani::setup()?;
     // every way out stops the download, panics too: a left-behind ani-cli would finish the
     // episode with ffmpeg, as a file that looks complete
