@@ -420,8 +420,18 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         }
         _ => Vec::new(),
     };
+    // episode titles load while the show is open, so its episode list has them right away
+    let shows_eps = matches!(screen.view, View::Show(_) | View::Episodes(..));
+    let ep = match &screen.view {
+        View::Episodes(_, EpMode::Play | EpMode::Download) => screen.menu.current(),
+        _ => None,
+    };
+    let ep = ep.map(|it| it.key.clone());
     if let Some(m) = media {
-        media_preview(app, f, inner, &m);
+        if shows_eps {
+            app.want_episodes(&m);
+        }
+        media_preview(app, f, inner, &m, ep.as_deref());
         return ahead.iter().for_each(|m| app.want_cover(m, false));
     }
     let lines: Vec<Line> = match &screen.view {
@@ -503,7 +513,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
 fn banner(app: &App) -> Vec<Line<'static>> {
     let key = |k: &'static str, what: &'static str| {
         Line::from(vec![
-            Span::styled(format!("{k:>8}  "), ACCENT),
+            Span::styled(format!("{k:>10}  "), ACCENT),
             Span::styled(what, DIM),
         ])
     };
@@ -525,18 +535,17 @@ fn banner(app: &App) -> Vec<Line<'static>> {
     v.push("".into());
     v.extend([
         key("type", "filter, fzf syntax: 'exact ^start end$ !not"),
-        key("↑↓ ^j^k", "move"),
+        key("←↓↑→ ^hjkl", "back, down, up, select"),
         key("tab", "mark for bulk actions"),
         key("^a", "mark all"),
-        key("enter → ^l", "select"),
-        key("← ^h", "back"),
+        key("enter", "select"),
         key("esc", "clear filter / back"),
         key("^c", "quit"),
     ]);
     v
 }
 
-fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media) {
+fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option<&str>) {
     let (fw, fh) = app.cell;
     let rows = (area.height * 3 / 5).clamp(6, 26).min(area.height);
     let cols = ((rows as f32 * fh as f32 * 0.7) / fw.max(1) as f32).round() as u16;
@@ -642,6 +651,25 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media) {
             format!("ani-cli: {} · {} episodes", s.title, s.episodes.len()),
             DIM,
         ));
+    }
+    if let Some(ep) = ep
+        && let Some(i) = app.ep_info.get(&m.id).and_then(|i| i.get(ep))
+    {
+        lines.push("".into());
+        if m.watched(ep) {
+            let title = [format!("Episode {ep}"), i.title.clone()];
+            let title = title
+                .into_iter()
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>();
+            lines.push(Line::styled(title.join(" · "), Style::new().bold()));
+            lines.extend(i.about.lines().map(|l| Line::styled(l.to_string(), DIM)));
+        } else {
+            lines.push(Line::styled(
+                format!("Episode {ep} · not watched yet, so no summary"),
+                DIM,
+            ));
+        }
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), info);
     // only true RGB titles: a named color has no RGB value to fade back into

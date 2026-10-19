@@ -1,6 +1,6 @@
 //! fzf-style list: type to filter (fzf syntax via nucleo), tab to mark, enter to accept.
 
-use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
+use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::widgets::ListState;
@@ -12,6 +12,8 @@ pub struct Item {
     pub key: String,
     /// already watched: shown with a check and dimmed
     pub done: bool,
+    /// found by the filter too, but not shown (e.g. what an episode is about)
+    pub about: String,
 }
 
 impl Item {
@@ -21,6 +23,7 @@ impl Item {
             label: label.into(),
             hint: hint.into(),
             done: false,
+            about: String::new(),
         }
     }
 }
@@ -79,12 +82,24 @@ impl Menu {
 
     fn filter(&mut self) {
         let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
+        // hidden text is long: fuzzy would match almost anything, so every word as typed
+        let words = Pattern::new(
+            &self.query,
+            CaseMatching::Smart,
+            Normalization::Smart,
+            AtomKind::Substring,
+        );
         let mut buf = Vec::new();
         let mut scored: Vec<(usize, u32, Vec<u32>)> = Vec::new();
         for (i, item) in self.items.iter().enumerate() {
             let mut idx = Vec::new();
             let hay = Utf32Str::new(&item.label, &mut buf);
-            if let Some(score) = pattern.indices(hay, &mut self.matcher, &mut idx) {
+            let label = pattern.indices(hay, &mut self.matcher, &mut idx);
+            let about = || {
+                let hay = Utf32Str::new(&item.about, &mut buf);
+                words.score(hay, &mut self.matcher).map(|_| 0) // after every label match
+            };
+            if let Some(score) = label.or_else(about) {
                 idx.sort_unstable();
                 idx.dedup();
                 scored.push((i, score, idx));
@@ -239,5 +254,19 @@ mod tests {
         press(&mut m, KeyCode::Up);
         press(&mut m, KeyCode::Up);
         assert_eq!(m.current_index(), Some(3)); // wrapped around
+    }
+
+    #[test]
+    fn finds_hidden_text_word_by_word_after_labels() {
+        let mut m = menu();
+        m.items[3].about = "A town where everyone sleeps.".into();
+        m.items[1].about = "The walls are on fire.".into();
+        m.edit(|q| *q = "sleeps town".into());
+        assert_eq!(m.current_index(), Some(3));
+        assert_eq!(m.matches.len(), 1); // no fuzzy hits all over the text
+        m.edit(|q| *q = "fire".into());
+        let order: Vec<usize> = m.matches.iter().map(|(i, _)| *i).collect();
+        assert_eq!(order.first(), Some(&2));
+        assert_eq!(order.last(), Some(&1));
     }
 }

@@ -7,7 +7,7 @@ mod menu;
 mod ui;
 
 use ani::Source;
-use anilist::{Client, Entry, Media};
+use anilist::{Client, Entry, EpInfo, Media};
 use menu::{Act, Item, Menu};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -16,6 +16,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::layout::Size;
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::Entry::Vacant;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
@@ -111,6 +112,7 @@ enum Msg {
     Viewer(Result<(u64, String), String>),
     /// prepared poster: pixel file, pixel size, size in cells
     Cover(u64, CoverKey, Result<(PathBuf, u32, u32, Size), String>),
+    EpInfo(u64, HashMap<String, EpInfo>),
     Resolved(Media, Result<Source, String>),
     Saved(Media, Result<Option<Entry>, String>),
     /// (media, episode, what it waits on now; None = the player is up)
@@ -152,6 +154,8 @@ pub struct App {
     /// AniList list changes not answered yet
     saves_pending: usize,
     pub covers: HashMap<u64, Cover>,
+    /// episode titles and summaries per show (empty while loading or when there are none)
+    pub ep_info: HashMap<u64, HashMap<String, EpInfo>>,
     /// poster size in cells, set by the last layout
     pub poster: Size,
     pub sources: HashMap<u64, Source>,
@@ -313,6 +317,35 @@ fn load_cover(
     kitty::prepare(&bytes, size, cell)
 }
 
+/// Episode titles and summaries from the disk cache, or ani.zip once it is a day old (a
+/// month for shows that are out completely).
+fn load_episodes(m: &Media) -> HashMap<String, EpInfo> {
+    let path = ani::cache_dir()
+        .join("episodes")
+        .join(format!("{}.json", m.id));
+    let days = if m.status.as_deref() == Some("FINISHED") {
+        30
+    } else {
+        1
+    };
+    let age = fs::metadata(&path).and_then(|md| md.modified()).ok();
+    let age = age.and_then(|t| t.elapsed().ok()).unwrap_or(Duration::MAX);
+    let cached = || serde_json::from_slice(&fs::read(&path).ok()?).ok();
+    if age.as_secs() < days * 86_400
+        && let Some(eps) = cached()
+    {
+        return eps;
+    }
+    match anilist::episodes(m.id) {
+        Ok(eps) => {
+            let _ = fs::create_dir_all(path.parent().unwrap());
+            let _ = fs::write(&path, serde_json::to_vec(&eps).unwrap_or_default());
+            eps
+        }
+        Err(_) => cached().unwrap_or_default(),
+    }
+}
+
 /// Downloads an ani-hop still has to do, kept on disk so the next start can resume them
 /// after quitting early, a crash or a closed terminal. One file per process, as several
 /// can run at once.
@@ -464,6 +497,7 @@ impl App {
             no_graphics: false,
             saves_pending: 0,
             covers: HashMap::new(),
+            ep_info: HashMap::new(),
             poster: Size::new(0, 0),
             sources: ani::load_resolved(),
             fresh: HashSet::new(),
@@ -672,6 +706,15 @@ impl App {
         }
     }
 
+    /// Episode titles and summaries, once a session per show.
+    pub fn want_episodes(&mut self, m: &Media) {
+        if let Vacant(e) = self.ep_info.entry(m.id) {
+            e.insert(HashMap::new());
+            let m = m.clone();
+            self.spawn(move || Msg::EpInfo(m.id, load_episodes(&m)));
+        }
+    }
+
     /// Frees every poster in the terminal.
     fn forget_posters(&mut self) {
         for c in self.covers.values() {
@@ -828,20 +871,25 @@ impl App {
             }
             View::Episodes(m, mode) => {
                 let local = ani::local_episodes(&ani::folder(m));
-                // AniList progress: everything up to it counts as watched
-                let watched = |ep: &str| m.progress() > 0 && ani::ep_num(ep) <= m.progress() as f64;
+                let info = self.ep_info.get(&m.id);
+                // what a watched episode is called and about; nothing that spoils the rest
+                let item = |key: &str, ep: &str, hint: String| {
+                    let mut it = Item::new(key, format!("Episode {ep}"), hint);
+                    it.done = m.watched(ep);
+                    if let Some(i) = info.and_then(|i| i.get(ep)).filter(|_| it.done) {
+                        if !i.title.is_empty() {
+                            it.label = format!("{} · {}", it.label, i.title);
+                        }
+                        it.about = i.about.clone();
+                    }
+                    it
+                };
                 if *mode == EpMode::Delete {
                     return local
                         .into_iter()
                         .map(|(ep, p)| {
                             let mb = fs::metadata(&p).map_or(0, |md| md.len() >> 20);
-                            let mut it = Item::new(
-                                p.to_string_lossy(),
-                                format!("Episode {ep}"),
-                                format!("{mb} MB"),
-                            );
-                            it.done = watched(&ep);
-                            it
+                            item(&p.to_string_lossy(), &ep, format!("{mb} MB"))
                         })
                         .collect();
                 }
@@ -863,10 +911,7 @@ impl App {
                 eps.into_iter()
                     .map(|ep| {
                         let on_disk = local.iter().any(|(e, _)| *e == ep);
-                        let label = format!("Episode {ep}");
-                        let mut it = Item::new(&ep, label, if on_disk { "on disk" } else { "" });
-                        it.done = watched(&ep);
-                        it
+                        item(&ep, &ep, if on_disk { "on disk" } else { "" }.into())
                     })
                     .collect()
             }
@@ -925,6 +970,12 @@ impl App {
         if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c' | 'q'))
         {
             return self.request_quit();
+        }
+        // a switch flips with ← too, there is nothing to go back to
+        let left = k.code == KeyCode::Left
+            || (k.code == KeyCode::Char('h') && k.modifiers.contains(KeyModifiers::CONTROL));
+        if left && self.top().menu.current().is_some_and(|i| i.key == "skip") {
+            return self.accept();
         }
         match self.top().menu.key(k) {
             Some(Act::Accept) => self.accept(),
@@ -1448,6 +1499,12 @@ impl App {
                 }
                 self.toast(format!("AniList login failed: {e}"), true);
                 self.refresh();
+            }
+            Msg::EpInfo(id, eps) => {
+                self.ep_info.insert(id, eps);
+                if matches!(&self.top().view, View::Episodes(m, _) if m.id == id) {
+                    self.refresh();
+                }
             }
             Msg::Cover(id, key, res) => {
                 let wanted = matches!(self.covers.get(&id), Some(Cover::Loading(k)) if *k == key);

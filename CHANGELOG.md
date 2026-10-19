@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.2 – 2026-10-19
+
+### Added
+
+- Watched episodes show their title in the episode list and their summary next to the show's details, so you can find one again by what happens in it. The filter searches the summaries too, word by word. Episodes you haven't watched stay blank, so nothing spoils. The texts come from ani.zip, one request per show, cached on disk.
+
+### Changed
+
+- ← and ctrl+h flip "Skip openings and endings" as well, like enter and →.
+- The help on the start page lists the arrows and ctrl+h/j/k/l in one line.
+- "Why ani-hop" in the README is a table and mentions herdr.
+
 ## 0.3.1 – 2026-10-19
 
 ### Added
