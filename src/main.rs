@@ -48,6 +48,8 @@ pub enum View {
     Main,
     /// first start or missing tools: package check + login suggestion
     Setup,
+    /// switches and the AniList login
+    Settings,
     /// anime list; `true` = local downloads (rescanned on refresh)
     Shows(Vec<Media>, bool),
     Show(Media),
@@ -776,22 +778,29 @@ impl App {
                     plural(self.local.len(), "show"),
                 ));
                 v.push(Item::new(
+                    "settings",
+                    "Settings & AniList…",
+                    self.user.as_ref().map_or("not logged in", |u| u.1.as_str()),
+                ));
+                v.push(Item::new("quit", "Quit", ""));
+                v
+            }
+            View::Settings => vec![
+                Item::new(
                     "skip",
                     "Skip openings and endings",
                     if ani::skip_on() { "on" } else { "off" },
-                ));
-                v.push(Item::new("audio", "Audio", audio_label(ani::dub(None))));
-                v.push(match (&self.client.token, &self.user) {
+                ),
+                Item::new("audio", "Audio", audio_label(ani::dub(None))),
+                match (&self.client.token, &self.user) {
                     (Some(_), user) => Item::new(
                         "logout",
                         "Log out of AniList",
                         user.as_ref().map_or("", |u| u.1.as_str()),
                     ),
                     (None, _) => Item::new("login", "Log in to AniList", ""),
-                });
-                v.push(Item::new("quit", "Quit", ""));
-                v
-            }
+                },
+            ],
             View::Setup => {
                 let mut v = Vec::new();
                 let pkgs: Vec<&str> = self.missing.iter().map(|d| d.1).collect();
@@ -983,11 +992,11 @@ impl App {
         {
             return self.request_quit();
         }
-        // a switch in the main menu flips with ← too, there is nothing to go back to
+        // a switch in the settings flips with ← too, esc goes back
         let left = k.code == KeyCode::Left
             || (k.code == KeyCode::Char('h') && k.modifiers.contains(KeyModifiers::CONTROL));
         if left
-            && matches!(self.top().view, View::Main)
+            && matches!(self.top().view, View::Settings)
             && self
                 .top()
                 .menu
@@ -1043,7 +1052,7 @@ impl App {
             .current()
             .map_or(String::new(), |i| i.label.clone());
         match &screen.view {
-            View::Main => self.main_action(&key, &label),
+            View::Main | View::Settings => self.main_action(&key, &label),
             View::Setup => match key.as_str() {
                 "install" => self.external = screen.menu.current().map(|i| i.hint.clone()),
                 "login" => self.main_action("login", ""),
@@ -1231,6 +1240,7 @@ impl App {
         }
         match key {
             "search" => _ = self.push("Search", View::Input(Input::Search)),
+            "settings" => _ = self.push("Settings & AniList", View::Settings),
             "downloads" => {
                 let list = ani::local_shows().into_iter().map(|(m, _)| m).collect();
                 self.push("Downloads", View::Shows(list, true));
