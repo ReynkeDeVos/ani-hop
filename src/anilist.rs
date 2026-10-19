@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -89,6 +90,11 @@ impl Media {
         self.media_list_entry.as_ref().map_or(0, |e| e.progress)
     }
 
+    /// Up to the AniList progress everything counts as watched.
+    pub fn watched(&self, ep: &str) -> bool {
+        self.progress() > 0 && crate::ani::ep_num(ep) <= self.progress() as f64
+    }
+
     /// Episodes that are out right now (None = unknown).
     pub fn released(&self) -> Option<u32> {
         self.next_airing_episode
@@ -120,6 +126,41 @@ pub fn fetch(url: &str) -> Result<Vec<u8>, String> {
     }
     let body = res.body_mut().with_config().limit(20 << 20);
     body.read_to_vec().map_err(|e| e.to_string())
+}
+
+/// What an episode is called and is about.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct EpInfo {
+    pub title: String,
+    pub about: String,
+}
+
+/// Titles and summaries of every episode, from ani.zip (keyed by AniList id, one request a
+/// show, served from Cloudflare's cache) as AniList has none per episode.
+pub fn episodes(id: u64) -> Result<HashMap<String, EpInfo>, String> {
+    let bytes = fetch(&format!("https://api.ani.zip/mappings?anilist_id={id}"))?;
+    let v: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    Ok(episode_info(&v))
+}
+
+fn episode_info(v: &Value) -> HashMap<String, EpInfo> {
+    // AniDB writes ` for '
+    let tidy = |s: Option<&str>| s.unwrap_or("").replace('`', "'").trim().to_string();
+    let eps = v["episodes"].as_object().into_iter().flatten();
+    eps.map(|(ep, e)| {
+        let title = tidy(e["title"]["en"].as_str().or(e["title"]["x-jat"].as_str()));
+        let about = e["overview"].as_str().or(e["summary"].as_str());
+        let info = EpInfo {
+            title: if title == format!("Episode {ep}") {
+                String::new()
+            } else {
+                title
+            },
+            about: tidy(about.and_then(|a| a.split("\nSource:").next())),
+        };
+        (ep.clone(), info)
+    })
+    .collect()
 }
 
 /// Changes to the user's list go out one at a time, in the order they were made.
@@ -261,6 +302,27 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reads_episode_titles_and_summaries() {
+        let v = serde_json::json!({ "episodes": {
+            "1": { "title": { "en": "The Journey`s End", "x-jat": "Bouken no Owari" },
+                   "summary": "It`s over.\nSource: Crunchyroll" },
+            "2": { "title": { "x-jat": "Betsu ni" }, "overview": "Magic lessons." },
+            "S1": { "title": { "en": "Episode S1" } },
+        }});
+        let eps = super::episode_info(&v);
+        assert_eq!(eps["1"].title, "The Journey's End");
+        assert_eq!(eps["1"].about, "It's over.");
+        assert_eq!(
+            (eps["2"].title.as_str(), eps["2"].about.as_str()),
+            ("Betsu ni", "Magic lessons.")
+        );
+        assert_eq!(
+            (eps["S1"].title.as_str(), eps["S1"].about.as_str()),
+            ("", "")
+        );
+    }
+
     #[test]
     fn backs_off_when_anilist_says_so() {
         assert_eq!(super::backoff(429, Some(46), Some(0), None, 0), Some(46));
