@@ -68,13 +68,56 @@ pub fn config_dir() -> PathBuf {
     xdg("XDG_CONFIG_HOME", ".config").join("ani-hop")
 }
 
+fn root_path() -> PathBuf {
+    config_dir().join("download-dir")
+}
+
+/// The folder from the settings, else ANI_CLI_DOWNLOAD_DIR, else ~/Videos/Anime.
 pub fn download_root() -> PathBuf {
+    fs::read_to_string(root_path())
+        .ok()
+        .map(|s| PathBuf::from(s.trim()))
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(default_root)
+}
+
+pub fn default_root() -> PathBuf {
     match std::env::var("ANI_CLI_DOWNLOAD_DIR") {
         Ok(d) if !d.is_empty() && d != "." => PathBuf::from(d),
         _ => {
             let user_dirs = xdg("XDG_CONFIG_HOME", ".config").join("user-dirs.dirs");
             videos_dir(&fs::read_to_string(user_dirs).unwrap_or_default(), &home()).join("Anime")
         }
+    }
+}
+
+/// Sets the download folder (`~` works); empty goes back to the default.
+pub fn set_download_root(dir: &str) -> Result<PathBuf, String> {
+    let dir = dir.trim();
+    if dir.is_empty() {
+        let _ = fs::remove_file(root_path());
+        return Ok(default_root());
+    }
+    let path = match dir.strip_prefix("~") {
+        Some("") => home(),
+        Some(rest) if rest.starts_with('/') => home().join(&rest[1..]),
+        _ => PathBuf::from(dir),
+    };
+    if !path.is_absolute() {
+        return Err("Needs a full path, like ~/Videos/Anime".into());
+    }
+    fs::create_dir_all(&path).map_err(|e| format!("{}: {e}", tilde(&path)))?;
+    fs::create_dir_all(config_dir())
+        .and_then(|()| fs::write(root_path(), path.to_string_lossy().as_bytes()))
+        .map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// A path as people write it, with ~ for the home folder.
+pub fn tilde(p: &Path) -> String {
+    match p.strip_prefix(home()) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => p.display().to_string(),
     }
 }
 
@@ -420,43 +463,69 @@ fn audio_path() -> PathBuf {
     config_dir().join("audio.json")
 }
 
-/// Audio chosen per AniList id and for "all" shows: "dub" (English) or "sub" (Japanese
-/// with English subtitles), the only two the provider has.
-fn audio() -> HashMap<String, String> {
+/// What a show plays with, as (key, label). The provider has Japanese and English audio,
+/// both with English subtitles, which mpv shows or keeps hidden (v switches).
+pub const AUDIO: [(&str, &str); 4] = [
+    ("raw", "Japanese · no subtitles"),
+    ("sub", "Japanese · English subtitles"),
+    ("dub", "English dub"),
+    ("dub+sub", "English dub · English subtitles"),
+];
+
+/// Audio chosen per AniList id and for "all" shows, as AUDIO keys.
+fn choices() -> HashMap<String, String> {
     fs::read(audio_path())
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default()
 }
 
-/// Whether to use the English dub: the show's own choice, else the one for all shows,
-/// else ani-cli's ANI_CLI_MODE.
-pub fn dub(id: Option<u64>) -> bool {
-    is_dub(&audio(), id)
+/// A show's audio (None: the default): its own choice, else the default, else ani-cli's
+/// ANI_CLI_MODE.
+pub fn audio(id: Option<u64>) -> &'static str {
+    audio_in(&choices(), id)
 }
 
-fn is_dub(all: &HashMap<String, String>, id: Option<u64>) -> bool {
-    match id.and_then(|i| all.get(&i.to_string())).or(all.get("all")) {
-        Some(mode) => mode == "dub",
-        None => std::env::var("ANI_CLI_MODE").is_ok_and(|m| m == "dub"),
-    }
+fn audio_in(all: &HashMap<String, String>, id: Option<u64>) -> &'static str {
+    let known = |a: Option<&String>| {
+        AUDIO
+            .iter()
+            .map(|k| k.0)
+            .find(|k| a.is_some_and(|a| a == k))
+    };
+    let env = std::env::var("ANI_CLI_MODE").is_ok_and(|m| m == "dub");
+    known(id.and_then(|i| all.get(&i.to_string())))
+        .or_else(|| known(all.get("all")))
+        .unwrap_or(if env { "dub" } else { "sub" })
 }
 
-pub fn set_dub(id: Option<u64>, on: bool) -> std::io::Result<()> {
-    let mut all = audio();
-    choose(&mut all, id, on);
+pub fn audio_label(audio: &str) -> &'static str {
+    AUDIO.iter().find(|a| a.0 == audio).map_or("", |a| a.1)
+}
+
+pub fn dub(audio: &str) -> bool {
+    audio.starts_with("dub")
+}
+
+fn subs(audio: &str) -> bool {
+    audio.ends_with("sub")
+}
+
+pub fn set_audio(id: Option<u64>, audio: &str) -> std::io::Result<()> {
+    let mut all = choices();
+    choose(&mut all, id, audio);
     fs::create_dir_all(config_dir())?;
     fs::write(audio_path(), serde_json::to_vec_pretty(&all)?)
 }
 
-/// A show keeps a choice of its own only while it differs from the one for all shows.
-fn choose(all: &mut HashMap<String, String>, id: Option<u64>, on: bool) {
+/// A show keeps a choice of its own only while it differs from the default.
+fn choose(all: &mut HashMap<String, String>, id: Option<u64>, audio: &str) {
     match id {
-        Some(id) if on == is_dub(all, None) => _ = all.remove(&id.to_string()),
-        Some(id) => _ = all.insert(id.to_string(), mode(on).into()),
+        Some(id) if audio == audio_in(all, None) => _ = all.remove(&id.to_string()),
+        Some(id) => _ = all.insert(id.to_string(), audio.into()),
         None => {
-            all.retain(|_, m| m != mode(on));
-            all.insert("all".into(), mode(on).into());
+            all.retain(|_, a| a != audio);
+            all.insert("all".into(), audio.into());
         }
     }
 }
@@ -466,9 +535,16 @@ fn mode(dub: bool) -> &'static str {
 }
 
 /// Streams through ani-cli (with ani-skip); `up` is called once mpv shows the episode.
-pub fn stream(src: &Source, ep: &str, dub: bool, mut up: impl FnMut()) -> Result<(), String> {
+pub fn stream(src: &Source, ep: &str, audio: &str, mut up: impl FnMut()) -> Result<(), String> {
+    let mut flags = std::env::var("ANI_CLI_PLAYER_FLAGS").unwrap_or_default();
+    // an mpv flag, other players ani-cli knows (vlc, syncplay) don't start with it
+    let mpv = std::env::var("ANI_CLI_PLAYER").map_or(true, |p| p.contains("mpv"));
+    if mpv && !subs(audio) {
+        flags.push_str(" --sub-visibility=no");
+    }
     let child = ani_cli()
-        .env("ANI_CLI_MODE", mode(dub))
+        .env("ANI_CLI_MODE", mode(dub(audio)))
+        .env("ANI_CLI_PLAYER_FLAGS", flags)
         .args(skip_on().then_some("--skip"))
         .args([
             "--exit-after-play",
@@ -494,6 +570,9 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
     let vtt = file.with_extension("vtt");
     if vtt.exists() {
         mpv.arg(format!("--sub-file={}", vtt.display()));
+        if hide_subs(audio(Some(m.id)), is_dub(file)) {
+            mpv.arg("--sub-visibility=no");
+        }
     }
     if let Some(mal) = m.id_mal.filter(|_| skip_on()) {
         let skip = Command::new("ani-skip")
@@ -517,7 +596,68 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
     }
 }
 
-/// Download folder of a show; `.media.json` inside links it back to AniList.
+/// What ani-hop knows about a show folder it downloaded into. It's kept in the config
+/// folder, so the download folder holds only episodes and subtitles.
+#[derive(Default, Serialize, Deserialize)]
+struct Downloaded {
+    media: Media,
+    /// episode files that are the English dub, ani-cli names both the same
+    #[serde(default)]
+    dub: Vec<String>,
+}
+
+/// By show folder.
+type Index = std::collections::BTreeMap<PathBuf, Downloaded>;
+
+#[cfg(not(test))]
+fn index_path() -> PathBuf {
+    config_dir().join("downloads.json")
+}
+
+#[cfg(test)]
+fn index_path() -> PathBuf {
+    std::env::temp_dir().join("ani-hop-test-index.json")
+}
+
+fn index() -> Index {
+    fs::read(index_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Changes the index under a lock, as another ani-hop may be changing it too.
+fn edit_index(f: impl FnOnce(&mut Index)) -> std::io::Result<()> {
+    let path = index_path();
+    fs::create_dir_all(path.parent().unwrap())?;
+    // its own file, as the rename below swaps the index for a new one
+    let lock = fs::File::create(path.with_extension("lock"))?;
+    lock.lock()?;
+    // a broken index stays as it is, rather than be overwritten with just this change
+    let mut all = match fs::read(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Index::new(),
+        r => serde_json::from_slice(&r?)?,
+    };
+    f(&mut all);
+    // written aside and renamed, so a full disk or quitting mid-write can't break it
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, serde_json::to_vec(&all)?)?;
+    fs::rename(&tmp, &path)
+}
+
+fn name(p: &Path) -> String {
+    p.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// A show folder ani-hop downloaded into. One it doesn't know may be the user's own.
+pub fn ours(dir: &Path) -> bool {
+    dir.is_dir() && index().contains_key(dir)
+}
+
+/// Download folder of a show.
 pub fn folder(m: &Media) -> PathBuf {
     let existing = local_shows().into_iter().find(|(lm, _)| lm.id == m.id);
     existing
@@ -526,15 +666,11 @@ pub fn folder(m: &Media) -> PathBuf {
 }
 
 pub fn local_shows() -> Vec<(Media, PathBuf)> {
-    let Ok(dir) = fs::read_dir(download_root()) else {
-        return Vec::new();
-    };
-    let mut shows: Vec<_> = dir
-        .flatten()
-        .filter_map(|e| {
-            let m = serde_json::from_slice(&fs::read(e.path().join(".media.json")).ok()?).ok()?;
-            Some((m, e.path()))
-        })
+    let root = download_root();
+    let mut shows: Vec<_> = index()
+        .into_iter()
+        .filter(|(p, _)| p.parent() == Some(&root) && p.is_dir())
+        .map(|(p, d)| (d.media, p))
         .collect();
     shows.sort_by(|a: &(Media, _), b| a.0.name().cmp(b.0.name()));
     shows
@@ -567,19 +703,48 @@ pub fn ep_num(ep: &str) -> f64 {
     ep.parse().unwrap_or(f64::MAX)
 }
 
+/// Whether a downloaded episode starts with its subtitles hidden. What the file is counts,
+/// not what the show is set to now: a Japanese one keeps them unless none are wanted at all.
+fn hide_subs(audio: &str, dub_file: bool) -> bool {
+    audio == "raw" || (dub_file && !subs(audio))
+}
+
+fn is_dub(file: &Path) -> bool {
+    let show = index().remove(file.parent().unwrap());
+    show.is_some_and(|d| d.dub.contains(&name(file)))
+}
+
 pub fn delete_episode(file: &Path) -> std::io::Result<()> {
     let _ = fs::remove_file(file.with_extension("vtt"));
     fs::remove_file(file)?;
     drop_if_empty(file.parent().unwrap())
 }
 
-/// Drops a show folder of ours once only its metadata is left. A folder without it may be
-/// the user's own with the same name.
+/// Deletes what ani-hop downloaded into a show folder (episodes, subtitles, unfinished
+/// parts) and the folder if that was all. A same-named folder may hold the user's own too.
+pub fn delete_show(dir: &Path) -> std::io::Result<()> {
+    for p in fs::read_dir(dir)?.flatten().map(|e| e.path()) {
+        let name = p.file_name().unwrap_or_default().to_string_lossy();
+        let ours = name.contains(" Episode ")
+            && (name.ends_with(".mp4") || name.ends_with(".vtt") || name.contains(".mp4."));
+        if ours {
+            fs::remove_file(&p)?;
+        }
+    }
+    edit_index(|all| {
+        all.remove(dir);
+    })?;
+    let _ = fs::remove_dir(dir); // fails while something of the user's is left in it
+    Ok(())
+}
+
+/// Drops a show folder of ours once nothing is left in it.
 fn drop_if_empty(dir: &Path) -> std::io::Result<()> {
-    let meta = dir.join(".media.json");
-    if meta.is_file() && fs::read_dir(dir)?.count() == 1 {
-        fs::remove_file(meta)?;
+    if ours(dir) && fs::read_dir(dir)?.next().is_none() {
         fs::remove_dir(dir)?;
+        edit_index(|all| {
+            all.remove(dir);
+        })?;
     }
     Ok(())
 }
@@ -587,8 +752,8 @@ fn drop_if_empty(dir: &Path) -> std::io::Result<()> {
 /// Deletes what unfinished downloads of `eps` left in a show folder (yt-dlp's .part
 /// files, subtitles), and the folder if that was all it held.
 pub fn discard(dir: &Path, eps: &[String]) {
-    if !dir.join(".media.json").is_file() {
-        return; // not a folder ani-hop made
+    if !ours(dir) {
+        return;
     }
     let done: Vec<String> = local_episodes(dir).into_iter().map(|(e, _)| e).collect();
     let Ok(rd) = fs::read_dir(dir) else {
@@ -617,8 +782,11 @@ pub fn download(
 ) -> Result<(), String> {
     let dir = folder(m);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    fs::write(dir.join(".media.json"), serde_json::to_vec(m).unwrap())
+    edit_index(|all| all.entry(dir.clone()).or_default().media = m.clone())
         .map_err(|e| e.to_string())?;
+    if local_episodes(&dir).iter().any(|(e, _)| e == ep) {
+        return Ok(()); // yt-dlp wouldn't replace it, so it stays the audio it was
+    }
     let child = {
         let mut dl = DOWNLOAD.lock().unwrap();
         if dl.0 {
@@ -643,10 +811,19 @@ pub fn download(
     });
     DOWNLOAD.lock().unwrap().1 = None;
     // ani-cli exits 0 even if yt-dlp failed, so the file is the only reliable signal
-    if local_episodes(&dir).iter().any(|(e, _)| e == ep) {
-        Ok(())
-    } else {
-        Err(last_error(&stderr))
+    match local_episodes(&dir).into_iter().find(|(e, _)| e == ep) {
+        Some((_, file)) => {
+            let _ = edit_index(|all| {
+                if let Some(d) = all.get_mut(&dir) {
+                    d.dub.retain(|f| *f != name(&file));
+                    if dub {
+                        d.dub.push(name(&file));
+                    }
+                }
+            });
+            Ok(())
+        }
+        None => Err(last_error(&stderr)),
     }
 }
 
@@ -762,7 +939,6 @@ mod tests {
     fn discards_only_unfinished_leftovers() {
         let dir = std::env::temp_dir().join(format!("ani-hop-discard-{}", std::process::id()));
         let files = [
-            ".media.json",
             "Show Episode 1.mp4",
             "Show Episode 1.vtt",
             "Show Episode 2.mp4.part-Frag7",
@@ -774,6 +950,7 @@ mod tests {
         files
             .iter()
             .for_each(|f| fs::write(dir.join(f), "").unwrap());
+        edit_index(|all| drop(all.insert(dir.clone(), Downloaded::default()))).unwrap();
         discard(&dir, &["1".into(), "2".into()]);
         let mut left: Vec<_> = fs::read_dir(&dir)
             .unwrap()
@@ -781,42 +958,81 @@ mod tests {
             .map(|e| e.file_name().into_string().unwrap())
             .collect();
         left.sort();
-        assert_eq!(left, [files[0], files[1], files[2], files[6]]);
+        assert_eq!(left, [files[0], files[1], files[5]]);
         // nothing finished and nothing else left: the folder goes
-        fs::remove_file(dir.join(files[1])).unwrap();
+        fs::remove_file(dir.join(files[0])).unwrap();
         discard(&dir, &["12".into()]);
         assert!(dir.exists(), "episode 1's subtitles are still there");
-        fs::remove_file(dir.join(files[2])).unwrap();
+        fs::remove_file(dir.join(files[1])).unwrap();
         discard(&dir, &[]);
-        assert!(!dir.exists());
+        assert!(!dir.exists() && !index().contains_key(&dir));
         // a same-named folder of the user's own stays as it is
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(files[5]), "").unwrap();
+        fs::write(dir.join(files[4]), "").unwrap();
         discard(&dir, &["2".into()]);
-        assert!(dir.join(files[5]).exists());
+        assert!(dir.join(files[4]).exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn audio_per_show_only_while_it_differs() {
         let mut all = HashMap::from([("all".to_string(), "sub".to_string())]);
-        choose(&mut all, Some(1), true);
-        assert!(is_dub(&all, Some(1)) && !is_dub(&all, Some(2)));
-        choose(&mut all, None, true);
+        choose(&mut all, Some(1), "dub");
+        assert_eq!(
+            (audio_in(&all, Some(1)), audio_in(&all, Some(2))),
+            ("dub", "sub")
+        );
+        choose(&mut all, None, "dub");
         assert_eq!(
             all.len(),
             1,
-            "show 1 matches all shows now and follows them"
+            "show 1 matches the default now and follows it"
         );
-        choose(&mut all, None, false);
-        assert!(!is_dub(&all, Some(1)));
-        choose(&mut all, Some(1), true);
-        choose(&mut all, Some(1), false);
+        choose(&mut all, None, "raw");
+        assert_eq!(audio_in(&all, Some(1)), "raw");
+        choose(&mut all, Some(1), "dub+sub");
+        choose(&mut all, Some(1), "raw");
+        assert_eq!(all.len(), 1, "back to the default, nothing of its own left");
+        all.insert("2".into(), "klingon".into());
+        assert_eq!(audio_in(&all, Some(2)), "raw", "unknown choices fall back");
+        assert!(dub("dub+sub") && subs("dub+sub") && !subs("dub") && subs("sub") && !dub("raw"));
+        // downloaded: Japanese files keep their subtitles under "English dub"
+        assert!(!hide_subs("dub", false) && hide_subs("dub", true) && hide_subs("raw", false));
+        assert!(!hide_subs("dub+sub", true) && !hide_subs("sub", true));
+    }
+
+    #[test]
+    fn deletes_only_what_was_downloaded() {
+        let root = std::env::temp_dir().join(format!("ani-hop-delete-{}", std::process::id()));
+        let dir = root.join("Show");
+        let episodes = [
+            "Show Episode 1.mp4",
+            "Show Episode 1.vtt",
+            "Show Episode 2.mp4.part",
+        ];
+        fs::create_dir_all(&dir).unwrap();
+        for f in episodes.iter().chain(&["notes.txt"]) {
+            fs::write(dir.join(f), "").unwrap();
+        }
+        edit_index(|all| drop(all.insert(dir.clone(), Downloaded::default()))).unwrap();
+        assert!(ours(&dir), "read back from the file");
+        delete_show(&dir).unwrap();
+        let left: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
         assert_eq!(
-            all.len(),
-            1,
-            "back to the choice for all, nothing of its own left"
+            left,
+            ["notes.txt"],
+            "the user's own file stays, and the folder with it"
         );
+        assert!(!ours(&dir));
+        fs::remove_file(dir.join("notes.txt")).unwrap();
+        edit_index(|all| drop(all.insert(dir.clone(), Downloaded::default()))).unwrap();
+        delete_show(&dir).unwrap();
+        assert!(!dir.exists());
+        fs::remove_dir(&root).unwrap();
     }
 
     #[test]

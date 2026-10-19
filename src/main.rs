@@ -7,7 +7,7 @@ mod menu;
 mod ui;
 
 use ani::Source;
-use anilist::{Client, Entry, EpInfo, Media};
+use anilist::{Client, Entry, EpInfo, Media, PER_PAGE};
 use menu::{Act, Item, Menu};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -50,8 +50,9 @@ pub enum View {
     Setup,
     /// switches and the AniList login
     Settings,
-    /// anime list; `true` = local downloads (rescanned on refresh)
-    Shows(Vec<Media>, bool),
+    Shows(Vec<Media>, Feed),
+    /// audio picker for a show, or the default (None)
+    Audio(Option<Media>),
     Show(Media),
     Episodes(Media, EpMode),
     Status(Media),
@@ -61,12 +62,24 @@ pub enum View {
     Input(Input),
 }
 
+/// Where a list of shows comes from.
+pub enum Feed {
+    /// the download folder, rescanned on refresh
+    Local,
+    /// an AniList list or search, all at once
+    Whole,
+    /// an AniList ranking (MediaSort) in pages: the next page if there is one, and whether
+    /// it's on its way (the first page may refresh on its own, without "More…")
+    Pages(String, Option<u32>, bool),
+}
+
 #[derive(Clone)]
 pub enum Input {
     Search,
     ClientId,
     Token,
     SourceQuery(Media),
+    DownloadDir,
 }
 
 pub enum Pending {
@@ -114,6 +127,8 @@ pub struct Job {
 
 enum Msg {
     Shows(u64, Result<Vec<Media>, String>),
+    /// the next page of a ranking
+    More(u64, Result<Vec<Media>, String>),
     Hits(u64, Result<Vec<String>, String>),
     Viewer(Result<(u64, String), String>),
     /// prepared poster: pixel file, pixel size, size in cells
@@ -181,6 +196,8 @@ pub struct App {
     pub missing: Vec<(&'static str, &'static str, &'static str)>,
     /// shell command to run in the real terminal (TUI paused), e.g. installing packages
     external: Option<String>,
+    /// asked for on a show's page while ani-cli searched, waiting to get back to that page
+    parked: Option<(Media, Want)>,
     quit: bool,
 }
 
@@ -532,6 +549,7 @@ impl App {
             glint: (0, Instant::now()),
             missing: ani::missing_deps(),
             external: None,
+            parked: None,
             quit: false,
         };
         app.scan_local();
@@ -583,7 +601,8 @@ impl App {
 
     /// Queues a download, saved first so quitting early doesn't lose it.
     fn download(&mut self, mut job: Job) {
-        job.dub.get_or_insert_with(|| ani::dub(Some(job.media.id)));
+        job.dub
+            .get_or_insert_with(|| ani::dub(ani::audio(Some(job.media.id))));
         self.dl_pending += job.eps.as_ref().map_or(1, Vec::len) as isize;
         edit_queue(|q| q.push(job.clone()));
         let _ = self.dl_tx.send(job);
@@ -620,6 +639,7 @@ impl App {
     fn push_loading(
         &mut self,
         title: &str,
+        feed: Feed,
         cache: Option<String>,
         f: impl FnOnce() -> Result<Vec<Media>, String> + Send + 'static,
     ) {
@@ -632,7 +652,7 @@ impl App {
             .as_ref()
             .and_then(|p| fs::metadata(p).ok()?.modified().ok()?.elapsed().ok());
         let recent = cached.is_some() && age.is_some_and(|a| a < Duration::from_secs(120));
-        let id = self.push(title, View::Shows(cached.unwrap_or_default(), false));
+        let id = self.push(title, View::Shows(cached.unwrap_or_default(), feed));
         if recent {
             return;
         }
@@ -656,13 +676,24 @@ impl App {
     fn pop(&mut self, n: usize) {
         self.stack
             .truncate(self.stack.len().saturating_sub(n).max(1));
+        if let Some((m, w)) = self.parked.take() {
+            let page = |s: &Screen| matches!(&s.view, View::Show(x) if x.id == m.id);
+            match (
+                page(self.stack.last().unwrap()),
+                self.stack.iter().any(page),
+            ) {
+                (true, _) => self.fulfill(m, w),
+                (false, true) => self.parked = Some((m, w)),
+                _ => {} // the show was left
+            }
+        }
         self.refresh();
     }
 
     /// Rebuilds the visible menu from current state (keeps query and cursor).
     fn refresh(&mut self) {
         self.scan_local();
-        if let View::Shows(list, true) = &mut self.top().view {
+        if let View::Shows(list, Feed::Local) = &mut self.top().view {
             *list = ani::local_shows().into_iter().map(|(m, _)| m).collect();
         }
         let items = self.items(&self.stack.last().unwrap().view);
@@ -805,7 +836,16 @@ impl App {
                     "Skip openings and endings",
                     if ani::skip_on() { "on" } else { "off" },
                 ),
-                Item::new("audio", "Audio", audio_label(ani::dub(None))),
+                Item::new(
+                    "audio",
+                    "Default audio…",
+                    ani::audio_label(ani::audio(None)),
+                ),
+                Item::new(
+                    "folder",
+                    "Download folder…",
+                    ani::tilde(&ani::download_root()),
+                ),
                 match (&self.client.token, &self.user) {
                     (Some(_), user) => Item::new(
                         "logout",
@@ -831,26 +871,36 @@ impl App {
                 v.push(Item::new("continue", "Continue", ""));
                 v
             }
-            View::Shows(list, _) => list
-                .iter()
-                .map(|m| {
-                    let mut hint = Vec::new();
-                    if let Some(n) = self.local.get(&m.id).filter(|n| **n > 0) {
-                        hint.push(format!("↓{n}"));
-                    }
-                    if m.media_list_entry.is_some() {
-                        hint.push(format!(
-                            "{}/{}",
-                            m.progress(),
-                            m.episodes.map_or("?".into(), |e| e.to_string())
-                        ));
-                    } else if let Some(e) = m.episodes {
-                        hint.push(format!("{e} ep"));
-                    }
-                    hint.extend(m.season_year.map(|y| y.to_string()));
-                    Item::new(m.id.to_string(), m.name(), hint.join(" · "))
-                })
-                .collect(),
+            View::Shows(list, feed) => {
+                let mut v: Vec<Item> = list
+                    .iter()
+                    .map(|m| {
+                        let mut hint = Vec::new();
+                        if let Some(n) = self.local.get(&m.id).filter(|n| **n > 0) {
+                            hint.push(format!("↓{n}"));
+                        }
+                        if m.media_list_entry.is_some() {
+                            hint.push(format!(
+                                "{}/{}",
+                                m.progress(),
+                                m.episodes.map_or("?".into(), |e| e.to_string())
+                            ));
+                        } else if let Some(e) = m.episodes {
+                            hint.push(format!("{e} ep"));
+                        }
+                        hint.extend(m.season_year.map(|y| y.to_string()));
+                        Item::new(m.id.to_string(), m.name(), hint.join(" · "))
+                    })
+                    .collect();
+                if let Feed::Pages(_, Some(page), _) = feed
+                    && !list.is_empty()
+                {
+                    let mut more = Item::new("more", "More…", format!("page {page}"));
+                    more.action = true;
+                    v.push(more);
+                }
+                v
+            }
             View::Show(m) => {
                 let local = ani::local_episodes(&ani::folder(m));
                 let src = self.sources.get(&m.id);
@@ -893,8 +943,8 @@ impl App {
                 }
                 v.push(Item::new(
                     "audio",
-                    "♪  Audio for this show",
-                    audio_label(ani::dub(Some(m.id))),
+                    "♪  Audio for this show…",
+                    ani::audio_label(ani::audio(Some(m.id))),
                 ));
                 v.push(Item::new(
                     "source",
@@ -960,6 +1010,23 @@ impl App {
                     v.push(Item::new("remove", "Remove from list", ""));
                 }
                 v
+            }
+            View::Audio(m) => {
+                let id = m.as_ref().map(|m| m.id);
+                let (cur, default) = (ani::audio(id), ani::audio(None));
+                ani::AUDIO
+                    .iter()
+                    .map(|(k, label)| {
+                        let mut hint = Vec::new();
+                        if *k == cur {
+                            hint.push("current");
+                        }
+                        if id.is_some() && *k == default {
+                            hint.push("default");
+                        }
+                        Item::new(*k, *label, hint.join(" · "))
+                    })
+                    .collect()
             }
             View::Sources(_, _, hits) => hits
                 .iter()
@@ -1059,6 +1126,23 @@ impl App {
                 "login" => self.main_action("login", ""),
                 _ => self.pop(1),
             },
+            // marked shows don't count here, "More…" is what the cursor is on
+            View::Shows(_, Feed::Pages(sort, Some(page), fetching))
+                if screen.menu.current().is_some_and(|i| i.key == "more") =>
+            {
+                // one page at a time; the first one's refresh would drop what comes after it
+                match (screen.loading, *fetching) {
+                    (true, true) => return,
+                    (true, false) => return self.toast("Still refreshing the first page…", false),
+                    _ => {}
+                }
+                let (sort, page, id, c) = (sort.clone(), *page, screen.id, self.client.clone());
+                self.top().loading = true;
+                if let View::Shows(_, Feed::Pages(_, _, f)) = &mut self.top().view {
+                    *f = true;
+                }
+                self.spawn(move || Msg::More(id, c.browse(&sort, None, page)));
+            }
             View::Shows(list, _) => {
                 let picked: Vec<Media> = keys
                     .iter()
@@ -1105,6 +1189,17 @@ impl App {
                     }
                 }
             }
+            View::Audio(m) => {
+                let id = m.as_ref().map(|m| m.id);
+                let name = m
+                    .as_ref()
+                    .map_or("Default audio".into(), |m| m.name().to_string());
+                if let Err(e) = ani::set_audio(id, &key) {
+                    return self.toast(e.to_string(), true);
+                }
+                self.toast(format!("{name}: {}", ani::audio_label(&key)), false);
+                self.pop(1);
+            }
             View::Status(m) => {
                 let (m, c) = (m.clone(), self.client.clone());
                 match (key.as_str(), m.media_list_entry.as_ref().map(|e| e.id)) {
@@ -1150,7 +1245,7 @@ impl App {
                     let dirs: Vec<PathBuf> = list
                         .iter()
                         .map(ani::folder)
-                        .filter(|d| d.exists())
+                        .filter(|d| ani::ours(d))
                         .collect();
                     self.push(
                         format!("Delete all downloads of {}?", plural(dirs.len(), "show")),
@@ -1202,7 +1297,7 @@ impl App {
                         let mut failed = 0;
                         for p in paths {
                             let res = if p.is_dir() {
-                                fs::remove_dir_all(p)
+                                ani::delete_show(p)
                             } else {
                                 ani::delete_episode(p)
                             };
@@ -1237,14 +1332,19 @@ impl App {
             let sort = sort.to_string();
             // per user: entries carry that user's list status and progress
             let cache = format!("{}-{sort}", self.user.as_ref().map_or(0, |u| u.0));
-            return self.push_loading(label, Some(cache), move || c.browse(&sort, None));
+            let feed = Feed::Pages(sort.clone(), Some(2), false);
+            return self.push_loading(label, feed, Some(cache), move || c.browse(&sort, None, 1));
         }
         match key {
             "search" => _ = self.push("Search", View::Input(Input::Search)),
             "settings" => _ = self.push("Settings & AniList", View::Settings),
+            "folder" => {
+                self.push("Download folder", View::Input(Input::DownloadDir));
+                self.top().menu.paste(&ani::tilde(&ani::download_root()));
+            }
             "downloads" => {
                 let list = ani::local_shows().into_iter().map(|(m, _)| m).collect();
-                self.push("Downloads", View::Shows(list, true));
+                self.push("Downloads", View::Shows(list, Feed::Local));
             }
             "login" => match client_id() {
                 Some(id) => self.start_auth(&id),
@@ -1263,12 +1363,8 @@ impl App {
                 self.refresh();
             }
             "audio" => {
-                let dub = !ani::dub(None);
-                if let Err(e) = ani::set_dub(None, dub) {
-                    return self.toast(e.to_string(), true);
-                }
-                self.toast(format!("Audio: {}", audio_label(dub)), false);
-                self.refresh();
+                self.push("Default audio", View::Audio(None));
+                self.top().menu.select_key(ani::audio(None));
             }
             "logout" => {
                 let _ = fs::remove_file(token_path());
@@ -1282,7 +1378,7 @@ impl App {
                 let status = list.trim_start_matches("list:").to_string();
                 let user = self.user.as_ref().map_or(0, |u| u.0);
                 let cache = format!("{user}-{status}");
-                self.push_loading(list_label(&status), Some(cache), move || {
+                self.push_loading(list_label(&status), Feed::Whole, Some(cache), move || {
                     c.list(user, &status)
                 });
             }
@@ -1297,14 +1393,16 @@ impl App {
     }
 
     fn submit(&mut self, input: Input, text: String) {
-        if text.is_empty() {
+        if text.is_empty() && !matches!(input, Input::DownloadDir) {
             return;
         }
         match input {
             Input::Search => {
                 let c = self.client.clone();
                 let title = format!("Search: {text}");
-                self.push_loading(&title, None, move || c.browse("SEARCH_MATCH", Some(&text)));
+                self.push_loading(&title, Feed::Whole, None, move || {
+                    c.browse("SEARCH_MATCH", Some(&text), 1)
+                });
             }
             Input::ClientId => {
                 if let Err(e) = write_private(&ani::config_dir().join("client_id"), &text) {
@@ -1324,6 +1422,13 @@ impl App {
                 self.toast("Checking token…", false);
                 self.pop(1);
             }
+            Input::DownloadDir => match ani::set_download_root(&text) {
+                Ok(dir) => {
+                    self.toast(format!("Downloads go to {}", ani::tilde(&dir)), false);
+                    self.pop(1);
+                }
+                Err(e) => self.toast(e, true),
+            },
             Input::SourceQuery(m) => {
                 let id = self.push("Pick source", View::Sources(m, text.clone(), Vec::new()));
                 self.top().loading = true;
@@ -1354,12 +1459,9 @@ impl App {
             }
             "web" => open_url(&format!("https://anilist.co/anime/{}", m.id)),
             "audio" => {
-                let dub = !ani::dub(Some(m.id));
-                if let Err(e) = ani::set_dub(Some(m.id), dub) {
-                    return self.toast(e.to_string(), true);
-                }
-                self.toast(format!("{}: {}", m.name(), audio_label(dub)), false);
-                self.refresh();
+                let cur = ani::audio(Some(m.id));
+                self.push("Audio", View::Audio(Some(m)));
+                self.top().menu.select_key(cur);
             }
             _ => {}
         }
@@ -1442,13 +1544,13 @@ impl App {
         }
         let (tx, id, e) = (self.tx.clone(), m.id, ep.clone());
         let step = move |s| _ = tx.send(Msg::PlayStep(id, e.clone(), s));
-        let dub = ani::dub(Some(m.id));
+        let audio = ani::audio(Some(m.id));
         self.spawn(move || {
-            let stream = |s: &Source| match ani::stream(s, &ep, dub, || step(None)) {
+            let stream = |s: &Source| match ani::stream(s, &ep, audio, || step(None)) {
                 // dubs come later or not at all, the subtitled one is the next best
-                Err(e) if dub && e.contains("dub") => {
+                Err(e) if ani::dub(audio) && e.contains("dub") => {
                     step(Some("no dub yet, fetching it with subtitles"));
-                    ani::stream(s, &ep, false, || step(None))
+                    ani::stream(s, &ep, "sub", || step(None))
                 }
                 res => res,
             };
@@ -1503,9 +1605,12 @@ impl App {
     fn update_media(&mut self, id: u64, entry: Option<Entry>) {
         for s in &mut self.stack {
             let media: Vec<&mut Media> = match &mut s.view {
-                View::Show(m) | View::Episodes(m, _) | View::Status(m) | View::Sources(m, ..) => {
-                    vec![m]
-                }
+                View::Show(m)
+                | View::Episodes(m, _)
+                | View::Status(m)
+                | View::Sources(m, ..)
+                | View::Audio(Some(m))
+                | View::Input(Input::SourceQuery(m)) => vec![m],
                 View::Shows(l, _) | View::Bulk(l) => l.iter_mut().collect(),
                 _ => Vec::new(),
             };
@@ -1519,7 +1624,43 @@ impl App {
 
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Shows(id, res) => self.fill(id, res, |v, list| *v = View::Shows(list, false)),
+            Msg::Shows(id, res) => self.fill(id, res, |v, list| {
+                if let View::Shows(l, feed) = v {
+                    if let Feed::Pages(_, next, _) = feed
+                        && list.len() < PER_PAGE
+                    {
+                        *next = None;
+                    }
+                    *l = list;
+                }
+            }),
+            Msg::More(id, res) => {
+                let screen = self.stack.iter_mut().find(|s| s.id == id);
+                if let Some(View::Shows(_, Feed::Pages(_, _, fetching))) =
+                    screen.map(|s| &mut s.view)
+                {
+                    *fetching = false;
+                }
+                let mut first = None; // Some(None): the page brought nothing new
+                self.fill(id, res, |v, more| {
+                    if let View::Shows(l, Feed::Pages(_, next, _)) = v {
+                        *next = next.filter(|_| more.len() >= PER_PAGE).map(|n| n + 1);
+                        // rankings shift between requests, a show may come round again
+                        let more: Vec<Media> = more
+                            .into_iter()
+                            .filter(|m| l.iter().all(|o| o.id != m.id))
+                            .collect();
+                        let start = l.len();
+                        l.extend(more);
+                        first = Some(l.get(start).map(|m| m.id.to_string()));
+                    }
+                });
+                match (first, self.stack.iter_mut().find(|s| s.id == id)) {
+                    (Some(Some(key)), Some(s)) => s.menu.select_key(&key),
+                    (Some(None), Some(_)) => self.toast("No more shows", false),
+                    _ => {}
+                }
+            }
             Msg::Hits(id, res) => self.fill(id, res, |v, hits| {
                 if let View::Sources(_, _, h) = v {
                     *h = hits;
@@ -1594,8 +1735,13 @@ impl App {
                         self.sources.insert(m.id, src);
                         self.fresh.insert(m.id);
                         ani::save_resolved(&self.sources);
-                        if let (Some(w), true) = (want, here) {
-                            self.fulfill(m, w);
+                        let open = (self.stack.iter())
+                            .any(|s| matches!(&s.view, View::Show(x) if x.id == m.id));
+                        match (want, here) {
+                            (Some(w), true) => self.fulfill(m, w),
+                            // e.g. the audio picker is open: once back on the show's page
+                            (Some(w), false) if open => self.parked = Some((m, w)),
+                            _ => {}
                         }
                     }
                     Err(e) if want.is_some() || here => self.toast(format!("ani-cli: {e}"), true),
@@ -1667,14 +1813,6 @@ impl App {
 
 pub fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
-}
-
-pub fn audio_label(dub: bool) -> &'static str {
-    if dub {
-        "English dub"
-    } else {
-        "Japanese · English subtitles"
-    }
 }
 
 pub fn list_label(status: &str) -> &'static str {

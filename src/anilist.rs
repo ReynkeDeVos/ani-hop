@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,6 +14,9 @@ const MEDIA: &str = "id idMal title { romaji english } synonyms coverImage { ext
   episodes status format season seasonYear averageScore genres description(asHtml: false)
   studios(isMain: true) { nodes { name } } nextAiringEpisode { episode timeUntilAiring }
   mediaListEntry { id status progress }";
+
+/// Shows per AniList page, the most it hands out at once.
+pub const PER_PAGE: usize = 50;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -245,13 +248,21 @@ impl Client {
         ))
     }
 
-    /// `sort` is an AniList MediaSort, e.g. TRENDING_DESC.
-    pub fn browse(&self, sort: &str, search: Option<&str>) -> Result<Vec<Media>, String> {
+    /// `sort` is an AniList MediaSort, e.g. TRENDING_DESC; pages count from 1.
+    pub fn browse(
+        &self,
+        sort: &str,
+        search: Option<&str>,
+        page: u32,
+    ) -> Result<Vec<Media>, String> {
         let q = format!(
-            "query($sort: [MediaSort], $search: String) {{ Page(perPage: 50) {{
+            "query($sort: [MediaSort], $search: String, $page: Int) {{ Page(page: $page, perPage: {PER_PAGE}) {{
                media(type: ANIME, sort: $sort, search: $search, isAdult: false) {{ {MEDIA} }} }} }}"
         );
-        let d = self.gql(&q, json!({ "sort": [sort], "search": search }))?;
+        let d = self.gql(
+            &q,
+            json!({ "sort": [sort], "search": search, "page": page }),
+        )?;
         serde_json::from_value(d["Page"]["media"].clone()).map_err(|e| e.to_string())
     }
 
@@ -266,9 +277,15 @@ impl Client {
             .as_array()
             .into_iter()
             .flatten();
+        // a show in a custom list comes again in its status list
+        let mut seen = HashSet::new();
         lists
             .flat_map(|l| l["entries"].as_array().into_iter().flatten())
             .map(|e| serde_json::from_value(e["media"].clone()).map_err(|e| e.to_string()))
+            .filter(|r: &Result<Media, String>| match r {
+                Ok(m) => seen.insert(m.id),
+                Err(_) => true,
+            })
             .collect()
     }
 

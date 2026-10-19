@@ -14,6 +14,8 @@ pub struct Item {
     pub done: bool,
     /// found by the filter too, but not shown (e.g. what an episode is about)
     pub about: String,
+    /// a command like "More…", not something to pick: can't be marked, isn't counted
+    pub action: bool,
 }
 
 impl Item {
@@ -24,6 +26,7 @@ impl Item {
             hint: hint.into(),
             done: false,
             about: String::new(),
+            action: false,
         }
     }
 }
@@ -62,8 +65,16 @@ impl Menu {
     /// Replaces the items, keeping query and cursor position where possible.
     pub fn set_items(&mut self, items: Vec<Item>) {
         let keep = self.current().map(|i| i.key.clone());
+        // marks stay with their items, wherever those move to
+        let marked: Vec<String> = self
+            .marked
+            .iter()
+            .map(|&i| self.items[i].key.clone())
+            .collect();
         self.items = items;
-        self.marked.retain(|&i| i < self.items.len());
+        self.marked = (0..self.items.len())
+            .filter(|&i| marked.contains(&self.items[i].key))
+            .collect();
         self.filter();
         if let Some(k) = keep {
             self.select_key(&k);
@@ -144,6 +155,7 @@ impl Menu {
 
     fn toggle(&mut self) {
         if let (true, Some(i)) = (self.multi, self.current_index())
+            && !self.items[i].action
             && !self.marked.remove(&i)
         {
             self.marked.insert(i);
@@ -176,7 +188,9 @@ impl Menu {
                 self.step(-1);
             }
             KeyCode::Char('a') if ctrl && self.multi => {
-                let visible: Vec<usize> = self.matches.iter().map(|m| m.0).collect();
+                let visible: Vec<usize> = (self.matches.iter().map(|m| m.0))
+                    .filter(|&i| !self.items[i].action)
+                    .collect();
                 if visible.iter().all(|i| self.marked.contains(i)) {
                     visible.iter().for_each(|i| _ = self.marked.remove(i));
                 } else {
@@ -222,6 +236,19 @@ mod tests {
 
     fn press(m: &mut Menu, code: KeyCode) {
         m.key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn marks_follow_items_and_skip_actions() {
+        let mut m = menu();
+        m.items[3].action = true;
+        m.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(m.selection(), [0, 1, 2], "the action isn't marked");
+        // a new item in front: the marks move along with theirs
+        let mut items = vec![Item::new("new", "New", "")];
+        items.extend(["Frieren", "Attack on Titan", "Fire Force"].map(|l| Item::new(l, l, "")));
+        m.set_items(items);
+        assert_eq!(m.selection(), [1, 2, 3]);
     }
 
     #[test]
