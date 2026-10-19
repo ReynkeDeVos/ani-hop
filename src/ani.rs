@@ -165,6 +165,8 @@ fn probe(args: &[&str]) -> Result<Option<(String, Vec<String>)>, String> {
         .args(args)
         .env("ANIHOP_MENU_OUT", &out)
         .env("ANI_CLI_PLAYER", "debug")
+        // a single-episode show gets its stream fetched here, and nearly every one has a sub
+        .env("ANI_CLI_MODE", "sub")
         .env("ANI_CLI_HIST_DIR", &dir)
         .output()
         .map_err(|e| format!("ani-cli: {e}"))?;
@@ -414,9 +416,59 @@ pub fn set_skip(on: bool) -> std::io::Result<()> {
     }
 }
 
+fn audio_path() -> PathBuf {
+    config_dir().join("audio.json")
+}
+
+/// Audio chosen per AniList id and for "all" shows: "dub" (English) or "sub" (Japanese
+/// with English subtitles), the only two the provider has.
+fn audio() -> HashMap<String, String> {
+    fs::read(audio_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Whether to use the English dub: the show's own choice, else the one for all shows,
+/// else ani-cli's ANI_CLI_MODE.
+pub fn dub(id: Option<u64>) -> bool {
+    is_dub(&audio(), id)
+}
+
+fn is_dub(all: &HashMap<String, String>, id: Option<u64>) -> bool {
+    match id.and_then(|i| all.get(&i.to_string())).or(all.get("all")) {
+        Some(mode) => mode == "dub",
+        None => std::env::var("ANI_CLI_MODE").is_ok_and(|m| m == "dub"),
+    }
+}
+
+pub fn set_dub(id: Option<u64>, on: bool) -> std::io::Result<()> {
+    let mut all = audio();
+    choose(&mut all, id, on);
+    fs::create_dir_all(config_dir())?;
+    fs::write(audio_path(), serde_json::to_vec_pretty(&all)?)
+}
+
+/// A show keeps a choice of its own only while it differs from the one for all shows.
+fn choose(all: &mut HashMap<String, String>, id: Option<u64>, on: bool) {
+    match id {
+        Some(id) if on == is_dub(all, None) => _ = all.remove(&id.to_string()),
+        Some(id) => _ = all.insert(id.to_string(), mode(on).into()),
+        None => {
+            all.retain(|_, m| m != mode(on));
+            all.insert("all".into(), mode(on).into());
+        }
+    }
+}
+
+fn mode(dub: bool) -> &'static str {
+    if dub { "dub" } else { "sub" }
+}
+
 /// Streams through ani-cli (with ani-skip); `up` is called once mpv shows the episode.
-pub fn stream(src: &Source, ep: &str, mut up: impl FnMut()) -> Result<(), String> {
+pub fn stream(src: &Source, ep: &str, dub: bool, mut up: impl FnMut()) -> Result<(), String> {
     let child = ani_cli()
+        .env("ANI_CLI_MODE", mode(dub))
         .args(skip_on().then_some("--skip"))
         .args([
             "--exit-after-play",
@@ -560,6 +612,7 @@ pub fn download(
     m: &Media,
     src: &Source,
     ep: &str,
+    dub: bool,
     mut progress: impl FnMut(&str),
 ) -> Result<(), String> {
     let dir = folder(m);
@@ -574,6 +627,7 @@ pub fn download(
         let child = ani_cli()
             .args(["-d", "-S", &src.index.to_string(), "-e", ep, &src.query])
             .env("ANI_CLI_DOWNLOAD_DIR", &dir)
+            .env("ANI_CLI_MODE", mode(dub))
             .env("ANI_CLI_HIST_DIR", cache_dir().join("probe")) // downloading isn't watching
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -741,6 +795,28 @@ mod tests {
         discard(&dir, &["2".into()]);
         assert!(dir.join(files[5]).exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn audio_per_show_only_while_it_differs() {
+        let mut all = HashMap::from([("all".to_string(), "sub".to_string())]);
+        choose(&mut all, Some(1), true);
+        assert!(is_dub(&all, Some(1)) && !is_dub(&all, Some(2)));
+        choose(&mut all, None, true);
+        assert_eq!(
+            all.len(),
+            1,
+            "show 1 matches all shows now and follows them"
+        );
+        choose(&mut all, None, false);
+        assert!(!is_dub(&all, Some(1)));
+        choose(&mut all, Some(1), true);
+        choose(&mut all, Some(1), false);
+        assert_eq!(
+            all.len(),
+            1,
+            "back to the choice for all, nothing of its own left"
+        );
     }
 
     #[test]
