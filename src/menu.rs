@@ -138,7 +138,10 @@ impl Menu {
     pub fn key(&mut self, k: KeyEvent) -> Option<Act> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         match k.code {
-            KeyCode::Enter => return Some(Act::Accept),
+            KeyCode::Enter | KeyCode::Right => return Some(Act::Accept),
+            KeyCode::Char('l') if ctrl => return Some(Act::Accept),
+            KeyCode::Left => return Some(Act::Back),
+            KeyCode::Char('h') if ctrl => return Some(Act::Back),
             KeyCode::Esc if !self.query.is_empty() => self.edit(String::clear),
             KeyCode::Esc => return Some(Act::Back),
             KeyCode::Up => self.step(-1),

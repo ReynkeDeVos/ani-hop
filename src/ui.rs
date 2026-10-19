@@ -528,7 +528,8 @@ fn banner(app: &App) -> Vec<Line<'static>> {
         key("↑↓ ^j^k", "move"),
         key("tab", "mark for bulk actions"),
         key("^a", "mark all"),
-        key("enter", "select"),
+        key("enter → ^l", "select"),
+        key("← ^h", "back"),
         key("esc", "clear filter / back"),
         key("^c", "quit"),
     ]);

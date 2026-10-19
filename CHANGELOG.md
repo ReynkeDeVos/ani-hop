@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 – 2026-10-19
+
+### Added
+
+- → and ctrl+l select, like enter; ← and ctrl+h go back.
+
 ## 0.3.0 – 2026-10-18
 
 ### Added
