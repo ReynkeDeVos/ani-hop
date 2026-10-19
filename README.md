@@ -2,7 +2,7 @@
 
 ![ani-hop demo](demo.avif)
 
-A fast terminal UI for anime: browse trending, top rated and search results with posters, then stream or download episodes through [ani-cli](https://github.com/pystardust/ani-cli). Log in with [AniList](https://anilist.co) to get your lists and have your progress tracked after every episode.
+A fast terminal UI for anime: browse trending, top rated and search results, then stream or download episodes through [ani-cli](https://github.com/pystardust/ani-cli). Log in with [AniList](https://anilist.co) to get your lists and have your progress tracked after every episode.
 
 ## Why ani-hop
 
