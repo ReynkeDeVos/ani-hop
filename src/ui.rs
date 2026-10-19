@@ -1,6 +1,6 @@
 use crate::anilist::Media;
 use crate::kitty;
-use crate::{App, Cover, EpMode, Input, PIN_REDIRECT, Pending, View, ani, list_label};
+use crate::{App, Cover, EpMode, Feed, Input, PIN_REDIRECT, Pending, View, ani, list_label};
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, BorderType, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap,
@@ -220,6 +220,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         View::Input(Input::ClientId) => "client id ",
         View::Input(Input::Token) => "token ",
         View::Input(Input::SourceQuery(_)) => "ani-cli search ",
+        View::Input(Input::DownloadDir) => "folder ",
         _ => "",
     };
     let prompt = Line::from(vec![
@@ -249,7 +250,16 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     }
 
     let m = &screen.menu;
-    let count = format!("{}/{}", m.matches.len(), m.items.len());
+    // how many there are, and while filtering how many of them match
+    let picks = |i: &usize| !m.items[*i].action;
+    let all = (0..m.items.len()).filter(picks).count();
+    let count = match m.query.is_empty() {
+        true => all.to_string(),
+        false => format!(
+            "{}/{all}",
+            m.matches.iter().filter(|(i, _)| picks(i)).count()
+        ),
+    };
     let mut info = vec![Span::styled(
         if m.items.is_empty() && screen.loading {
             String::new()
@@ -295,6 +305,9 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 .map_or("▶ playing".into(), |s| format!("{spin} {s}…")),
         ))
     });
+    // and the next page right on "More…"
+    let fetching = matches!(screen.view, View::Shows(_, Feed::Pages(_, _, true)));
+    let busy = busy.or_else(|| fetching.then(|| ("more".to_string(), format!("{spin} loading…"))));
     let width = list_area.width.saturating_sub(1) as usize; // minus the pointer column
     let rows: Vec<ListItem> = m
         .matches
@@ -385,6 +398,12 @@ fn input_help(input: &Input) -> Text<'static> {
             "Search ani-cli's provider with this text,".into(),
             "then pick the matching entry. The choice is remembered.".into(),
         ],
+        Input::DownloadDir => vec![
+            "Where new downloads go. ~ works.".into(),
+            format!("Empty goes back to {}.", ani::tilde(&ani::default_root())).into(),
+            "".into(),
+            "Shows already downloaded stay in the old folder.".into(),
+        ],
     };
     Text::from(lines).fg(DIM)
 }
@@ -405,6 +424,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         | View::Status(m)
         | View::Sources(m, ..)
         | View::Input(Input::SourceQuery(m))
+        | View::Audio(Some(m))
         | View::Confirm(Pending::Progress(m, _)) => Some(m.clone()),
         _ => None,
     };
@@ -529,10 +549,8 @@ fn banner(app: &App) -> Vec<Line<'static>> {
         ]),
         None => Line::styled("○ AniList: not connected", DIM),
     });
-    let root = ani::download_root().display().to_string();
-    let home = ani::home().display().to_string();
     v.push(Line::styled(
-        format!("↓ {}", root.replacen(&home, "~", 1)),
+        format!("↓ {}", ani::tilde(&ani::download_root())),
         DIM,
     ));
     v.push("".into());

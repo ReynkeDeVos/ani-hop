@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.1 – 2026-10-19
+
+### Added
+
+- Trending now, Top rated and All-time popular go past the first 50 shows: "More…" at the end of the list loads the next 50, with a spinner right on it while it loads, and the cursor lands on the first new one. A page loads only when you pick "More…", so AniList gets one request per page.
+- "Download folder…" in the settings sets where new downloads go (`~` works, empty goes back to the default). It wins over `ANI_CLI_DOWNLOAD_DIR`; shows already downloaded stay in the old folder.
+
+### Changed
+
+- Audio has four choices: Japanese with or without English subtitles, and the English dub with or without them. Pick from a list: "Default audio…" in the settings, "Audio for this show…" on a show's page. Hidden subtitles are still loaded, v in mpv shows them. "English dub" now means without subtitles; before, mpv showed them anyway. Downloads remember whether they are the dub, so an episode downloaded in Japanese keeps its subtitles after the show is switched to the dub.
+
+- Download folders hold only the episodes and their subtitles. What ani-hop keeps about a downloaded show is in `~/.config/ani-hop/downloads.json` now.
+
+- The number above a list is just how many entries it has. Only while you type a filter does it show how many of them match, like 3/100.
+
+### Fixed
+
+- Deleting the downloads of several marked shows removes only what ani-hop downloaded. A folder of your own with the same name keeps its other files.
+- A show that is also in one of your custom AniList lists no longer appears twice in its status list.
+- Marks stay on their shows when a list updates in the background, instead of moving to whatever is now in that row.
+
 ## 0.4.0 – 2026-10-19
 
 ### Added
