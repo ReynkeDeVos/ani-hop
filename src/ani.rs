@@ -6,6 +6,7 @@
 //! keeps working after `ani-cli -U`.
 
 use crate::anilist::Media;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -66,6 +67,24 @@ pub fn cache_dir() -> PathBuf {
 
 pub fn config_dir() -> PathBuf {
     xdg("XDG_CONFIG_HOME", ".config").join("ani-hop")
+}
+
+/// A JSON file, or the default when it's missing or broken.
+pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> T {
+    fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// Written aside and renamed, so a full disk or quitting mid-write can't leave half a file.
+pub fn write_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    fs::create_dir_all(path.parent().unwrap())?;
+    // through a symlink (dotfiles), as a plain write would
+    let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
+    fs::rename(&tmp, &path)
 }
 
 fn root_path() -> PathBuf {
@@ -298,17 +317,13 @@ fn overrides_path() -> PathBuf {
 
 /// Manually chosen sources: anilist id -> (search query, provider title).
 fn overrides() -> HashMap<String, (String, String)> {
-    fs::read(overrides_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    read_json(&overrides_path())
 }
 
 pub fn save_override(id: u64, query: &str, title: &str) -> std::io::Result<()> {
     let mut all = overrides();
     all.insert(id.to_string(), (query.to_string(), title.to_string()));
-    fs::create_dir_all(config_dir())?;
-    fs::write(overrides_path(), serde_json::to_vec_pretty(&all)?)
+    write_json(&overrides_path(), &all)
 }
 
 pub fn default_query(m: &Media) -> String {
@@ -325,14 +340,11 @@ fn resolved_path() -> PathBuf {
 
 /// Sources found in earlier sessions, so menus and playback don't wait for ani-cli.
 pub fn load_resolved() -> HashMap<u64, Source> {
-    fs::read(resolved_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    read_json(&resolved_path())
 }
 
 pub fn save_resolved(all: &HashMap<u64, Source>) {
-    let _ = fs::write(resolved_path(), serde_json::to_vec(all).unwrap_or_default());
+    let _ = write_json(&resolved_path(), all);
 }
 
 /// Re-checks a (possibly cached) source right before ani-cli runs: `-S` is positional and
@@ -474,10 +486,7 @@ pub const AUDIO: [(&str, &str); 4] = [
 
 /// Audio chosen per AniList id and for "all" shows, as AUDIO keys.
 fn choices() -> HashMap<String, String> {
-    fs::read(audio_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    read_json(&audio_path())
 }
 
 /// A show's audio (None: the default): its own choice, else the default, else ani-cli's
@@ -514,8 +523,7 @@ fn subs(audio: &str) -> bool {
 pub fn set_audio(id: Option<u64>, audio: &str) -> std::io::Result<()> {
     let mut all = choices();
     choose(&mut all, id, audio);
-    fs::create_dir_all(config_dir())?;
-    fs::write(audio_path(), serde_json::to_vec_pretty(&all)?)
+    write_json(&audio_path(), &all)
 }
 
 /// A show keeps a choice of its own only while it differs from the default.
@@ -620,10 +628,7 @@ fn index_path() -> PathBuf {
 }
 
 fn index() -> Index {
-    fs::read(index_path())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    read_json(&index_path())
 }
 
 /// Changes the index under a lock, as another ani-hop may be changing it too.
@@ -639,10 +644,7 @@ fn edit_index(f: impl FnOnce(&mut Index)) -> std::io::Result<()> {
         r => serde_json::from_slice(&r?)?,
     };
     f(&mut all);
-    // written aside and renamed, so a full disk or quitting mid-write can't break it
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec(&all)?)?;
-    fs::rename(&tmp, &path)
+    write_json(&path, &all)
 }
 
 fn name(p: &Path) -> String {
@@ -1033,6 +1035,29 @@ mod tests {
         delete_show(&dir).unwrap();
         assert!(!dir.exists());
         fs::remove_dir(&root).unwrap();
+    }
+
+    #[test]
+    fn writes_json_through_symlinks() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-json-{}", std::process::id()));
+        let (real, link) = (
+            dir.join("dotfiles/audio.json"),
+            dir.join("config/audio.json"),
+        );
+        fs::create_dir_all(real.parent().unwrap()).unwrap();
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        fs::write(&real, "{}").unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        write_json(&link, &HashMap::from([("all", "dub")])).unwrap();
+        assert!(
+            link.is_symlink(),
+            "the link stays, the target gets the content"
+        );
+        assert_eq!(read_json::<HashMap<String, String>>(&real)["all"], "dub");
+        let fresh = dir.join("new/first.json");
+        write_json(&fresh, &vec![1]).unwrap();
+        assert_eq!(read_json::<Vec<u32>>(&fresh), [1]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

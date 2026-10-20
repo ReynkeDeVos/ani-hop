@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0 – 2026-10-20
+
+### Changed
+
+- Settings and cache files are written atomically, so quitting or a crash mid-write can't leave a broken one. Internal cleanup otherwise; nothing changes in use.
+
 ## 0.4.1 – 2026-10-19
 
 ### Added

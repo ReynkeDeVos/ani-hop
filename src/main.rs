@@ -23,6 +23,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -288,7 +289,7 @@ fn run_in_terminal(cmd: &str) {
 }
 
 /// Bumped on every list change, so refreshes that started before it don't count as fresh.
-static LIST_CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static LIST_CHANGES: AtomicU64 = AtomicU64::new(0);
 
 fn token_path() -> PathBuf {
     ani::config_dir().join("token")
@@ -337,7 +338,6 @@ fn open_url(url: &str) {
         .spawn();
 }
 
-/// Cover from the disk cache (or AniList), scaled and encoded for the terminal.
 /// Cover from the disk cache (or AniList), scaled and written out for the terminal.
 fn load_cover(
     id: u64,
@@ -367,19 +367,16 @@ fn load_episodes(m: &Media) -> HashMap<String, EpInfo> {
     };
     let age = fs::metadata(&path).and_then(|md| md.modified()).ok();
     let age = age.and_then(|t| t.elapsed().ok()).unwrap_or(Duration::MAX);
-    let cached = || serde_json::from_slice(&fs::read(&path).ok()?).ok();
-    if age.as_secs() < days * 86_400
-        && let Some(eps) = cached()
-    {
-        return eps;
-    }
-    match anilist::episodes(m.id) {
-        Ok(eps) => {
-            let _ = fs::create_dir_all(path.parent().unwrap());
-            let _ = fs::write(&path, serde_json::to_vec(&eps).unwrap_or_default());
-            eps
-        }
-        Err(_) => cached().unwrap_or_default(),
+    let cached: Option<HashMap<String, EpInfo>> = ani::read_json(&path);
+    match cached {
+        Some(eps) if age.as_secs() < days * 86_400 => eps,
+        cached => match anilist::episodes(m.id) {
+            Ok(eps) => {
+                let _ = ani::write_json(&path, &eps);
+                eps
+            }
+            Err(_) => cached.unwrap_or_default(),
+        },
     }
 }
 
@@ -391,10 +388,7 @@ fn queue_file(pid: &str) -> PathBuf {
 }
 
 fn read_queue(path: &Path) -> Vec<Job> {
-    fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
+    ani::read_json(path)
 }
 
 /// Changes this process's saved queue; jobs with nothing left fall out.
@@ -409,11 +403,7 @@ fn edit_queue(f: impl FnOnce(&mut Vec<Job>)) {
         let _ = fs::remove_file(&path);
         return;
     }
-    // written aside and renamed, so quitting mid-write can't leave half a file
-    let tmp = path.with_extension("tmp");
-    let _ = fs::create_dir_all(path.parent().unwrap());
-    let _ = fs::write(&tmp, serde_json::to_vec(&q).unwrap_or_default())
-        .and_then(|()| fs::rename(&tmp, &path));
+    let _ = ani::write_json(&path, &q);
 }
 
 fn queue_files() -> Vec<PathBuf> {
@@ -512,12 +502,10 @@ impl App {
         let token = fs::read_to_string(token_path())
             .ok()
             .map(|t| t.trim().to_string());
-        let user: Option<(u64, String, bool)> = fs::read(user_path())
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .filter(|_| token.is_some());
+        let user: Option<(u64, String, bool)> = ani::read_json(&user_path());
+        let user = user.filter(|_| token.is_some());
         if let Some((_, _, english)) = &user {
-            anilist::ENGLISH_TITLES.store(*english, std::sync::atomic::Ordering::Relaxed);
+            anilist::ENGLISH_TITLES.store(*english, Ordering::Relaxed);
         }
         let client = Client { token };
         let mut app = App {
@@ -589,6 +577,12 @@ impl App {
         self.refresh();
     }
 
+    fn log_out(&mut self) {
+        let _ = fs::remove_file(token_path());
+        let _ = fs::remove_file(user_path());
+        (self.client.token, self.user) = (None, None);
+    }
+
     /// Back to the main menu; an unanswered resume question stays.
     fn back_to_main(&mut self) {
         self.stack
@@ -644,9 +638,7 @@ impl App {
         f: impl FnOnce() -> Result<Vec<Media>, String> + Send + 'static,
     ) {
         let path = cache.map(|k| list_cache(&k));
-        let cached = path
-            .as_ref()
-            .and_then(|p| serde_json::from_slice(&fs::read(p).ok()?).ok());
+        let cached: Option<Vec<Media>> = path.as_ref().and_then(|p| ani::read_json(p));
         // fetched less than 2 minutes ago: good enough, saves AniList requests
         let age = path
             .as_ref()
@@ -657,14 +649,13 @@ impl App {
             return;
         }
         self.top().loading = true;
-        let changes = LIST_CHANGES.load(std::sync::atomic::Ordering::Relaxed);
+        let changes = LIST_CHANGES.load(Ordering::Relaxed);
         self.spawn(move || {
             let res = f();
             if let (Ok(list), Some(p)) = (&res, path) {
-                let _ = fs::create_dir_all(p.parent().unwrap());
-                let _ = fs::write(&p, serde_json::to_vec(list).unwrap_or_default());
+                let _ = ani::write_json(&p, list);
                 // a save landed while this was in flight: keep it, but not as fresh
-                if LIST_CHANGES.load(std::sync::atomic::Ordering::Relaxed) != changes {
+                if LIST_CHANGES.load(Ordering::Relaxed) != changes {
                     let file = fs::File::options().write(true).open(&p);
                     let _ = file.map(|f| f.set_modified(std::time::UNIX_EPOCH));
                 }
@@ -1367,9 +1358,7 @@ impl App {
                 self.top().menu.select_key(ani::audio(None));
             }
             "logout" => {
-                let _ = fs::remove_file(token_path());
-                let _ = fs::remove_file(user_path());
-                (self.client.token, self.user) = (None, None);
+                self.log_out();
                 self.toast("Logged out", false);
                 self.refresh();
             }
@@ -1591,7 +1580,7 @@ impl App {
 
     /// Marks this user's cached lists as old, so the next visit shows them and refreshes.
     fn outdate_lists(&self) {
-        LIST_CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LIST_CHANGES.fetch_add(1, Ordering::Relaxed);
         let Ok(dir) = fs::read_dir(ani::cache_dir().join("lists")) else {
             return;
         };
@@ -1667,7 +1656,7 @@ impl App {
                 }
             }),
             Msg::Viewer(Ok(user)) => {
-                let english = anilist::ENGLISH_TITLES.load(std::sync::atomic::Ordering::Relaxed);
+                let english = anilist::ENGLISH_TITLES.load(Ordering::Relaxed);
                 let _ = write_private(
                     &user_path(),
                     &serde_json::json!([user.0, user.1, english]).to_string(),
@@ -1690,9 +1679,7 @@ impl App {
             Msg::Viewer(Err(e)) => {
                 // keep the token on network trouble, drop it when AniList rejects it
                 if e.contains("Invalid token") || e.contains("Unauthorized") {
-                    let _ = fs::remove_file(token_path());
-                    let _ = fs::remove_file(user_path());
-                    (self.client.token, self.user) = (None, None);
+                    self.log_out();
                     self.back_to_main();
                 }
                 self.toast(format!("AniList login failed: {e}"), true);
