@@ -35,7 +35,7 @@ brew tap pystardust/ani-cli https://github.com/pystardust/ani-cli.git
 brew install pystardust/ani-cli/ani-cli reynkedevos/tap/ani-hop
 ```
 
-**Windows.** ani-hop runs in WSL. Install it with `wsl --install -d Ubuntu-26.04` in an admin PowerShell, restart, then run the line above in Ubuntu. The [WSL guide](docs/distribution.md#windows-via-wsl-step-by-step) has the details, including posters through kitty.
+**Windows.** ani-hop runs in WSL. Install it with `wsl --install -d Ubuntu-26.04` in an admin PowerShell, restart, then run the `install.sh` line above in Ubuntu. The [WSL guide](docs/distribution.md#windows-via-wsl-step-by-step) has the details, including posters through kitty.
 
 **From source.** `cargo install --locked --git https://github.com/ReynkeDeVos/ani-hop` (Rust 1.89 or newer). It then needs [ani-cli](https://github.com/pystardust/ani-cli) 5.1 or newer, [mpv](https://mpv.io), [yt-dlp](https://github.com/yt-dlp/yt-dlp), ffmpeg, curl, patch and xdg-utils; [ani-skip](https://github.com/synacktraa/ani-skip) is optional.
 

@@ -182,12 +182,13 @@ fn aur_helper() -> Option<&'static str> {
 /// ani-hop came from Homebrew, get brew, which has no ani-skip or xdg-utils.
 pub fn install_command(pkgs: &[&str]) -> Option<String> {
     let list = pkgs.join(" ");
+    // -Syu: Arch doesn't do partial upgrades
     if let Some(helper) = aur_helper() {
-        return Some(format!("{helper} -S --needed {list}"));
+        return Some(format!("{helper} -Syu --needed {list}"));
     }
     let aur = pkgs.iter().any(|p| p.starts_with("ani-"));
     if have("pacman") && !aur {
-        return Some(format!("sudo pacman -S --needed {list}"));
+        return Some(format!("sudo pacman -Syu --needed {list}"));
     }
     if cfg!(target_os = "linux") && !from_brew(&exe()) {
         return Some(INSTALL_SH.into());
@@ -256,8 +257,10 @@ pub fn ani_cli_update() -> Option<String> {
     if let Some(helper) = aur_helper().filter(|_| have("pacman")) {
         return Some(format!("{helper} -Syu"));
     }
-    // a distro's old copy: install.sh puts a fresh one in ~/.local/bin, which comes first
-    (cfg!(target_os = "linux") && !path.starts_with("/nix")).then(|| INSTALL_SH.into())
+    // a distro's old copy: install.sh (or brew, for a brew ani-hop) puts a fresh one first
+    (!path.starts_with("/nix"))
+        .then(|| install_command(&["ani-cli"]))
+        .flatten()
 }
 
 /// This ani-hop's binary, symlinks resolved.

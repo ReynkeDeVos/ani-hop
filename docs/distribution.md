@@ -82,22 +82,22 @@ curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh
 
 dist's own `ani-hop-installer.sh` only installs the binary ([template](https://github.com/axodotdev/cargo-dist/blob/main/cargo-dist/templates/installer/installer.sh.j2)), and the dependencies are the point here. So dist builds no shell installer, and this script downloads dist's archives itself.
 
-It reads `ID` and `ID_LIKE` from `/etc/os-release`, so Ubuntu, Mint and Pop!_OS count as Debian, and Manjaro and EndeavourOS as Arch:
+It reads `ID` and `ID_LIKE` from `/etc/os-release`, so Ubuntu, Mint and Pop!_OS count as Debian, and Manjaro and EndeavourOS as Arch. Rocky and Alma (like Fedora, without its packages) and image-based systems with `/run/ostree-booted` (Silverblue, Bazzite, Bluefin, Endless) count as "anything else":
 
 | Step | Arch | Debian / Ubuntu | Fedora | anything else |
 |---|---|---|---|---|
-| yay or paru installed | `yay -S --needed ani-hop-bin`, then stop | | | |
-| system packages (sudo) | `pacman -S --needed mpv yt-dlp ffmpeg curl patch xdg-utils` | `apt-get install -y mpv ffmpeg curl patch xdg-utils` | `dnf install -y mpv yt-dlp ffmpeg-free curl patch xdg-utils` | print the list and carry on |
-| yt-dlp | from pacman | upstream binary into `~/.local/bin` | from dnf | upstream binary |
-| codecs | | | asks before enabling RPM Fusion free and running `dnf swap ffmpeg-free ffmpeg --allowerasing` | |
+| yay or paru installed | `yay -Syu --needed ani-hop-bin ani-skip-git`, then stop | | | |
+| system packages (sudo) | `pacman -Syu --needed mpv yt-dlp ffmpeg curl patch diffutils xdg-utils` (Arch doesn't do partial upgrades) | `apt-get install -y --no-install-recommends mpv ffmpeg curl patch xdg-utils xz-utils` | `dnf install -y mpv yt-dlp curl patch diffutils xdg-utils` plus ffmpeg (below) | print the list, yt-dlp included, and carry on |
+| yt-dlp | from pacman | upstream binary into `~/.local/bin` | from dnf | from the distro (upstream's build needs glibc) |
+| codecs | | | asks first, then enables RPM Fusion free and installs its `ffmpeg`; otherwise `ffmpeg-free` and the two commands to switch later | |
 | ani-cli, ani-skip | upstream into `~/.local/bin` | same | same | same |
-| ani-hop | release archive for `uname -m` (x86_64, aarch64), checksum checked, into `~/.local/bin` | same | same | same |
+| ani-hop | release archive for `uname -m` (x86_64, aarch64), checksum checked, into `~/.local/bin` (on the yay/paru path an old copy there is removed) | same | same | same |
 
 Sources: the Arch, Debian and Fedora package names and versions are in section 3. The RPM Fusion commands come from [Configuration](https://rpmfusion.org/Configuration) and [Howto/Multimedia](https://rpmfusion.org/Howto/Multimedia). Fedora's ffmpeg has no H.264 or HEVC decoder of its own, only openh264 ([enable_decoders](https://src.fedoraproject.org/rpms/ffmpeg/raw/f44/f/enable_decoders)). The yt-dlp files are `yt-dlp_linux` and `yt-dlp_linux_aarch64` ([release files](https://github.com/yt-dlp/yt-dlp#release-files)).
 
 Details:
 - **ani-skip:** the script downloads `ani-skip` and its mpv script to `~/.config/mpv/scripts/skip.lua`. It doesn't use ani-skip's installer, which insists on Windows mpv.exe under WSL ([install](https://raw.githubusercontent.com/synacktraa/ani-skip/master/install)).
-- **Prompts:** the RPM Fusion question reads from `/dev/tty`, because with `curl | sh` the script itself is on stdin. Without a terminal it skips the step and prints the two commands.
+- **Prompts:** the RPM Fusion question and pacman's or yay's questions read from `/dev/tty`, because with `curl | sh` the script itself is on stdin. Without a terminal the script skips RPM Fusion (and prints the two commands) and runs pacman and yay with `--noconfirm`.
 - **sudo** is used only for system packages. Everything else goes in `$HOME`. The script refuses to run as root, because the user-level files would then land in `/root`.
 - **PATH:** at the end it checks whether `~/.local/bin` is on PATH, and if not, prints the line to add to the shell's rc file.
 - **Updating:** run the same line again. It fetches the newest ani-hop and fresh copies of ani-cli, ani-skip and the upstream yt-dlp. System packages update with the distro.
@@ -276,7 +276,7 @@ All done in 0.6.0:
 - [x] LICENSE, plus `license`, `description`, `repository`, `homepage` and `rust-version` in [Cargo.toml](../Cargo.toml).
 - [x] `install.sh` as in section 4, plus its container test job.
 - [x] `stream()` passes `ANI_CLI_PLAYER=mpv` when the user hasn't set it. This fixes WSL ([ani-cli L464](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L464)) and macOS with IINA ([L461](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L461)).
-- [x] `install_command`: yay/paru and pacman as before, the `install.sh` line elsewhere on Linux, and brew on macOS (without ani-skip, which Homebrew lacks).
+- [x] `install_command`: yay/paru and pacman (now with `-Syu`), the `install.sh` line elsewhere on Linux, and brew on macOS or when ani-hop came from Homebrew (without ani-skip and xdg-utils, which Homebrew lacks).
 - [x] The update hints from section 5.
 - [x] macOS: `open_url` uses `open`, and DEPS skips `xdg-open` there.
 - [x] `running()` and the poster cleanup use a lock file per process in `~/.cache/ani-hop/run/`, held for the whole run and probed with [`File::try_lock`](https://doc.rust-lang.org/std/fs/struct.File.html), instead of `/proc`. This also survives pid reuse. Leftover files of dead processes are removed at the next start.

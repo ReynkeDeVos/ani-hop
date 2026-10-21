@@ -542,6 +542,10 @@ fn setup(app: &App) -> Vec<Line<'static>> {
             "with Homebrew (brew.sh); ani-skip from github.com/synacktraa/ani-skip",
             DIM,
         ));
+        if names.contains(&"xdg-open") {
+            // only on Linux (deps() leaves it out on macOS), and Homebrew has no xdg-utils
+            v.push(Line::styled("xdg-open: xdg-utils from your distro", DIM));
+        }
     }
     v.extend(["".into(), Line::styled("AniList", Style::new().bold())]);
     v.push(match &app.user {

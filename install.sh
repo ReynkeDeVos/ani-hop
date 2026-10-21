@@ -4,7 +4,7 @@
 #   curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh
 #
 # System packages come from the distro, with sudo. ani-hop, ani-cli, ani-skip and, where the
-# distro's is too old or missing, yt-dlp go into ~/.local/bin, so `ani-cli -U` needs no sudo.
+# distro's is too old (Debian, Ubuntu), yt-dlp go into ~/.local/bin, so `ani-cli -U` needs no sudo.
 # Run it again to update them. ANI_HOP_RELEASE_URL picks another release, for example
 # https://github.com/ReynkeDeVos/ani-hop/releases/download/v0.6.0
 set -eu
@@ -38,6 +38,12 @@ as_root() {
 	else
 		warn "sudo not found, run this as root: $*"
 	fi
+}
+
+# pacman and the AUR helpers ask before they upgrade; with `curl | sh` the answer has to come
+# from the terminal, and without one there's no one to ask.
+arch_install() {
+	if tty_ok; then "$@" </dev/tty; else "$@" --noconfirm; fi
 }
 
 get() { curl -fsSL --retry 3 -o "$tmp/$2" "$1" || die "could not download $1"; }
@@ -88,18 +94,21 @@ main() {
 	*" fedora "*) case $(rpm -E %fedora 2>/dev/null) in [0-9]*) os=fedora ;; *) os=other ;; esac ;;
 	*) os=other ;;
 	esac
+	# Image-based systems (Silverblue, Bazzite, Bluefin, Endless) can't install into /usr.
+	[ ! -e /run/ostree-booted ] || os=other
 
-	# The AUR package brings ani-cli, ani-skip and the rest, and updates with the system.
+	# ani-hop-bin brings ani-cli and the rest, ani-skip-git the skipping; both update with
+	# the system. -Syu, because Arch doesn't do partial upgrades.
 	if [ "$os" = arch ]; then
 		for helper in yay paru; do
 			have "$helper" || continue
 			say "Installing ani-hop-bin from the AUR with $helper"
-			if tty_ok; then
-				"$helper" -S --needed ani-hop-bin </dev/tty
-			else
-				"$helper" -S --needed --noconfirm ani-hop-bin
+			arch_install "$helper" -Syu --needed ani-hop-bin ani-skip-git
+			# an earlier run's copy would come first on PATH
+			if [ -e "$BIN/ani-hop" ]; then
+				rm -f "$BIN/ani-hop"
+				say "Removed the old $BIN/ani-hop"
 			fi
-			[ ! -e "$BIN/ani-hop" ] || warn "remove ani-hop, ani-cli and ani-skip from $BIN, an earlier run put them there and they hide the AUR ones"
 			exit
 		done
 	fi
@@ -114,7 +123,7 @@ main() {
 	say "Installing system packages"
 	case $os in
 	arch)
-		as_root pacman -S --needed --noconfirm mpv yt-dlp ffmpeg curl patch diffutils xdg-utils
+		arch_install as_root pacman -Syu --needed mpv yt-dlp ffmpeg curl patch diffutils xdg-utils
 		yt=
 		;;
 	debian)
@@ -127,9 +136,8 @@ main() {
 		yt=
 		;;
 	*)
-		warn "unknown distro, install these with your package manager: mpv ffmpeg curl patch diffutils xdg-utils xz"
-		# Keep a distro yt-dlp, but update one this script put here before.
-		if have yt-dlp && [ ! -e "$BIN/yt-dlp" ]; then yt=; fi
+		warn "unknown distro, install these with your package manager: mpv yt-dlp ffmpeg curl patch diffutils xdg-utils xz"
+		yt= # upstream's build needs glibc, which Alpine and NixOS don't have the usual way
 		;;
 	esac
 
@@ -151,7 +159,9 @@ main() {
 	say "Installing ani-hop into $BIN"
 	get "$RELEASE/$archive" "$archive"
 	get "$RELEASE/$archive.sha256" "$archive.sha256"
-	(cd "$tmp" && sha256sum -c "$archive.sha256" >/dev/null) || die "checksum mismatch for $archive"
+	# compared by hand: busybox's sha256sum -c trips over the empty line dist ends the file with
+	[ "$(cut -d' ' -f1 "$tmp/$archive.sha256")" = "$(sha256sum <"$tmp/$archive" | cut -d' ' -f1)" ] ||
+		die "checksum mismatch for $archive"
 	tar -xJf "$tmp/$archive" -C "$tmp" || die "could not unpack $archive (is xz installed?)"
 	place "ani-hop-$target/ani-hop" "$BIN/ani-hop" 755
 
