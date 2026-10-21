@@ -5,7 +5,7 @@
 ### Added
 
 - One line installs ani-hop on Debian/Ubuntu, Fedora and Arch: `curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh`. mpv and ffmpeg come from the distro, ani-cli and ani-skip from upstream, so `ani-cli -U` keeps ani-cli current. Running it again updates everything. On Fedora it offers RPM Fusion, without which most episodes don't play.
-- Ready-made builds for Linux (x86_64 and ARM) and Apple-silicon Macs with every release, also as `ani-hop-bin` in the AUR and in a Homebrew tap (`reynkedevos/tap/ani-hop`).
+- Ready-made builds for Linux (x86_64 and ARM) and Apple-silicon Macs with every release, also in a Homebrew tap (`reynkedevos/tap/ani-hop`).
 - Runs on macOS: the AniList login opens in your browser, two ani-hops running at once keep their downloads and posters apart, and downloads go to `~/Movies/Anime`.
 - The setup screen says when ani-cli is older than 5.1, which ani-hop needs, and offers the right update command. The start screen shows when a new ani-hop is out and how to update it, checked at most once a day.
 - Licensed under GPL-3.0-or-later. Release archives include the licences of the libraries inside.

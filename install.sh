@@ -98,10 +98,12 @@ main() {
 	[ ! -e /run/ostree-booted ] || os=other
 
 	# ani-hop-bin brings ani-cli and the rest, ani-skip-git the skipping; both update with
-	# the system. -Syu, because Arch doesn't do partial upgrades.
+	# the system. -Syu, because Arch doesn't do partial upgrades. Until ani-hop-bin is in the
+	# AUR, Arch takes the pacman path below.
 	if [ "$os" = arch ]; then
 		for helper in yay paru; do
 			have "$helper" || continue
+			"$helper" -Si ani-hop-bin >/dev/null 2>&1 || continue
 			say "Installing ani-hop-bin from the AUR with $helper"
 			arch_install "$helper" -Syu --needed ani-hop-bin ani-skip-git
 			# an earlier run's copy would come first on PATH

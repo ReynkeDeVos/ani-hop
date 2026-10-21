@@ -20,13 +20,11 @@ A fast terminal UI for anime: browse trending, top rated and search results, the
 
 ## Install
 
-**Debian/Ubuntu, Fedora, Arch and their derivatives.** One line installs ani-hop and everything it needs. mpv and ffmpeg come from your distro, ani-cli and ani-skip from upstream into `~/.local/bin`, so `ani-cli -U` keeps ani-cli current without sudo. Run it again to update. On Arch with yay or paru it installs the AUR package instead. On other distros it installs ani-hop, ani-cli and ani-skip and lists the system packages to install yourself.
+**Debian/Ubuntu, Fedora, Arch and their derivatives.** One line installs ani-hop and everything it needs. mpv and ffmpeg come from your distro, ani-cli and ani-skip from upstream into `~/.local/bin`, so `ani-cli -U` keeps ani-cli current without sudo. Run it again to update. On Arch with yay or paru it will install the AUR package `ani-hop-bin` instead, once that is published (AUR sign-ups are closed for now). On other distros it installs ani-hop, ani-cli and ani-skip and lists the system packages to install yourself.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh
 ```
-
-**Arch (AUR).** `yay -S ani-hop-bin`, then `yay -Syu` updates ani-hop and ani-cli together.
 
 **Homebrew (macOS on Apple silicon, Linux).** ani-cli comes from its own tap:
 

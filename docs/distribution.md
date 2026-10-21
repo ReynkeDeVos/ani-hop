@@ -7,18 +7,18 @@ Researched on 2026-10-21 and updated the same day with the maintainer's decision
 | Platform | Channel | Why |
 |---|---|---|
 | **Debian/Ubuntu, Fedora, Arch** | **Install script** (section 4) | It installs mpv, ffmpeg, curl, patch and xdg-utils from the distro, plus yt-dlp where the distro's is current. Upstream ani-cli goes in `~/.local/bin`, where `ani-cli -U` keeps it fresh without sudo, and the ani-hop binary goes there too. Running the script again updates them. |
-| **Arch** | **AUR `ani-hop-bin`** | The AUR has a current ani-cli ([5.1-1](https://aur.archlinux.org/packages/ani-cli)), yay/paru [resolve AUR dependencies](https://wiki.archlinux.org/title/AUR_helpers), and `yay -Syu` updates everything. The install script hands over to it when yay or paru is installed. |
+| **Arch** | **AUR `ani-hop-bin`** | The AUR has a current ani-cli ([5.1-1](https://aur.archlinux.org/packages/ani-cli)), yay/paru [resolve AUR dependencies](https://wiki.archlinux.org/title/AUR_helpers), and `yay -Syu` updates everything. The install script hands over to it when yay or paru is installed and the package exists. |
 | **macOS, and Linux with Homebrew** | **Formula in your own tap** | It pulls in mpv, yt-dlp and ffmpeg, and `brew upgrade` keeps them current. ani-cli comes from the upstream tap, whose formula has no macOS-only parts ([formula](https://github.com/pystardust/ani-cli/blob/master/Formula/ani-cli.rb)). mpv, ffmpeg and yt-dlp have x86_64 and arm64 Linux bottles ([mpv](https://formulae.brew.sh/api/formula/mpv.json), [ffmpeg](https://formulae.brew.sh/api/formula/ffmpeg.json), [yt-dlp](https://formulae.brew.sh/api/formula/yt-dlp.json)). No DMG: it installs nothing else and needs a [$99/year Developer ID](https://developer.apple.com/programs/). |
 | **Windows** | **WSL guide only** | No native build, no MSI, EXE, winget or Scoop. WSL needs no code, gets the Linux channels and their updates, and is the only way to get posters on Windows (section 4). |
 | **Own auto-updater** | **No** | ani-cli is the only dependency that has to stay fresh. Every channel above either updates it with the rest (AUR, Homebrew) or puts the upstream script where `ani-cli -U` works (install script, WSL). ani-hop should only show the right update command (section 5). |
 | **Licence** | **GPL-3.0-or-later** (added on this branch) | ani-cli is GPL-3.0 too ([formula](https://github.com/pystardust/ani-cli/blob/master/Formula/ani-cli.rb)). Homebrew core accepts any licence compatible with the Debian Free Software Guidelines ([Licence Guidelines](https://docs.brew.sh/Licence-Guidelines)), and your own tap has no rule. It has to be v3, not v2, because `ring` (used by rustls) is Apache-2.0, which [works with GPLv3 but not GPLv2](https://www.gnu.org/licenses/license-list.html#apache2). The other dependencies are MIT, Apache, BSD, ISC, Zlib, Unicode-3.0, MPL-2.0 (nucleo-matcher, not marked "Incompatible With Secondary Licenses") and CDLA-Permissive-2.0 (webpki-roots). |
 
-**Status: everything below is built in 0.6.0** (LICENSE, dist release, AUR and Homebrew publishing, `install.sh` with container tests, the macOS fixes, `ANI_CLI_PLAYER=mpv`, the update hints, the README install and WSL sections). Left before the first release, all on your side:
+**Status: everything below is built in 0.6.0** (LICENSE, dist release, AUR and Homebrew publishing, `install.sh` with container tests, the macOS fixes, `ANI_CLI_PLAYER=mpv`, the update hints, the README install and WSL sections). The tap repo `ReynkeDeVos/homebrew-tap` and the secret `HOMEBREW_TAP_TOKEN` are set up.
 
-1. Create a public repo `ReynkeDeVos/homebrew-tap` with a README (tick "Add a README file"). It must have a `main` branch: dist's publish job checks it out, which fails on an empty repo.
-2. Create a fine-grained token with Contents read/write on that repo only, and save it as the secret `HOMEBREW_TAP_TOKEN` in ani-hop's repo settings.
-3. Log in to the AUR, add an SSH public key to the account, and save the private key (without a passphrase) as the secret `AUR_SSH_PRIVATE_KEY`. The first push creates `ani-hop-bin`.
-4. Merge the PR and tag: `git tag v0.6.0 && git push origin v0.6.0`.
+**The AUR waits for an account.** AUR sign-ups were closed on 2026-10-21, with no manual queue; reopening is announced on [aur-general](https://lists.archlinux.org/mailman3/lists/aur-general.lists.archlinux.org/) and the [Arch news](https://archlinux.org/news/). Until then the AUR job only checks the release archives, and `install.sh` on Arch takes the pacman path, because `yay -Si ani-hop-bin` finds nothing. To switch it on:
+
+1. Register on the AUR, add an SSH public key (no passphrase) to the account, and save the private key as the secret `AUR_SSH_PRIVATE_KEY`.
+2. Publish the current release: `gh workflow run publish-aur.yml -f tag=vX.Y.Z`. The first push creates `ani-hop-bin`; later releases push it by themselves.
 
 ## 2. Starting point (0.5.0, commit `1d82100`)
 
@@ -234,7 +234,7 @@ To change the dist config, edit `dist-workspace.toml` and run `dist generate`; C
 **Every release afterwards:**
 1. Open a PR with the version bump and the CHANGELOG entry, and squash-merge it, as now.
 2. Run `git tag vX.Y.Z && git push origin vX.Y.Z`. The last release on GitHub is v0.4.1; v0.5.0 was never tagged.
-3. `release.yml` runs plan, then builds the targets. It then creates the GitHub release with the archives, checksums and notes from CHANGELOG.md, pushes `ani-hop.rb` to the tap, and pushes the PKGBUILD to the AUR. `install.sh` picks up the new archives by itself, through `releases/latest/download/…`.
+3. `release.yml` runs plan, then builds the targets. It then creates the GitHub release with the archives, checksums and notes from CHANGELOG.md, pushes `ani-hop.rb` to the tap, and pushes the PKGBUILD to the AUR (once `AUR_SSH_PRIVATE_KEY` exists). `install.sh` picks up the new archives by itself, through `releases/latest/download/…`.
 
 Stop writing GitHub releases by hand. Release titles change to the CHANGELOG heading (`0.5.0 – 2026-10-20`). Every PR also gets a `dist plan` check.
 
@@ -243,7 +243,7 @@ Stop writing GitHub releases by hand. Release titles change to the CHANGELOG hea
 | Secret | For | Notes |
 |---|---|---|
 | `HOMEBREW_TAP_TOKEN` | pushing the formula | PAT with write access to the tap repo. dist's docs say a classic PAT with `repo` scope; a fine-grained PAT with Contents write should work, since the job only checks out and pushes (inferred) |
-| `AUR_SSH_PRIVATE_KEY` | pushing the PKGBUILD | passwordless key registered on the AUR account |
+| `AUR_SSH_PRIVATE_KEY` | pushing the PKGBUILD | passwordless key registered on the AUR account; without it the AUR job skips the push |
 | `GITHUB_TOKEN` | creating the release | automatic |
 
 Traps:
