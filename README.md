@@ -23,3 +23,7 @@ A fast terminal UI for anime: browse trending, top rated and search results, the
 ```sh
 cargo install --git https://github.com/ReynkeDeVos/ani-hop
 ```
+
+## License
+
+[GPL-3.0-or-later](LICENSE)
