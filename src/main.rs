@@ -608,7 +608,13 @@ impl App {
     fn after_install(&mut self) {
         self.missing = ani::missing_deps();
         self.old_ani_cli = ani::old_ani_cli();
-        let names: Vec<&str> = self.missing.iter().map(|d| d.0).collect();
+        // ani-skip is optional and Homebrew has none, so it's no reason for an error
+        let names: Vec<&str> = self
+            .missing
+            .iter()
+            .map(|d| d.0)
+            .filter(|&n| n != "ani-skip")
+            .collect();
         match (names.is_empty(), &self.old_ani_cli) {
             (false, _) => self.toast(format!("Still missing: {}", names.join(", ")), true),
             (true, Some(v)) => self.toast(

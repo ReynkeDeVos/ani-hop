@@ -1,6 +1,6 @@
 # Distributing ani-hop on Linux, macOS and Windows
 
-Researched on 2026-10-21 and updated the same day with the maintainer's decisions: Linux comes first (install script, AUR, Homebrew), the licence is GPL, and Windows only gets a WSL guide. Package versions and store policies change often, so every claim links to its source. Steps marked *(unconfirmed)* were not run and have no source that confirms them. The first version, with the full Windows analysis, is commit `b09665e`.
+Researched on 2026-10-21 and updated the same day with the maintainer's decisions: Linux comes first (install script, AUR, Homebrew), the licence is GPL, and Windows only gets a WSL guide. Package versions and store policies change often, so every claim links to its source. Steps marked *(unconfirmed)* were not run and have no source that confirms them. The [first version](https://github.com/ReynkeDeVos/ani-hop/blob/b09665e/docs/distribution.md) has the full Windows analysis.
 
 ## 1. Decisions and order
 
@@ -15,26 +15,26 @@ Researched on 2026-10-21 and updated the same day with the maintainer's decision
 
 **Status: everything below is built in 0.6.0** (LICENSE, dist release, AUR and Homebrew publishing, `install.sh` with container tests, the macOS fixes, `ANI_CLI_PLAYER=mpv`, the update hints, the README install and WSL sections). Left before the first release, all on your side:
 
-1. Create an empty public repo `ReynkeDeVos/homebrew-tap`.
+1. Create a public repo `ReynkeDeVos/homebrew-tap` with a README (tick "Add a README file"). It must have a `main` branch: dist's publish job checks it out, which fails on an empty repo.
 2. Create a fine-grained token with Contents read/write on that repo only, and save it as the secret `HOMEBREW_TAP_TOKEN` in ani-hop's repo settings.
 3. Log in to the AUR, add an SSH public key to the account, and save the private key (without a passphrase) as the secret `AUR_SSH_PRIVATE_KEY`. The first push creates `ani-hop-bin`.
 4. Merge the PR and tag: `git tag v0.6.0 && git push origin v0.6.0`.
 
-## 2. Starting point (before 0.6.0; line numbers as of commit `b09665e`)
+## 2. Starting point (0.5.0, commit `1d82100`)
 
-ani-hop checks PATH for ani-cli, mpv, ani-skip, yt-dlp, ffmpeg, curl and xdg-open ([`src/ani.rs:144`](../src/ani.rs#L144)); yt-dlp, ffmpeg and curl are only used through ani-cli. It reads ani-cli's menus through a fake `rofi` script ([`src/ani.rs:24`](../src/ani.rs#L24)), so ani-cli needs no fzf. It runs mpv itself for downloaded episodes ([`src/ani.rs:576`](../src/ani.rs#L576)) and reads yt-dlp's `[download]` lines ([`src/ani.rs:810`](../src/ani.rs#L810)). Besides these, ani-cli itself needs sed, grep and, for `-U`, patch ([ani-cli L554-L578](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L554-L578)).
+ani-hop checks PATH for ani-cli, mpv, ani-skip, yt-dlp, ffmpeg, curl and xdg-open ([`src/ani.rs:144`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/ani.rs#L144)); yt-dlp, ffmpeg and curl are only used through ani-cli. It reads ani-cli's menus through a fake `rofi` script ([`src/ani.rs:24`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/ani.rs#L24)), so ani-cli needs no fzf. It runs mpv itself for downloaded episodes ([`src/ani.rs:576`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/ani.rs#L576)) and reads yt-dlp's `[download]` lines ([`src/ani.rs:810`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/ani.rs#L810)). Besides these, ani-cli itself needs sed, grep and, for `-U`, patch ([ani-cli L554-L578](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L554-L578)).
 
 **Linux** works today on every distro that has the dependencies.
 
 **macOS** compiles, but four things break at runtime:
-- The AniList login runs `xdg-open` ([`src/main.rs:334`](../src/main.rs#L334)), which macOS does not have.
-- `running()` ([`src/ani.rs:853`](../src/ani.rs#L853)) and the poster cleanup ([`src/kitty.rs:115`](../src/kitty.rs#L115)) read `/proc`, so every other ani-hop looks dead. A second ani-hop then takes over the first one's download queue ([`src/main.rs:420`](../src/main.rs#L420)) and deletes its poster files.
-- On macOS ani-cli picks IINA before mpv ([ani-cli L461](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L461)), and ani-cli's README tells Mac users to install IINA ([README](https://github.com/pystardust/ani-cli/blob/master/README.md)). ani-hop assumes mpv: it passes mpv flags ([`src/ani.rs:549`](../src/ani.rs#L549)) and waits for mpv's `VO:` line ([`src/ani.rs:455`](../src/ani.rs#L455)).
-- The install offer only knows yay, paru and pacman ([`src/ani.rs:165`](../src/ani.rs#L165)).
+- The AniList login runs `xdg-open` ([`src/main.rs:334`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/main.rs#L334)), which macOS does not have.
+- `running()` ([`src/ani.rs:853`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/ani.rs#L853)) and the poster cleanup ([`src/kitty.rs:115`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/kitty.rs#L115)) read `/proc`, so every other ani-hop looks dead. A second ani-hop then takes over the first one's download queue ([`src/main.rs:420`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/main.rs#L420)) and deletes its poster files.
+- On macOS ani-cli picks IINA before mpv ([ani-cli L461](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L461)), and ani-cli's README tells Mac users to install IINA ([README](https://github.com/pystardust/ani-cli/blob/master/README.md)). ani-hop assumes mpv: it passes mpv flags ([`src/ani.rs:549`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/ani.rs#L549)) and waits for mpv's `VO:` line ([`src/ani.rs:455`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/ani.rs#L455)).
+- The install offer only knows yay, paru and pacman ([`src/ani.rs:165`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/ani.rs#L165)).
 
-Posters should work in Ghostty and kitty, because the poster file falls back from `/dev/shm` to `$TMPDIR` ([`src/kitty.rs:90`](../src/kitty.rs#L90)).
+Posters should work in Ghostty and kitty, because the poster file falls back from `/dev/shm` to `$TMPDIR` ([`src/kitty.rs:90`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/kitty.rs#L90)).
 
-**Windows** does not compile (`std::os::unix` imports), and no Windows terminal draws the kitty Unicode placeholders that posters use ([`src/kitty.rs:145`](../src/kitty.rs#L145)). Commit `b09665e` lists the roughly 250 lines a native port would need. That work is not planned.
+**Windows** does not compile (`std::os::unix` imports), and no Windows terminal draws the kitty Unicode placeholders that posters use ([`src/kitty.rs:145`](https://github.com/ReynkeDeVos/ani-hop/blob/1d82100/src/kitty.rs#L145)). The [first version of this document](https://github.com/ReynkeDeVos/ani-hop/blob/b09665e/docs/distribution.md) lists the roughly 250 lines a native port would need. That work is not planned.
 
 ## 3. Dependencies per channel
 
@@ -53,7 +53,7 @@ Sources: Repology for [ani-cli](https://repology.org/project/ani-cli/versions), 
 
 Takeaway:
 - **Only ani-cli has to stay fresh.** It changed its streaming source twice this year ([v5.0](https://github.com/pystardust/ani-cli/releases/tag/v5.0), 2026-08-01; [v5.1](https://github.com/pystardust/ani-cli/releases/tag/v5.1), 2026-09-11), so the 4.x packages are probably broken (not tested). It is current only in the AUR, the upstream Homebrew tap, MacPorts, Scoop and nixpkgs-unstable. nixpkgs 26.05 still has 5.0. That is why the install script never takes ani-cli from apt or dnf.
-- **yt-dlp can be a few months old.** ani-cli only hands it a direct link it has already found ([ani-cli L349](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L349)). Debian 13's is 18 months old, though, so the script uses the upstream binary there. For ani-hop yt-dlp is still a hard dependency: ani-hop reads its progress lines, and it stops downloads the way it does so that ani-cli doesn't fall back to ffmpeg, which leaves a partial file that looks finished ([`src/ani.rs:969`](../src/ani.rs#L969)). AUR ani-cli doesn't depend on yt-dlp ([AUR](https://aur.archlinux.org/packages/ani-cli)), so ani-hop's packages must declare it.
+- **yt-dlp can be a few months old.** ani-cli only hands it a direct link it has already found ([ani-cli L349](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L349)). Debian 13's is 18 months old, though, so the script uses the upstream binary there. For ani-hop yt-dlp is still a hard dependency: ani-hop reads its progress lines, and it stops downloads the way it does so that ani-cli doesn't fall back to ffmpeg, which leaves a partial file that looks finished ([`src/ani.rs:979`](../src/ani.rs#L979)). AUR ani-cli doesn't depend on yt-dlp ([AUR](https://aur.archlinux.org/packages/ani-cli)), so ani-hop's packages must declare it.
 - **mpv and ffmpeg are fine from any package manager,** apart from Fedora's codecs.
 - **ani-skip is optional** and only packaged in the AUR and nixpkgs.
 
@@ -96,7 +96,7 @@ It reads `ID` and `ID_LIKE` from `/etc/os-release`, so Ubuntu, Mint and Pop!_OS 
 Sources: the Arch, Debian and Fedora package names and versions are in section 3. The RPM Fusion commands come from [Configuration](https://rpmfusion.org/Configuration) and [Howto/Multimedia](https://rpmfusion.org/Howto/Multimedia). Fedora's ffmpeg has no H.264 or HEVC decoder of its own, only openh264 ([enable_decoders](https://src.fedoraproject.org/rpms/ffmpeg/raw/f44/f/enable_decoders)). The yt-dlp files are `yt-dlp_linux` and `yt-dlp_linux_aarch64` ([release files](https://github.com/yt-dlp/yt-dlp#release-files)).
 
 Details:
-- **ani-skip:** the script downloads `ani-skip` and its mpv script to `~/.config/mpv/scripts/skip.lua`, the same two files as in the WSL guide below. It doesn't use ani-skip's installer, which insists on Windows mpv.exe under WSL ([install](https://raw.githubusercontent.com/synacktraa/ani-skip/master/install)).
+- **ani-skip:** the script downloads `ani-skip` and its mpv script to `~/.config/mpv/scripts/skip.lua`. It doesn't use ani-skip's installer, which insists on Windows mpv.exe under WSL ([install](https://raw.githubusercontent.com/synacktraa/ani-skip/master/install)).
 - **Prompts:** the RPM Fusion question reads from `/dev/tty`, because with `curl | sh` the script itself is on stdin. Without a terminal it skips the step and prints the two commands.
 - **sudo** is used only for system packages. Everything else goes in `$HOME`. The script refuses to run as root, because the user-level files would then land in `/root`.
 - **PATH:** at the end it checks whether `~/.local/bin` is on PATH, and if not, prints the line to add to the shell's rc file.
@@ -136,7 +136,7 @@ Limits:
 
 ### Windows: only through WSL
 
-Windows is not a focus. ani-hop runs there in WSL, which uses the Linux channels above. A native build would install no dependencies (MSI/EXE), lack ani-cli (winget, Chocolatey), or need the same port plus PowerShell underneath (Scoop). It would also show no posters, and couldn't be tested on Arch. Commit `b09665e` has the full comparison.
+Windows is not a focus. ani-hop runs there in WSL, which uses the Linux channels above. A native build would install no dependencies (MSI/EXE), lack ani-cli (winget, Chocolatey), or need the same port plus PowerShell underneath (Scoop). It would also show no posters, and couldn't be tested on Arch. The [first version of this document](https://github.com/ReynkeDeVos/ani-hop/blob/b09665e/docs/distribution.md) has the full comparison.
 
 #### Windows via WSL, step by step
 
@@ -254,8 +254,8 @@ Traps:
 
 ## 7. Rejected options
 
-- **Any native Windows build** (MSI, EXE, winget, Scoop, Chocolatey): decided against, and WSL is the answer instead. In short: an MSI or EXE installs no dependencies ([dist MSI](https://github.com/axodotdev/cargo-dist/blob/main/book/src/installers/msi.md)). winget and Chocolatey have no ani-cli ([Repology](https://repology.org/project/ani-cli/versions)). Scoop has it, but runs PowerShell underneath. A port is about 250 lines with no posters. Details are in commit `b09665e`.
-- **Windows mpv.exe under WSL**, as ani-cli's README suggests: `have("mpv")` and `play_file` need Linux mpv ([`src/ani.rs:156`](../src/ani.rs#L156), [`src/ani.rs:707`](../src/ani.rs#L707)), and Windows programs get Linux paths [unconverted](https://learn.microsoft.com/en-us/windows/wsl/filesystems).
+- **Any native Windows build** (MSI, EXE, winget, Scoop, Chocolatey): decided against, and WSL is the answer instead. In short: an MSI or EXE installs no dependencies ([dist MSI](https://github.com/axodotdev/cargo-dist/blob/main/book/src/installers/msi.md)). winget and Chocolatey have no ani-cli ([Repology](https://repology.org/project/ani-cli/versions)). Scoop has it, but runs PowerShell underneath. A port is about 250 lines with no posters. Details are in the [first version of this document](https://github.com/ReynkeDeVos/ani-hop/blob/b09665e/docs/distribution.md).
+- **Windows mpv.exe under WSL**, as ani-cli's README suggests: `have("mpv")` and `play_file` need Linux mpv ([`src/ani.rs:156`](../src/ani.rs#L156), [`src/ani.rs:717`](../src/ani.rs#L717)), and Windows programs get Linux paths [unconverted](https://learn.microsoft.com/en-us/windows/wsl/filesystems).
 - **DMG, pkg, cask, notarization:** install no dependencies, [cost $99/year](https://developer.apple.com/programs/), and [CLI tools belong in formulae](https://docs.brew.sh/Acceptable-Casks).
 - **homebrew-core:** [notability and repo age](https://docs.brew.sh/Package-Acceptance-Policy), and ani-cli isn't in core. GPL would be fine there.
 - **Intel macOS builds:** Homebrew is [Tier 3 on Intel with no new bottles](https://docs.brew.sh/Support-Tiers).
@@ -281,7 +281,7 @@ All done in 0.6.0:
 - [x] macOS: `open_url` uses `open`, and DEPS skips `xdg-open` there.
 - [x] `running()` and the poster cleanup use a lock file per process in `~/.cache/ani-hop/run/`, held for the whole run and probed with [`File::try_lock`](https://doc.rust-lang.org/std/fs/struct.File.html), instead of `/proc`. This also survives pid reuse. Leftover files of dead processes are removed at the next start.
 - [x] Downloads default to `~/Movies/Anime` on macOS.
-- [x] A missing ani-skip no longer opens the setup screen at every start, since it is optional and Homebrew has none.
+- [x] ani-skip is optional for real: `stream()` only passes `--skip` when ani-skip is installed (ani-cli stops otherwise), and a missing ani-skip no longer opens the setup screen at every start. Homebrew has none.
 
 **Windows:** nothing. WSL runs the Linux build.
 

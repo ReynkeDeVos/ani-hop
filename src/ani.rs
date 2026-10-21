@@ -178,7 +178,8 @@ fn aur_helper() -> Option<&'static str> {
 
 /// One command for everything missing (Arch package names, as in DEPS). ani-cli and
 /// ani-skip live in the AUR, so plain pacman only qualifies when neither is needed; other
-/// distros get install.sh, which fetches both from upstream. Homebrew has no ani-skip.
+/// distros get install.sh, which fetches both from upstream. macOS, and Linux when
+/// ani-hop came from Homebrew, get brew, which has no ani-skip or xdg-utils.
 pub fn install_command(pkgs: &[&str]) -> Option<String> {
     let list = pkgs.join(" ");
     if let Some(helper) = aur_helper() {
@@ -188,14 +189,14 @@ pub fn install_command(pkgs: &[&str]) -> Option<String> {
     if have("pacman") && !aur {
         return Some(format!("sudo pacman -S --needed {list}"));
     }
-    if cfg!(target_os = "linux") {
+    if cfg!(target_os = "linux") && !from_brew(&exe()) {
         return Some(INSTALL_SH.into());
     }
     let brew: Vec<&str> = pkgs
         .iter()
         .filter_map(|p| match *p {
             "ani-cli" => Some("pystardust/ani-cli/ani-cli"),
-            "ani-skip-git" => None,
+            "ani-skip-git" | "xdg-utils" => None,
             p => Some(p),
         })
         .collect();
@@ -215,7 +216,8 @@ pub fn old_ani_cli() -> Option<String> {
         .arg("-V")
         .stdin(Stdio::null())
         .output()
-        .ok()?;
+        .ok()
+        .filter(|o| o.status.success())?; // it exits early when curl or a player is missing
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
     older(&v, TESTED_ANI_CLI).then_some(v)
 }
@@ -258,11 +260,16 @@ pub fn ani_cli_update() -> Option<String> {
     (cfg!(target_os = "linux") && !path.starts_with("/nix")).then(|| INSTALL_SH.into())
 }
 
+/// This ani-hop's binary, symlinks resolved.
+fn exe() -> PathBuf {
+    std::env::current_exe()
+        .and_then(fs::canonicalize)
+        .unwrap_or_default()
+}
+
 /// How to update this ani-hop, judged by where it lives.
 pub fn update_command() -> String {
-    let exe = std::env::current_exe()
-        .and_then(fs::canonicalize)
-        .unwrap_or_default();
+    let exe = exe();
     if exe.starts_with(home().join(".local/bin")) {
         INSTALL_SH.into()
     } else if from_brew(&exe) {
@@ -294,7 +301,7 @@ pub fn setup() -> std::io::Result<()> {
     // locked before it gets its name, so no one ever finds it unlocked and deletes it
     let tmp = run.join(format!("{me}.tmp"));
     let lock = fs::File::create(&tmp)?;
-    lock.lock()?;
+    let _ = lock.lock(); // where locks don't work, held() takes every ani-hop for alive
     fs::rename(&tmp, run.join(format!("{me}.lock")))?;
     let _ = ALIVE.set(lock);
     for p in fs::read_dir(&run)?.flatten().map(|e| e.path()) {
@@ -686,7 +693,8 @@ pub fn stream(src: &Source, ep: &str, audio: &str, mut up: impl FnMut()) -> Resu
         .env("ANI_CLI_PLAYER", player)
         .env("ANI_CLI_MODE", mode(dub(audio)))
         .env("ANI_CLI_PLAYER_FLAGS", flags)
-        .args(skip_on().then_some("--skip"))
+        // ani-cli stops when --skip finds no ani-skip, and ani-skip is optional
+        .args((skip_on() && have("ani-skip")).then_some("--skip"))
         .args([
             "--exit-after-play",
             "-S",
@@ -986,8 +994,10 @@ pub fn running(pid: &str) -> bool {
     held(&run_dir().join(format!("{pid}.lock")))
 }
 
+/// Shared, so it works on a read-only handle (NFS insists). Any error counts as held:
+/// better to leave a dead ani-hop's queue alone than take a live one's.
 fn held(lock: &Path) -> bool {
-    fs::File::open(lock).is_ok_and(|f| matches!(f.try_lock(), Err(fs::TryLockError::WouldBlock)))
+    fs::File::open(lock).is_ok_and(|f| f.try_lock_shared().is_err())
 }
 
 #[cfg(test)]

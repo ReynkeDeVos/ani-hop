@@ -530,8 +530,8 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     }
     let pkgs: Vec<&str> = app.missing.iter().map(|d| d.1).collect();
     if !pkgs.is_empty() && ani::install_command(&pkgs).is_none() {
-        // shortcut: only Linux and macOS are supported, and Linux always gets a command;
-        // word it per OS if another one is added
+        // shortcut: worded for Homebrew, the only way to land here on Linux or macOS; word
+        // it per OS if another one is added
         let names: Vec<&str> = app.missing.iter().map(|d| d.0).collect();
         v.push("".into());
         v.push(Line::styled(

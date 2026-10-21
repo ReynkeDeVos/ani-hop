@@ -6,7 +6,7 @@
 # System packages come from the distro, with sudo. ani-hop, ani-cli, ani-skip and, where the
 # distro's is too old or missing, yt-dlp go into ~/.local/bin, so `ani-cli -U` needs no sudo.
 # Run it again to update them. ANI_HOP_RELEASE_URL picks another release, for example
-# https://github.com/ReynkeDeVos/ani-hop/releases/download/v0.5.0
+# https://github.com/ReynkeDeVos/ani-hop/releases/download/v0.6.0
 set -eu
 
 BIN=$HOME/.local/bin
@@ -60,7 +60,7 @@ fedora_packages() {
 		as_root "$@" ffmpeg
 	elif tty_ok && ask "Enable RPM Fusion for an ffmpeg that plays H.264 and HEVC?"; then
 		as_root dnf install -y "$fusion"
-		as_root "$@" --allowerasing ffmpeg
+		as_root "$@" ffmpeg --allowerasing
 	else
 		as_root "$@" ffmpeg-free
 		say "Most streams need H.264. To get it, enable RPM Fusion and swap ffmpeg:"
@@ -70,10 +70,11 @@ fedora_packages() {
 
 main() {
 	[ "$(id -u)" -ne 0 ] || die "don't run this as root: ani-hop and ani-cli go into ~/.local/bin of the user who runs it, and sudo is only needed for system packages"
+	[ "$(uname -s)" = Linux ] || die "this script is for Linux; on macOS install ani-hop with Homebrew, see the README"
 
 	case $(uname -m) in
 	x86_64) target=x86_64-unknown-linux-musl yt=yt-dlp_linux ;;
-	aarch64 | arm64) target=aarch64-unknown-linux-musl yt=yt-dlp_linux_aarch64 ;;
+	aarch64) target=aarch64-unknown-linux-musl yt=yt-dlp_linux_aarch64 ;;
 	*) die "there is no ani-hop build for $(uname -m), only for x86_64 and aarch64" ;;
 	esac
 	archive=ani-hop-$target.tar.xz
@@ -83,7 +84,8 @@ main() {
 	case $os in
 	*" arch "*) os=arch ;;
 	*" debian "* | *" ubuntu "*) os=debian ;;
-	*" fedora "*) os=fedora ;;
+	# Rocky and Alma say they are like fedora too, but have none of its packages.
+	*" fedora "*) case $(rpm -E %fedora 2>/dev/null) in [0-9]*) os=fedora ;; *) os=other ;; esac ;;
 	*) os=other ;;
 	esac
 
@@ -97,6 +99,7 @@ main() {
 			else
 				"$helper" -S --needed --noconfirm ani-hop-bin
 			fi
+			[ ! -e "$BIN/ani-hop" ] || warn "remove ani-hop, ani-cli and ani-skip from $BIN, an earlier run put them there and they hide the AUR ones"
 			exit
 		done
 	fi
@@ -116,7 +119,8 @@ main() {
 		;;
 	debian)
 		as_root apt-get update
-		as_root apt-get install -y mpv ffmpeg curl patch xdg-utils xz-utils
+		# mpv recommends the distro's yt-dlp, which is too old and would sit next to ours.
+		as_root apt-get install -y --no-install-recommends mpv ffmpeg curl patch xdg-utils xz-utils
 		;;
 	fedora)
 		fedora_packages
@@ -174,7 +178,8 @@ main() {
 		;;
 	esac
 
-	say "Done: $("$BIN/ani-hop" --version), ani-cli $("$BIN/ani-cli" -V 2>/dev/null || echo '(not working yet)')"
+	version=$("$BIN/ani-hop" --version) || die "$BIN/ani-hop was installed but does not run"
+	say "Done: $version, ani-cli $("$BIN/ani-cli" -V 2>/dev/null || echo '(not working yet)')"
 }
 
 main "$@"

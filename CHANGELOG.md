@@ -14,7 +14,8 @@
 
 - Episodes play in mpv unless `ANI_CLI_PLAYER` says otherwise. ani-cli would pick IINA on macOS and Windows' mpv.exe under WSL.
 - "Install missing packages" works beyond Arch: other distros get the install line, macOS gets Homebrew.
-- A missing ani-skip no longer brings up the setup screen at every start, since it's optional.
+- ani-skip is optional: without it episodes play without skipping, instead of failing, and the setup screen no longer comes up at every start.
+- Two ani-hops running at once now recognise each other through a lock file instead of /proc. Quit a running older ani-hop before starting this one, or the new one offers to resume its downloads.
 
 ## 0.5.0 – 2026-10-20
 

@@ -29,7 +29,7 @@ if command -v apt-get >/dev/null; then
 	apt-get update -q >/dev/null
 	apt-get install -qy --no-install-recommends sudo curl ca-certificates >/dev/null
 elif command -v dnf >/dev/null; then
-	dnf install -qy sudo util-linux >/dev/null # util-linux has su
+	dnf install -qy sudo util-linux util-linux-script >/dev/null # su, and script for a fake terminal
 elif command -v pacman >/dev/null; then
 	pacman -Syu --noconfirm --needed sudo >/dev/null
 fi
@@ -39,15 +39,16 @@ echo 'tester ALL=(ALL) NOPASSWD: ALL' >/etc/sudoers.d/tester
 as_tester() { su - tester -c "export ANI_HOP_RELEASE_URL=file:///release; $1"; }
 
 check() {
-	as_tester 'set -e; PATH=$HOME/.local/bin:$PATH
+	# shellcheck disable=SC2016 # expanded by the tester's shell
+	as_tester 'set -eo pipefail; PATH=$HOME/.local/bin:$PATH
 		ani-hop --version | grep "^ani-hop [0-9]"
-		echo "ani-cli $(ani-cli -V)"; ani-cli -V | grep -q "^5\."
-		echo "ani-skip $(ani-skip -V)"
-		echo "yt-dlp $(yt-dlp --version) at $(command -v yt-dlp)"
-		mpv --version | head -n1
-		ffmpeg -version | head -n1
+		ani-cli -V | sed "s/^/ani-cli /" | grep "^ani-cli 5\."
+		ani-skip -V | sed "s/^/ani-skip /"
+		yt-dlp --version | sed "s/^/yt-dlp /"; command -v yt-dlp
+		mpv --version | sed -n 1p
+		ffmpeg -version | sed -n 1p
 		test -s ~/.config/mpv/scripts/skip.lua
-		for c in patch diff xdg-open xz; do command -v $c >/dev/null || { echo "missing $c"; exit 1; }; done' ||
+		for c in mpv ffmpeg yt-dlp ani-skip patch diff xdg-open xz; do command -v $c >/dev/null || { echo "missing $c"; exit 1; }; done' ||
 		fail "check after $1"
 }
 
@@ -73,5 +74,12 @@ start=$(date +%s)
 as_tester 'sh /install.sh' || fail "second run"
 echo "second run took $(($(date +%s) - start))s"
 check "second run"
+
+if grep -q '^ID=fedora' /etc/os-release; then
+	step "fedora with a terminal: yes to RPM Fusion"
+	echo y | as_tester 'script -qec "sh /install.sh" /dev/null' || fail "RPM Fusion run"
+	rpm -q ffmpeg-libs || fail "no ffmpeg from RPM Fusion"
+	check "RPM Fusion run"
+fi
 
 step "PASS"
