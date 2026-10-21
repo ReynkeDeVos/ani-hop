@@ -1,7 +1,12 @@
 [package]
 name = "ani-hop"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
+rust-version = "1.89"
+license = "GPL-3.0-or-later"
+description = "A fast terminal UI for anime: browse, stream and download through ani-cli, with AniList sync"
+repository = "https://github.com/ReynkeDeVos/ani-hop"
+homepage = "https://github.com/ReynkeDeVos/ani-hop"
 
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }
@@ -10,3 +15,8 @@ ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }
 ureq = { version = "3.4.2", features = ["json"] }
 serde_json = "1.0.154"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

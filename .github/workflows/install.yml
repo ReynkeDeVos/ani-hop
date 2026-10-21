@@ -1,0 +1,51 @@
+# Runs install.sh in fresh Debian, Ubuntu, Fedora and Arch containers against an archive
+# packed the way dist packs release archives.
+name: Install script
+
+on:
+  pull_request:
+    paths: [install.sh, .github/test-install.sh, .github/workflows/install.yml]
+  push:
+    branches: [main]
+    paths: [install.sh, .github/test-install.sh, .github/workflows/install.yml]
+
+jobs:
+  archive:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: rustup target add x86_64-unknown-linux-musl
+      - run: cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: Pack it like dist does
+        run: |
+          name=ani-hop-x86_64-unknown-linux-musl
+          mkdir -p "release/$name"
+          cp target/x86_64-unknown-linux-musl/release/ani-hop LICENSE README.md CHANGELOG.md THIRD-PARTY-LICENSES.md "release/$name/"
+          cd release
+          tar -cJf "$name.tar.xz" "$name"
+          sha256sum -b "$name.tar.xz" > "$name.tar.xz.sha256"
+          rm -r "$name"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release
+          path: release/
+
+  test:
+    needs: archive
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ["debian:13", "ubuntu:24.04", "fedora:44", "archlinux:latest"]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: release
+          path: release
+      - run: ENGINE=docker .github/test-install.sh "${{ matrix.image }}" release

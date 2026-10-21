@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0 – 2026-10-21
+
+### Added
+
+- One line installs ani-hop on Debian/Ubuntu, Fedora and Arch: `curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh`. mpv and ffmpeg come from the distro, ani-cli and ani-skip from upstream, so `ani-cli -U` keeps ani-cli current. Running it again updates everything. On Fedora it offers RPM Fusion, without which most episodes don't play.
+- Ready-made builds for Linux (x86_64 and ARM) and Apple-silicon Macs with every release, also in a Homebrew tap (`reynkedevos/tap/ani-hop`).
+- Runs on macOS: the AniList login opens in your browser, two ani-hops running at once keep their downloads and posters apart, and downloads go to `~/Movies/Anime`.
+- The setup screen says when ani-cli is older than 5.1, which ani-hop needs, and offers the right update command. The start screen shows when a new ani-hop is out and how to update it, checked at most once a day.
+- Licensed under GPL-3.0-or-later. Release archives include the licences of the libraries inside.
+
+### Changed
+
+- Episodes play in mpv unless `ANI_CLI_PLAYER` says otherwise. ani-cli would pick IINA on macOS and Windows' mpv.exe under WSL.
+- "Install missing packages" works beyond Arch: other distros get the install line, macOS gets Homebrew.
+- ani-skip is optional: without it episodes play without skipping, instead of failing, and the setup screen no longer comes up at every start.
+- Two ani-hops running at once now recognise each other through a lock file instead of /proc. Quit a running older ani-hop before starting this one, or the new one offers to resume its downloads.
+
 ## 0.5.0 – 2026-10-20
 
 ### Changed

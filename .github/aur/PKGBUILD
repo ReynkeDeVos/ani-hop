@@ -1,0 +1,28 @@
+# Maintainer: Renke Brixel (https://github.com/ReynkeDeVos)
+# Written by .github/workflows/publish-aur.yml on every release; @…@ get filled in there.
+pkgname=ani-hop-bin
+pkgver=@VERSION@
+pkgrel=1
+pkgdesc="A fast terminal UI for anime: browse, stream and download through ani-cli, with AniList sync"
+arch=('x86_64' 'aarch64')
+url="https://github.com/ReynkeDeVos/ani-hop"
+license=('GPL-3.0-or-later')
+depends=('ani-cli' 'mpv' 'yt-dlp' 'ffmpeg' 'curl' 'patch' 'xdg-utils')
+optdepends=('ani-skip: skips openings and endings'
+            'curl-impersonate: gets ani-cli past Cloudflare'
+            'ghostty: posters'
+            'kitty: posters')
+provides=('ani-hop')
+conflicts=('ani-hop')
+# versioned names: yay and paru keep the last download, and makepkg would reuse it
+source_x86_64=("ani-hop-$pkgver-x86_64.tar.xz::$url/releases/download/v$pkgver/ani-hop-x86_64-unknown-linux-musl.tar.xz")
+source_aarch64=("ani-hop-$pkgver-aarch64.tar.xz::$url/releases/download/v$pkgver/ani-hop-aarch64-unknown-linux-musl.tar.xz")
+sha256sums_x86_64=('@SHA256_X86_64@')
+sha256sums_aarch64=('@SHA256_AARCH64@')
+
+package() {
+  cd "ani-hop-$CARCH-unknown-linux-musl"
+  install -Dm755 ani-hop "$pkgdir/usr/bin/ani-hop"
+  install -Dm644 THIRD-PARTY-LICENSES.md -t "$pkgdir/usr/share/licenses/$pkgname/"
+  install -Dm644 README.md CHANGELOG.md -t "$pkgdir/usr/share/doc/$pkgname/"
+}

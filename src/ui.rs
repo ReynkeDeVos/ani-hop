@@ -502,25 +502,50 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     };
     let mut v: Vec<Line> = logo().collect();
     v.extend(["".into(), Line::styled("Tools", Style::new().bold())]);
-    for (bin, _, what) in ani::DEPS {
-        v.push(row(!app.missing.iter().any(|d| d.0 == bin), bin, what));
+    for (bin, _, what) in ani::deps() {
+        let old = bin == "ani-cli" && app.old_ani_cli.is_some();
+        v.push(row(
+            !old && !app.missing.iter().any(|d| d.0 == bin),
+            bin,
+            what,
+        ));
     }
     v.push(row(
         kitty::supported(),
         "graphics",
         "posters need Ghostty or Kitty",
     ));
-    let pkgs: Vec<&str> = app.missing.iter().map(|d| d.1).collect();
-    if !pkgs.is_empty() && ani::install_command(&pkgs).is_none() {
+    if let Some(old) = &app.old_ani_cli {
         v.push("".into());
         v.push(Line::styled(
-            format!("Install: {}", pkgs.join(" ")),
+            format!(
+                "ani-cli {old} is too old, ani-hop needs {}",
+                ani::TESTED_ANI_CLI
+            ),
+            Color::Yellow,
+        ));
+        if ani::ani_cli_update().is_none() {
+            v.push(Line::styled("Update it with your package manager", DIM));
+        }
+    }
+    let pkgs: Vec<&str> = app.missing.iter().map(|d| d.1).collect();
+    if !pkgs.is_empty() && ani::install_command(&pkgs).is_none() {
+        // shortcut: worded for Homebrew, the only way to land here on Linux or macOS; word
+        // it per OS if another one is added
+        let names: Vec<&str> = app.missing.iter().map(|d| d.0).collect();
+        v.push("".into());
+        v.push(Line::styled(
+            format!("Install: {}", names.join(" ")),
             Color::Yellow,
         ));
         v.push(Line::styled(
-            "ani-cli and ani-skip-git come from the AUR",
+            "with Homebrew (brew.sh); ani-skip from github.com/synacktraa/ani-skip",
             DIM,
         ));
+        if names.contains(&"xdg-open") {
+            // only on Linux (deps() leaves it out on macOS), and Homebrew has no xdg-utils
+            v.push(Line::styled("xdg-open: xdg-utils from your distro", DIM));
+        }
     }
     v.extend(["".into(), Line::styled("AniList", Style::new().bold())]);
     v.push(match &app.user {
@@ -553,6 +578,12 @@ fn banner(app: &App) -> Vec<Line<'static>> {
         format!("↓ {}", ani::tilde(&ani::download_root())),
         DIM,
     ));
+    if let Some((new, cmd)) = &app.release {
+        v.push(Line::styled(
+            format!("↑ ani-hop {new} is out: {cmd}"),
+            ACCENT,
+        ));
+    }
     v.push("".into());
     v.extend([
         key("type", "filter, fzf syntax: 'exact ^start end$ !not"),

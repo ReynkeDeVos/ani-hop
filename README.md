@@ -18,8 +18,27 @@ A fast terminal UI for anime: browse trending, top rated and search results, the
 | **Sub or dub** | Japanese or the English dub, each with or without English subtitles, for all shows or just one. Downloads follow the choice; if an episode has no dub yet, the stream falls back to subtitles. |
 | **Skips openings and endings** | With ani-skip, in streams and downloads alike; switch it off in the settings. |
 
-**Needs** [ani-cli](https://github.com/pystardust/ani-cli), [ani-skip](https://github.com/synacktraa/ani-skip), [mpv](https://mpv.io), [yt-dlp](https://github.com/yt-dlp/yt-dlp), ffmpeg, curl, xdg-utils and [Ghostty](https://ghostty.org) or [kitty](https://sw.kovidgoyal.net/kitty/) for the posters.
+## Install
+
+**Debian/Ubuntu, Fedora, Arch and their derivatives.** One line installs ani-hop and everything it needs. mpv and ffmpeg come from your distro, ani-cli and ani-skip from upstream into `~/.local/bin`, so `ani-cli -U` keeps ani-cli current without sudo. Run it again to update. On Arch with yay or paru it will install the AUR package `ani-hop-bin` instead, once that is published (AUR sign-ups are closed for now). On other distros it installs ani-hop, ani-cli and ani-skip and lists the system packages to install yourself.
 
 ```sh
-cargo install --git https://github.com/ReynkeDeVos/ani-hop
+curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh
 ```
+
+**Homebrew (macOS on Apple silicon, Linux).** ani-cli comes from its own tap:
+
+```sh
+brew tap pystardust/ani-cli https://github.com/pystardust/ani-cli.git
+brew install pystardust/ani-cli/ani-cli reynkedevos/tap/ani-hop
+```
+
+**Windows.** ani-hop runs in WSL. Install it with `wsl --install -d Ubuntu-26.04` in an admin PowerShell, restart, then run the `install.sh` line above in Ubuntu. The [WSL guide](docs/distribution.md#windows-via-wsl-step-by-step) has the details, including posters through kitty.
+
+**From source.** `cargo install --locked --git https://github.com/ReynkeDeVos/ani-hop` (Rust 1.89 or newer). It then needs [ani-cli](https://github.com/pystardust/ani-cli) 5.1 or newer, [mpv](https://mpv.io), [yt-dlp](https://github.com/yt-dlp/yt-dlp), ffmpeg, curl, patch and xdg-utils; [ani-skip](https://github.com/synacktraa/ani-skip) is optional.
+
+Posters need [Ghostty](https://ghostty.org) or [kitty](https://sw.kovidgoyal.net/kitty/). ani-hop checks its tools at the start and offers to install what's missing. It also says when ani-cli is too old or a new ani-hop is out, with the command that updates it.
+
+## License
+
+[GPL-3.0-or-later](LICENSE)

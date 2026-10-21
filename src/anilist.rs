@@ -121,6 +121,20 @@ fn agent() -> &'static ureq::Agent {
     })
 }
 
+/// Where `url` redirects to, without following it.
+pub fn location(url: &str) -> Result<String, String> {
+    let res = agent()
+        .get(url)
+        .config()
+        .max_redirects(0)
+        .build()
+        .call()
+        .map_err(|e| e.to_string())?;
+    let to = res.headers().get("location").and_then(|l| l.to_str().ok());
+    to.map(str::to_string)
+        .ok_or_else(|| format!("HTTP {}", res.status()))
+}
+
 /// Plain GET, e.g. cover images (from AniList's CDN, which has no request limit).
 pub fn fetch(url: &str) -> Result<Vec<u8>, String> {
     let mut res = agent().get(url).call().map_err(|e| e.to_string())?;
