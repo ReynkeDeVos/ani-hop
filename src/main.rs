@@ -143,6 +143,8 @@ enum Msg {
     DlAdd(isize),
     DlProgress(String),
     DlDone(String, Result<(), String>),
+    /// (version, update command) of a newer ani-hop
+    Release(Option<(String, String)>),
 }
 
 /// The episode being started or watched.
@@ -195,6 +197,10 @@ pub struct App {
     /// media whose title glint plays, and since when
     pub glint: (u64, Instant),
     pub missing: Vec<(&'static str, &'static str, &'static str)>,
+    /// the installed ani-cli's version, when it's older than ani::TESTED_ANI_CLI
+    pub old_ani_cli: Option<String>,
+    /// (version, update command) of a newer ani-hop release
+    pub release: Option<(String, String)>,
     /// shell command to run in the real terminal (TUI paused), e.g. installing packages
     external: Option<String>,
     /// asked for on a show's page while ani-cli searched, waiting to get back to that page
@@ -278,6 +284,28 @@ fn main() -> std::io::Result<()> {
     res
 }
 
+/// The newest release's version, if it's newer than this ani-hop. GitHub is asked at most
+/// once a day, through the redirect of /releases/latest (no API, so no rate limit).
+fn newer_release() -> Option<String> {
+    let seen = ani::cache_dir().join("latest-release");
+    let day = Duration::from_secs(24 * 60 * 60);
+    let fresh = fs::metadata(&seen)
+        .and_then(|m| m.modified())
+        .is_ok_and(|t| t.elapsed().is_ok_and(|age| age < day));
+    let tag = match fresh {
+        true => fs::read_to_string(&seen).ok()?,
+        false => {
+            let to = anilist::location("https://github.com/ReynkeDeVos/ani-hop/releases/latest");
+            // .../releases/tag/v0.6.0; before the first release just .../releases
+            let tag = to.ok()?.rsplit('/').next()?.to_string();
+            let _ = fs::write(&seen, &tag);
+            tag
+        }
+    };
+    let v = tag.trim().trim_start_matches('v');
+    ani::older(env!("CARGO_PKG_VERSION"), v).then(|| v.to_string())
+}
+
 /// Runs `cmd` in the plain terminal (sudo prompts work) and waits for enter.
 fn run_in_terminal(cmd: &str) {
     use std::io::Write;
@@ -331,7 +359,12 @@ fn parse_token(input: &str) -> String {
 }
 
 fn open_url(url: &str) {
-    let _ = Command::new("xdg-open")
+    let open = if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    };
+    let _ = Command::new(open)
         .arg(url)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -536,6 +569,8 @@ impl App {
             started: Instant::now(),
             glint: (0, Instant::now()),
             missing: ani::missing_deps(),
+            old_ani_cli: ani::old_ani_cli(),
+            release: None,
             external: None,
             parked: None,
             quit: false,
@@ -544,7 +579,9 @@ impl App {
         app.push("ani-hop", View::Main);
         let welcomed = ani::config_dir().join("welcomed");
         let first = !welcomed.exists();
-        if first || !app.missing.is_empty() {
+        // ani-skip is optional (and Homebrew has none), so it alone doesn't bring this up
+        let needed = app.missing.iter().any(|d| d.0 != "ani-skip");
+        if first || needed || app.old_ani_cli.is_some() {
             let _ = fs::create_dir_all(ani::config_dir());
             let _ = fs::write(&welcomed, "");
             app.push(if first { "Welcome" } else { "Setup" }, View::Setup);
@@ -564,15 +601,24 @@ impl App {
             let c = app.client.clone();
             app.spawn(move || Msg::Viewer(c.viewer()));
         }
+        app.spawn(|| Msg::Release(newer_release().map(|v| (v, ani::update_command()))));
         app
     }
 
     fn after_install(&mut self) {
         self.missing = ani::missing_deps();
+        self.old_ani_cli = ani::old_ani_cli();
         let names: Vec<&str> = self.missing.iter().map(|d| d.0).collect();
-        match names.is_empty() {
-            true => self.toast("All set: every tool is installed", false),
-            false => self.toast(format!("Still missing: {}", names.join(", ")), true),
+        match (names.is_empty(), &self.old_ani_cli) {
+            (false, _) => self.toast(format!("Still missing: {}", names.join(", ")), true),
+            (true, Some(v)) => self.toast(
+                format!(
+                    "ani-cli is still {v}, ani-hop needs {}",
+                    ani::TESTED_ANI_CLI
+                ),
+                true,
+            ),
+            (true, None) => self.toast("All set: every tool is installed", false),
         }
         self.refresh();
     }
@@ -852,6 +898,9 @@ impl App {
                 if let Some(cmd) = ani::install_command(&pkgs).filter(|_| !pkgs.is_empty()) {
                     v.push(Item::new("install", "Install missing packages", cmd));
                 }
+                if let Some(cmd) = ani::ani_cli_update().filter(|_| self.old_ani_cli.is_some()) {
+                    v.push(Item::new("update", "Update ani-cli", cmd));
+                }
                 if self.user.is_none() {
                     v.push(Item::new(
                         "login",
@@ -1113,7 +1162,9 @@ impl App {
         match &screen.view {
             View::Main | View::Settings => self.main_action(&key, &label),
             View::Setup => match key.as_str() {
-                "install" => self.external = screen.menu.current().map(|i| i.hint.clone()),
+                "install" | "update" => {
+                    self.external = screen.menu.current().map(|i| i.hint.clone())
+                }
                 "login" => self.main_action("login", ""),
                 _ => self.pop(1),
             },
@@ -1794,6 +1845,7 @@ impl App {
                 }
                 self.refresh();
             }
+            Msg::Release(v) => self.release = v,
         }
     }
 }

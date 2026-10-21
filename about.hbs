@@ -1,0 +1,13 @@
+# Third-party licences
+
+The ani-hop binary contains code from these crates. Each licence text appears once, followed by the crates it covers.
+{{#each licenses}}{{#unless (eq id "GPL-3.0-or-later")}}
+
+## {{{name}}}
+
+Used by {{#each used_by}}{{{crate.name}}} {{{crate.version}}}{{#unless @last}}, {{/unless}}{{/each}}.
+
+```text
+{{{text}}}
+```
+{{/unless}}{{/each}}

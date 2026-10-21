@@ -112,7 +112,7 @@ pub fn cleanup() {
         let pid = name
             .strip_prefix("ani-hop-tty-graphics-protocol-")
             .and_then(|r| r.split('-').next());
-        let dead = pid.is_some_and(|p| !Path::new("/proc").join(p).exists());
+        let dead = pid.is_some_and(|p| !crate::ani::running(p));
         if name.starts_with(&prefix()) || dead {
             let _ = std::fs::remove_file(e.path());
         }

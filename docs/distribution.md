@@ -13,15 +13,14 @@ Researched on 2026-10-21 and updated the same day with the maintainer's decision
 | **Own auto-updater** | **No** | ani-cli is the only dependency that has to stay fresh. Every channel above either updates it with the rest (AUR, Homebrew) or puts the upstream script where `ani-cli -U` works (install script, WSL). ani-hop should only show the right update command (section 5). |
 | **Licence** | **GPL-3.0-or-later** (added on this branch) | ani-cli is GPL-3.0 too ([formula](https://github.com/pystardust/ani-cli/blob/master/Formula/ani-cli.rb)). Homebrew core accepts any licence compatible with the Debian Free Software Guidelines ([Licence Guidelines](https://docs.brew.sh/Licence-Guidelines)), and your own tap has no rule. It has to be v3, not v2, because `ring` (used by rustls) is Apache-2.0, which [works with GPLv3 but not GPLv2](https://www.gnu.org/licenses/license-list.html#apache2). The other dependencies are MIT, Apache, BSD, ISC, Zlib, Unicode-3.0, MPL-2.0 (nucleo-matcher, not marked "Incompatible With Secondary Licenses") and CDLA-Permissive-2.0 (webpki-roots). |
 
-In this order:
+**Status: everything below is built in 0.6.0** (LICENSE, dist release, AUR and Homebrew publishing, `install.sh` with container tests, the macOS fixes, `ANI_CLI_PLAYER=mpv`, the update hints, the README install and WSL sections). Left before the first release, all on your side:
 
-1. ~~LICENSE~~: done on this branch, with `license` in Cargo.toml and a line in the README.
-2. A tag-triggered release with [dist](https://github.com/axodotdev/cargo-dist/releases/tag/v0.33.0), **Linux only at first** (section 6). It builds static x86_64 and aarch64 binaries, creates the GitHub release, pushes the Homebrew formula (usable on Linux right away) and pushes the AUR package. You keep tagging by hand.
-3. `install.sh` for Debian/Ubuntu, Fedora and Arch, which installs those binaries (section 4). The README's install section then lists the script, the AUR and brew.
-4. The macOS fixes, about 50 lines (section 8), together with `ANI_CLI_PLAYER=mpv`, which also fixes WSL. After that, add the Apple silicon target to dist, so the same formula covers Macs.
-5. A short WSL section in the README pointing to the guide here. No further Windows work.
+1. Create an empty public repo `ReynkeDeVos/homebrew-tap`.
+2. Create a fine-grained token with Contents read/write on that repo only, and save it as the secret `HOMEBREW_TAP_TOKEN` in ani-hop's repo settings.
+3. Log in to the AUR, add an SSH public key to the account, and save the private key (without a passphrase) as the secret `AUR_SSH_PRIVATE_KEY`. The first push creates `ani-hop-bin`.
+4. Merge the PR and tag: `git tag v0.6.0 && git push origin v0.6.0`.
 
-## 2. Starting point
+## 2. Starting point (before 0.6.0; line numbers as of commit `b09665e`)
 
 ani-hop checks PATH for ani-cli, mpv, ani-skip, yt-dlp, ffmpeg, curl and xdg-open ([`src/ani.rs:144`](../src/ani.rs#L144)); yt-dlp, ffmpeg and curl are only used through ani-cli. It reads ani-cli's menus through a fake `rofi` script ([`src/ani.rs:24`](../src/ani.rs#L24)), so ani-cli needs no fzf. It runs mpv itself for downloaded episodes ([`src/ani.rs:576`](../src/ani.rs#L576)) and reads yt-dlp's `[download]` lines ([`src/ani.rs:810`](../src/ani.rs#L810)). Besides these, ani-cli itself needs sed, grep and, for `-U`, patch ([ani-cli L554-L578](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L554-L578)).
 
@@ -54,7 +53,7 @@ Sources: Repology for [ani-cli](https://repology.org/project/ani-cli/versions), 
 
 Takeaway:
 - **Only ani-cli has to stay fresh.** It changed its streaming source twice this year ([v5.0](https://github.com/pystardust/ani-cli/releases/tag/v5.0), 2026-08-01; [v5.1](https://github.com/pystardust/ani-cli/releases/tag/v5.1), 2026-09-11), so the 4.x packages are probably broken (not tested). It is current only in the AUR, the upstream Homebrew tap, MacPorts, Scoop and nixpkgs-unstable. nixpkgs 26.05 still has 5.0. That is why the install script never takes ani-cli from apt or dnf.
-- **yt-dlp can be a few months old.** ani-cli only hands it a direct link it has already found ([ani-cli L349](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L349)). Debian 13's is 18 months old, though, so the script uses the upstream binary there. For ani-hop yt-dlp is still a hard dependency: ani-hop reads its progress lines, and it stops downloads the way it does so that ani-cli doesn't fall back to ffmpeg, which leaves a partial file that looks finished ([`src/ani.rs:838`](../src/ani.rs#L838)). AUR ani-cli doesn't depend on yt-dlp ([AUR](https://aur.archlinux.org/packages/ani-cli)), so ani-hop's packages must declare it.
+- **yt-dlp can be a few months old.** ani-cli only hands it a direct link it has already found ([ani-cli L349](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L349)). Debian 13's is 18 months old, though, so the script uses the upstream binary there. For ani-hop yt-dlp is still a hard dependency: ani-hop reads its progress lines, and it stops downloads the way it does so that ani-cli doesn't fall back to ffmpeg, which leaves a partial file that looks finished ([`src/ani.rs:969`](../src/ani.rs#L969)). AUR ani-cli doesn't depend on yt-dlp ([AUR](https://aur.archlinux.org/packages/ani-cli)), so ani-hop's packages must declare it.
 - **mpv and ffmpeg are fine from any package manager,** apart from Fedora's codecs.
 - **ani-skip is optional** and only packaged in the AUR and nixpkgs.
 
@@ -122,14 +121,13 @@ Same tap, same commands as on macOS (below). dist puts Linux and macOS archives 
 
 ```sh
 brew tap pystardust/ani-cli https://github.com/pystardust/ani-cli.git
-brew trust pystardust/ani-cli
-brew install ani-cli reynkedevos/tap/ani-hop
+brew install pystardust/ani-cli/ani-cli reynkedevos/tap/ani-hop
 brew install --cask ghostty    # macOS only, or kitty; posters only show there
 ```
 
 Updates: `brew upgrade`.
 
-Don't make the formula depend on `pystardust/ani-cli/ani-cli`. Since Homebrew 6.0, non-official taps [need explicit trust](https://docs.brew.sh/Tap-Trust), and only a name typed on the command line is trusted automatically. The docs don't say that this covers dependencies, and Homebrew's [loader checks every formula](https://github.com/Homebrew/brew/blob/main/Library/Homebrew/trust.rb). pystardust's tap also needs the explicit URL above. If ani-cli is missing, ani-hop's own dependency check reports it.
+Since Homebrew 6.0, non-official taps [need explicit trust](https://docs.brew.sh/Tap-Trust). Installing a fully qualified name, as above, trusts just that formula, so no `brew trust` is needed. Don't make the formula depend on `pystardust/ani-cli/ani-cli`: only a name typed on the command line is trusted automatically. The docs don't say that this covers dependencies, and Homebrew's [loader checks every formula](https://github.com/Homebrew/brew/blob/main/Library/Homebrew/trust.rb). pystardust's tap also needs the explicit URL above. If ani-cli is missing, ani-hop's own dependency check reports it.
 
 Limits:
 - **Apple silicon on macOS 15 or newer only.** Homebrew [stopped building Intel bottles](https://docs.brew.sh/Support-Tiers), so mpv and ffmpeg would compile from source on an Intel Mac.
@@ -160,28 +158,14 @@ You need Windows 11, or Windows 10 build 19044 or newer for [WSLg](https://learn
    ```sh
    sudo apt update && sudo apt upgrade -y && sudo apt install -y kitty
    curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh
-   echo 'export PATH="$HOME/.local/bin:$PATH" ANI_CLI_PLAYER=mpv' >> ~/.bashrc && . ~/.bashrc
+   . ~/.profile
    ```
-   You need `ANI_CLI_PLAYER=mpv`. On WSL2, ani-cli otherwise looks for Windows `mpv.exe` ([L464](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L464); the WSL kernel name [ends in WSL2](https://github.com/microsoft/WSL2-Linux-Kernel/blob/linux-msft-wsl-6.18.y/arch/x86/configs/config-wsl)), and Play fails with "Program mpv.exe not found". The setting can go once ani-hop sets it itself (section 8).
-
-   **Until `install.sh` exists**, do by hand what it will do:
-   ```sh
-   sudo apt install -y mpv ffmpeg curl patch xdg-utils cargo build-essential
-   mkdir -p ~/.local/bin ~/.config/mpv/scripts && cd ~/.local/bin
-   curl -fsSLO https://raw.githubusercontent.com/pystardust/ani-cli/master/ani-cli
-   curl -fsSL -o yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux
-   curl -fsSLO https://raw.githubusercontent.com/synacktraa/ani-skip/master/ani-skip
-   curl -fsSL -o ~/.config/mpv/scripts/skip.lua https://raw.githubusercontent.com/synacktraa/ani-skip/master/integrations/mpv.lua
-   chmod +x ani-cli yt-dlp ani-skip && cd
-   cargo install --locked --root ~/.local --git https://github.com/ReynkeDeVos/ani-hop
-   ```
-   - On an ARM PC, use `yt-dlp_linux_aarch64`.
-   - Ubuntu 26.04's Rust is newer than the 1.89 that ani-hop's locked dependencies need ([Repology](https://repology.org/project/rust/versions), [Cargo.lock](../Cargo.lock)), but this build was not tried *(unconfirmed)*.
+   Ubuntu's `~/.profile` puts `~/.local/bin` on PATH once that folder exists, which the install line creates. ani-hop runs ani-cli with `ANI_CLI_PLAYER=mpv`; otherwise ani-cli would look for Windows `mpv.exe` on WSL2 ([L464](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L464); the WSL kernel name [ends in WSL2](https://github.com/microsoft/WSL2-Linux-Kernel/blob/linux-msft-wsl-6.18.y/arch/x86/configs/config-wsl)).
 3. **Start it.**
    - **With posters:** type `kitty &` in the Ubuntu window, then `ani-hop` in the kitty window *(unconfirmed)*. Only a terminal inside the same WSL distro can show posters, because ani-hop hands each one over as a Linux file ([`src/kitty.rs:145`](../src/kitty.rs#L145)). If kitty says "Wayland: Failed to connect to display", run `mkdir -p ~/.config/kitty && echo 'linux_display_server x11' >> ~/.config/kitty/kitty.conf` ([kitty #8463](https://github.com/kovidgoyal/kitty/issues/8463), [wslg #1032](https://github.com/microsoft/wslg/issues/1032)). Whether current WSL still needs this is *(unconfirmed)*.
    - **Without posters:** run `ani-hop` in the "Ubuntu 26.04 LTS" tab of Windows Terminal.
 4. **AniList login:** nothing to do. xdg-utils 1.2 detects WSL and opens links in the Windows default browser ([xdg-utils-common](https://gitlab.freedesktop.org/xdg/xdg-utils/-/blob/master/scripts/xdg-utils-common.in), [xdg-open](https://gitlab.freedesktop.org/xdg/xdg-utils/-/blob/master/scripts/xdg-open.in)).
-5. **Downloads** go to `~/Videos/Anime` inside Linux ([`src/ani.rs:95`](../src/ani.rs#L95)). In Explorer that is `\\wsl.localhost\Ubuntu-26.04\home\<user>\Videos\Anime`, or run `cd ~/Videos/Anime && explorer.exe .`. You can set "Download folder…" to `/mnt/c/Users/<you>/Videos`, but Microsoft says crossing file systems [is slower](https://learn.microsoft.com/en-us/windows/wsl/filesystems).
+5. **Downloads** go to `~/Videos/Anime` inside Linux ([`src/ani.rs:96`](../src/ani.rs#L96)). In Explorer that is `\\wsl.localhost\Ubuntu-26.04\home\<user>\Videos\Anime`, or run `cd ~/Videos/Anime && explorer.exe .`. You can set "Download folder…" to `/mnt/c/Users/<you>/Videos`, but Microsoft says crossing file systems [is slower](https://learn.microsoft.com/en-us/windows/wsl/filesystems).
 6. **Updates:** `sudo apt update && sudo apt upgrade`, then the `install.sh` line again (or `ani-cli -U; yt-dlp -U; ani-skip -U`). Run `wsl --update` in PowerShell now and then ([basic commands](https://learn.microsoft.com/en-us/windows/wsl/basic-commands)).
 
 **Arch variant**, with commands from the [Arch wiki](https://wiki.archlinux.org/title/Install_Arch_Linux_on_WSL). Arch starts as root with no user and no sudo, and is x86_64 only:
@@ -197,10 +181,7 @@ wsl --manage archlinux --set-default-user NAME; wsl --terminate archlinux
 # in archlinux, as NAME:
 git clone https://aur.archlinux.org/yay-bin.git && (cd yay-bin && makepkg -si)
 yay -S ani-hop-bin
-echo 'export ANI_CLI_PLAYER=mpv' >> ~/.bashrc
 ```
-
-Until `ani-hop-bin` exists, replace the `yay -S` line with `yay -S ani-cli ani-skip-git mpv yt-dlp ffmpeg patch xdg-utils rust && cargo install --locked --git https://github.com/ReynkeDeVos/ani-hop`, and add `$HOME/.cargo/bin` to PATH.
 
 Then start kitty as in step 3. Updates: `yay -Syu` and `wsl --update`. The image ships no fonts, so `ttf-dejavu` is a precaution *(unconfirmed)*.
 
@@ -213,6 +194,8 @@ The package manager should own updates, for ani-hop and its dependencies alike:
 - **Ready-made updaters are a poor fit.** dist's updater is experimental and only covers its own installers ([updater](https://axodotdev.github.io/cargo-dist/book/installers/updater.html)), and its library pulls in reqwest and tokio ([axoupdater](https://github.com/axodotdev/axoupdater/blob/main/axoupdater/Cargo.toml)).
 
 What ani-hop can still do, small and hint-only:
+Both are built (`ani::old_ani_cli`, `ani::ani_cli_update`, `ani::update_command`, `newer_release` in main.rs):
+
 1. **ani-cli version.** Run `ani-cli -V` along with the existing dependency check. If it is older than a `TESTED_ANI_CLI` constant (5.1 today), say so on the dependency screen with the right command:
    - the script is user-writable: `ani-cli -U`
    - `/usr/bin` with yay or paru: `yay -Syu`
@@ -241,41 +224,16 @@ What ani-hop can still do, small and hint-only:
 
 dist is community-maintained since 2025 ([announcement](https://blog.mistys-internet.website/post/2025/07/20/dist-0-dot-28-dot-1-is-out)) and [still releases](https://github.com/axodotdev/cargo-dist/releases).
 
-**One-time setup:**
-1. Add `description`, `repository` and `homepage` to Cargo.toml (the licence is already there). `dist init` stops without `repository`.
-2. Create an empty repo, `ReynkeDeVos/homebrew-tap`.
-3. Register on the AUR and add an SSH key.
-4. Run `sudo pacman -S cargo-dist`, then `dist init`. Edit `dist-workspace.toml` roughly like this, and check the result with `dist plan`:
-   ```toml
-   [dist]
-   targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]   # add "aarch64-apple-darwin" after the macOS fixes
-   installers = ["homebrew"]             # install.sh replaces dist's shell installer
-   tap = "ReynkeDeVos/homebrew-tap"
-   publish-jobs = ["homebrew", "./publish-aur"]
+**Setup (done in 0.6.0):** `description`, `repository`, `homepage` and `rust-version` in Cargo.toml; `dist-workspace.toml`; the generated `.github/workflows/release.yml`; `.github/workflows/publish-aur.yml` with the PKGBUILD template in `.github/aur/`; `about.toml` and `about.hbs` for [cargo-about](https://github.com/EmbarkStudios/cargo-about), which writes `THIRD-PARTY-LICENSES.md` into every archive (MIT, BSD and Apache ask for their notices in binary copies too). Beyond the plan:
+- `pr-run-mode = "upload"`: every PR builds all three targets, so a broken Mac or ARM build shows up before the tag.
+- `.github/workflows/ci.yml`: fmt, clippy and tests on Linux and macOS, plus a check that `THIRD-PARTY-LICENSES.md` matches Cargo.lock.
+- `.github/workflows/install.yml`: runs `install.sh` in Debian 13, Ubuntu 24.04, Fedora 44 and Arch containers.
 
-   [dist.github-custom-runners]          # dist's defaults are being retired
-   global = "ubuntu-24.04"               # plan/host/publish jobs only, not builds
-   x86_64-unknown-linux-musl = "ubuntu-24.04"
-   aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
-   aarch64-apple-darwin = "macos-15"
-
-   [dist.dependencies.homebrew]
-   mpv = { stage = ["run"] }
-   yt-dlp = { stage = ["run"] }
-   ```
-5. Add `.github/workflows/publish-aur.yml`, a `workflow_call` job using [KSXGitHub/github-actions-deploy-aur](https://github.com/KSXGitHub/github-actions-deploy-aur). It pushes `ani-hop-bin` with:
-   ```
-   license=('GPL-3.0-or-later')
-   depends=(ani-cli mpv yt-dlp ffmpeg curl xdg-utils)
-   optdepends=('ani-skip: skips openings and endings' 'curl-impersonate: gets ani-cli past Cloudflare'
-               'ghostty: posters' 'kitty: posters')
-   ```
-   Keep the dependencies unversioned. `ani-cli-git` [provides an unversioned `ani-cli`](https://aur.archlinux.org/packages/ani-cli-git), which a versioned dependency would [not accept](https://wiki.archlinux.org/title/PKGBUILD#provides).
-6. Ship the dependencies' licence notices in the archives. MIT, BSD and Apache ask for them in binary copies too. [cargo-about](https://github.com/EmbarkStudios/cargo-about) generates the file, and dist's `include` setting adds it ([config](https://github.com/axodotdev/cargo-dist/blob/main/book/src/reference/config.md)).
+To change the dist config, edit `dist-workspace.toml` and run `dist generate`; CI's plan step fails if `release.yml` is out of date. The PKGBUILD's `depends` stay unversioned: `ani-cli-git` [provides an unversioned `ani-cli`](https://aur.archlinux.org/packages/ani-cli-git), which a versioned dependency would [not accept](https://wiki.archlinux.org/title/PKGBUILD#provides).
 
 **Every release afterwards:**
 1. Open a PR with the version bump and the CHANGELOG entry, and squash-merge it, as now.
-2. Run `git tag vX.Y.Z && git push origin vX.Y.Z`. v0.5.0 is not tagged yet.
+2. Run `git tag vX.Y.Z && git push origin vX.Y.Z`. The last release on GitHub is v0.4.1; v0.5.0 was never tagged.
 3. `release.yml` runs plan, then builds the targets. It then creates the GitHub release with the archives, checksums and notes from CHANGELOG.md, pushes `ani-hop.rb` to the tap, and pushes the PKGBUILD to the AUR. `install.sh` picks up the new archives by itself, through `releases/latest/download/…`.
 
 Stop writing GitHub releases by hand. Release titles change to the CHANGELOG heading (`0.5.0 – 2026-10-20`). Every PR also gets a `dist plan` check.
@@ -297,7 +255,7 @@ Traps:
 ## 7. Rejected options
 
 - **Any native Windows build** (MSI, EXE, winget, Scoop, Chocolatey): decided against, and WSL is the answer instead. In short: an MSI or EXE installs no dependencies ([dist MSI](https://github.com/axodotdev/cargo-dist/blob/main/book/src/installers/msi.md)). winget and Chocolatey have no ani-cli ([Repology](https://repology.org/project/ani-cli/versions)). Scoop has it, but runs PowerShell underneath. A port is about 250 lines with no posters. Details are in commit `b09665e`.
-- **Windows mpv.exe under WSL**, as ani-cli's README suggests: `have("mpv")` and `play_file` need Linux mpv ([`src/ani.rs:154`](../src/ani.rs#L154), [`src/ani.rs:576`](../src/ani.rs#L576)), and Windows programs get Linux paths [unconverted](https://learn.microsoft.com/en-us/windows/wsl/filesystems).
+- **Windows mpv.exe under WSL**, as ani-cli's README suggests: `have("mpv")` and `play_file` need Linux mpv ([`src/ani.rs:156`](../src/ani.rs#L156), [`src/ani.rs:707`](../src/ani.rs#L707)), and Windows programs get Linux paths [unconverted](https://learn.microsoft.com/en-us/windows/wsl/filesystems).
 - **DMG, pkg, cask, notarization:** install no dependencies, [cost $99/year](https://developer.apple.com/programs/), and [CLI tools belong in formulae](https://docs.brew.sh/Acceptable-Casks).
 - **homebrew-core:** [notability and repo age](https://docs.brew.sh/Package-Acceptance-Policy), and ani-cli isn't in core. GPL would be fine there.
 - **Intel macOS builds:** Homebrew is [Tier 3 on Intel with no new bottles](https://docs.brew.sh/Support-Tiers).
@@ -313,25 +271,23 @@ Traps:
 
 ## 8. Code changes needed
 
-**All platforms**
-- [x] LICENSE file and `license` in [Cargo.toml](../Cargo.toml).
-- [ ] `description`, `repository` and `homepage` in Cargo.toml, for dist. XS.
-- [ ] `install.sh` as in section 4, plus its container test job. M.
-- [ ] [`src/ani.rs:549`](../src/ani.rs#L549) `stream()`: pass `ANI_CLI_PLAYER=mpv` when the user hasn't set it. ani-hop already requires mpv ([`src/ani.rs:146`](../src/ani.rs#L146)). This fixes WSL ([ani-cli L464](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L464)) and macOS with IINA ([L461](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L461)). XS.
-- [ ] [`src/ani.rs:165`](../src/ani.rs#L165) `install_command`: add apt, dnf and brew branches, with their package names in DEPS and an updated hint at [`src/ui.rs:521`](../src/ui.rs#L521). For apt and dnf, offer only the stable dependencies, never ani-cli; for those, point to `install.sh`. S.
-- [ ] The update hints from section 5, on the dependency screen ([`src/ui.rs:491`](../src/ui.rs#L491)). S.
+All done in 0.6.0:
 
-**macOS** (S, about 50 lines, plus one run on a Mac or a `macos-15` runner)
-- [ ] [`src/main.rs:333`](../src/main.rs#L333) `open_url`: use `open` on macOS, and drop the `xdg-open` row from DEPS there ([`src/ani.rs:151`](../src/ani.rs#L151)). XS.
-- [ ] [`src/ani.rs:852`](../src/ani.rs#L852) `running()` and [`src/kitty.rs:115`](../src/kitty.rs#L115): replace `/proc` with a per-process `queue/<pid>.lock` that is held for the whole run and probed with [`File::try_lock`](https://doc.rust-lang.org/std/fs/struct.File.html). This also survives pid reuse. S.
-- [ ] Optional: default downloads to `~/Movies` on macOS ([`src/ani.rs:61`](../src/ani.rs#L61)). XS.
+- [x] LICENSE, plus `license`, `description`, `repository`, `homepage` and `rust-version` in [Cargo.toml](../Cargo.toml).
+- [x] `install.sh` as in section 4, plus its container test job.
+- [x] `stream()` passes `ANI_CLI_PLAYER=mpv` when the user hasn't set it. This fixes WSL ([ani-cli L464](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L464)) and macOS with IINA ([L461](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L461)).
+- [x] `install_command`: yay/paru and pacman as before, the `install.sh` line elsewhere on Linux, and brew on macOS (without ani-skip, which Homebrew lacks).
+- [x] The update hints from section 5.
+- [x] macOS: `open_url` uses `open`, and DEPS skips `xdg-open` there.
+- [x] `running()` and the poster cleanup use a lock file per process in `~/.cache/ani-hop/run/`, held for the whole run and probed with [`File::try_lock`](https://doc.rust-lang.org/std/fs/struct.File.html), instead of `/proc`. This also survives pid reuse. Leftover files of dead processes are removed at the next start.
+- [x] Downloads default to `~/Movies/Anime` on macOS.
+- [x] A missing ani-skip no longer opens the setup screen at every start, since it is optional and Homebrew has none.
 
 **Windows:** nothing. WSL runs the Linux build.
 
 ## 9. Open questions
 
-1. **Nothing was run on a Mac or on Windows.** On a Mac: the tap install sequence, and whether kitty accepts poster files from `$TMPDIR` (Ghostty's code does, [graphics_image.zig](https://github.com/ghostty-org/ghostty/blob/v1.3.1/src/terminal/kitty/graphics_image.zig)). Under WSL: the guide, kitty under WSLg, and the Wayland workaround.
-2. **Should the script enable RPM Fusion by default on Fedora?** Without it most streams probably won't play (H.264), but it adds a third-party repo. The plan above asks first.
-3. **Should ani-hop be tested against ani-cli master or tags?** `-U` and the install script jump to master (5.1.5 today), while packages ship tags (5.1). ani-hop depends on undocumented ani-cli behaviour (rofi menus, debug player output, file names), and master changed download file naming after 5.1 ([compare](https://github.com/pystardust/ani-cli/compare/v5.1...master)). The script could fetch the latest tag instead of master; `ani-cli -U` would still move to master later.
-4. **Does ani-cli 4.10 or 4.14 still play anything?** If not, should ani-hop refuse versions below 5.1 rather than just warn?
-5. **Does dist build the musl targets with these custom runners, and does it write one formula for Linux and macOS?** Check with `dist plan` and a test tag.
+1. **Nothing was run on a Mac or on Windows.** The PR's CI builds and tests the Mac target, but nobody has clicked through it. On a Mac: the tap install sequence, and whether kitty accepts poster files from `$TMPDIR` (Ghostty's code does, [graphics_image.zig](https://github.com/ghostty-org/ghostty/blob/v1.3.1/src/terminal/kitty/graphics_image.zig)). Under WSL: the guide, kitty under WSLg, and the Wayland workaround.
+2. **ani-cli master or tags?** `-U` and the install script use master (5.1.5 today), packages ship tags (5.1). Master's one change that touches ani-hop's side, replacing `<>:"/\|?*` in download file names with `_`, is harmless: ani-hop only reads the ` Episode N` end of the name ([`src/ani.rs`](../src/ani.rs), `local_episodes`).
+3. **Does ani-cli 4.10 or 4.14 still play anything?** If not, should ani-hop refuse versions below 5.1 rather than just warn?
+4. **Does dist build the musl targets with these custom runners, and does it write one formula for Linux and macOS?** `dist plan` is happy and the PR builds all three targets; the formula is only written for real on the first tag.
