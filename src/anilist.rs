@@ -85,10 +85,11 @@ pub struct Entry {
 const ANI_CLI_ONLY: u64 = 1 << 63;
 
 impl Media {
-    /// A show found through ani-cli alone. The id hashes the search and the name, so the same
-    /// pick has it again next time (FNV-1a: std's hasher may change between releases).
+    /// A show found through ani-cli alone. The id hashes the search and the entry, not the
+    /// shown name, so the same pick has it again next time and a provider's own "X (2)" can't
+    /// take a numbered one's (FNV-1a: std's hasher may change between releases).
     pub fn from_ani_cli(name: &str, at: crate::ani::Source) -> Media {
-        let key = format!("{}\n{name}", at.query);
+        let key = format!("{}\n{}\n{}", at.query, at.title, at.nth);
         let hash = (key.bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
             (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
         });
@@ -393,7 +394,7 @@ mod tests {
         };
         let m = super::Media::from_ani_cli("Hunter x Hunter (2)", at("hunter x hunter"));
         // saved in resolved.json, audio.json and downloads.json, so it must never change
-        assert_eq!(m.id, 10_417_355_497_785_652_780);
+        assert_eq!(m.id, 10_198_325_430_496_578_357);
         let other = super::Media::from_ani_cli("Hunter x Hunter (2)", at("hunter"));
         assert_ne!(m.id, other.id);
         assert!(!m.on_anilist() && super::Media::default().on_anilist());

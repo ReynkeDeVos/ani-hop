@@ -495,6 +495,16 @@ fn best_matches(m: &Media, hits: &[String]) -> Vec<usize> {
     }
 }
 
+/// The show `best_matches` compares titles with: one ani-cli found by its provider title, as
+/// its shown name may carry a number ("A (2)") that would read as a season.
+fn matched(m: &Media) -> Media {
+    let mut m = m.clone();
+    if let Some(at) = &m.ani_cli {
+        m.title.romaji = Some(at.title.clone());
+    }
+    m
+}
+
 fn overrides_path() -> PathBuf {
     config_dir().join("sources.json")
 }
@@ -545,15 +555,14 @@ pub fn locate(m: &Media, src: &Source) -> Result<Source, String> {
 }
 
 /// Where `src` is in fresh `hits`: the nth entry with its title, as equal titles (a remake)
-/// keep their order when others move in. Saved before 0.6.1: its old place, or its only match.
+/// keep their order when others move in. Saved before 0.6.1: only an unambiguous match.
 fn position(src: &Source, hits: &[String]) -> Option<usize> {
     let same: Vec<usize> = (1..=hits.len())
         .filter(|&i| hits[i - 1] == src.title)
         .collect();
     match src.nth {
-        0 if same.contains(&src.index) => Some(src.index),
         0 if same.len() == 1 => Some(same[0]),
-        0 => None,
+        0 => None, // which of the equal titles is unknown: resolve again
         n => same.get(n - 1).copied(),
     }
 }
@@ -562,6 +571,7 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
     let saved = overrides().remove(&m.id.to_string());
     // picked from ani-cli's own results: that very entry, unless "Change source…" chose another
     let picked = m.ani_cli.as_ref().filter(|_| saved.is_none());
+    let mut found = Err("no title to search for".to_string());
     if let Some(at) = picked {
         let (hits, eps) = search(&at.query)?;
         if let Some(eps) = eps {
@@ -577,6 +587,7 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
             ));
         }
         // gone, or picked as a single hit whose title ani-cli never showed: match titles below
+        found = Ok((at.query.clone(), (hits, None)));
     }
     // provider search chokes on some symbols (HUNTER×HUNTER), so fall back to plainer queries
     let plain = |t: &String| {
@@ -585,10 +596,10 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let mut queries: Vec<String> = match (&saved, picked) {
-        (Some((q, _)), _) => vec![q.clone()],
-        (None, Some(at)) => vec![at.query.clone()],
-        (None, None) => [
+    let mut queries: Vec<String> = match &saved {
+        Some((q, _)) => vec![q.clone()],
+        None if picked.is_some() => Vec::new(), // searched above
+        None => [
             m.title.romaji.clone(),
             m.title.english.clone(),
             m.title.romaji.as_ref().map(plain),
@@ -598,7 +609,6 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
         .collect(),
     };
     queries.dedup();
-    let mut found = Err("no title to search for".to_string());
     for q in queries {
         found = search(&q).map(|r| (q, r));
         if found.is_ok() {
@@ -609,9 +619,10 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
     if let Some(eps) = eps {
         return Ok(Source::at(&query, &hits, 1, eps));
     }
-    let candidates = match saved.and_then(|(_, t)| hits.iter().position(|h| *h == t)) {
+    let exact = saved.map(|(_, t)| t).or(picked.map(|at| at.title.clone()));
+    let candidates = match exact.and_then(|t| hits.iter().position(|h| *h == t)) {
         Some(pos) => vec![pos],
-        None => best_matches(m, &hits),
+        None => best_matches(&matched(m), &hits),
     };
     // same title twice (HUNTER×HUNTER 1999/2011): a finished show's episode count decides
     let want = m
@@ -1178,6 +1189,12 @@ mod tests {
         assert_eq!(names, ["A", "A (3)", "A (2)"]);
         let ids: HashSet<u64> = shows.iter().map(|m| m.id).collect();
         assert_eq!(ids.len(), 3);
+        // the same entries from an earlier search without the provider's "A (2)" keep their ids
+        let before = |_: &str| Ok((vec!["A".into(), "A".into()], None));
+        let before = or_ani_cli(Err("e".into()), "a", before).unwrap();
+        assert_eq!(before[1].name(), "A (2)");
+        assert_eq!(before[1].id, shows[1].id); // the second A, now "A (3)"
+        assert_ne!(before[1].id, shows[2].id); // not the provider's "A (2)"
 
         // one hit: ani-cli shows no title, only its episodes
         let single = |q: &str| Ok((vec![q.to_string()], Some(vec!["1".into(), "2".into()])));
@@ -1201,11 +1218,10 @@ mod tests {
         let moved: Vec<String> = ["New", "HxH", "Fantasy", "HxH"].map(String::from).into();
         assert_eq!(position(&src, &moved), Some(4));
         assert_eq!(position(&src, &hits[..2]), None); // the second one is gone
-        // saved before 0.6.1: its old place, its only match, or resolve again
+        // saved before 0.6.1: its only match, or resolve again when it's one of several
         let old = Source { nth: 0, ..src };
-        assert_eq!(position(&old, &hits), Some(3));
+        assert_eq!(position(&old, &hits), None);
         assert_eq!(position(&old, &hits[1..]), Some(2));
-        assert_eq!(position(&old, &moved), None);
     }
 
     #[test]
@@ -1220,7 +1236,13 @@ mod tests {
         ]
         .map(String::from);
         assert_eq!(position(m.ani_cli.as_ref().unwrap(), &hits), None);
-        assert_eq!(best_matches(&m, &hits), [1]); // what resolve falls back to
+        assert_eq!(best_matches(&matched(&m), &hits), [1]); // what resolve falls back to
+
+        // a numbered one is matched by its provider title, not "A (2)" (= "A Season 2")
+        let hits = ["A", "A", "A Season 2"].map(String::from);
+        let at = Source::at("a", &hits, 2, Vec::new());
+        let m = Media::from_ani_cli("A (2)", at);
+        assert_eq!(best_matches(&matched(&m), &hits[1..]), [0]);
     }
 
     #[test]
