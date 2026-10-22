@@ -200,8 +200,8 @@ fn aur_helper() -> Option<&'static str> {
 /// ani-hop came from Homebrew, get brew, which has no ani-skip or xdg-utils.
 pub fn install_command(pkgs: &[&str]) -> Option<String> {
     let list = pkgs.join(" ");
-    // -S without -y: no system upgrade (Omarchy refuses one outside omarchy update), and no
-    // partial upgrade either
+    // -S without -y: no system upgrade (Omarchy refuses one outside omarchy update), and the
+    // package database isn't refreshed, so it installs what fits the system as last upgraded
     if let Some(helper) = aur_helper() {
         return Some(format!("{helper} -S --needed {list}"));
     }

@@ -87,7 +87,7 @@ It reads `ID` and `ID_LIKE` from `/etc/os-release`, so Ubuntu, Mint and Pop!_OS 
 | Step | Arch | Debian / Ubuntu | Fedora | anything else |
 |---|---|---|---|---|
 | yay or paru installed, and `ani-hop-bin` in the AUR | `yay -S --needed ani-hop-bin ani-skip-git`, then stop | | | |
-| system packages (sudo) | only the ones `pacman -T` reports missing, with `pacman -S --needed`: no system upgrade, which is the user's (Omarchy refuses `-Syu` outside `omarchy update`), and without `-y` no partial upgrade either | `apt-get install -y --no-install-recommends mpv ffmpeg curl patch xdg-utils xz-utils` | `dnf install -y mpv yt-dlp curl patch diffutils xdg-utils` plus ffmpeg (below) | print the list, yt-dlp included, and carry on |
+| system packages (sudo) | only the ones `pacman -T` reports missing, with `pacman -S --needed`: no system upgrade, which is the user's (Omarchy refuses `-Syu` outside `omarchy update`). Without `-y` the package database isn't refreshed, so it installs what fits the system as last upgraded; after an interrupted `-Syu` the user has to finish that upgrade first ([partial upgrades](https://wiki.archlinux.org/title/System_maintenance#Partial_upgrades_are_unsupported)) | `apt-get install -y --no-install-recommends mpv ffmpeg curl patch xdg-utils xz-utils` | `dnf install -y mpv yt-dlp curl patch diffutils xdg-utils` plus ffmpeg (below) | print the list, yt-dlp included, and carry on |
 | yt-dlp | from pacman | upstream binary into `~/.local/bin` | from dnf | from the distro (upstream's build needs glibc) |
 | codecs | | | asks first, then enables RPM Fusion free and installs its `ffmpeg`; otherwise `ffmpeg-free` and the two commands to switch later | |
 | ani-cli, ani-skip | upstream into `~/.local/bin` | same | same | same |

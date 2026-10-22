@@ -125,12 +125,15 @@ main() {
 	case $os in
 	arch)
 		# Only what's missing, and no system upgrade: that's the user's, or omarchy update's,
-		# and Omarchy refuses -Syu outside it. -S without -y is no partial upgrade.
-		missing=$(pacman -T mpv yt-dlp ffmpeg curl patch diffutils xdg-utils || true)
+		# and Omarchy refuses -Syu outside it. Without -y the package database isn't refreshed,
+		# so this installs what fits the system as it was last upgraded.
+		# pacman -T: 0 all there, 127 some missing (listed), anything else broke
+		missing=$(pacman -T mpv yt-dlp ffmpeg curl patch diffutils xdg-utils) ||
+			[ $? -eq 127 ] || die "pacman couldn't check which packages are installed"
 		if [ -n "$missing" ]; then
 			# shellcheck disable=SC2086 # one package per word
 			arch_install as_root pacman -S --needed $missing ||
-				die "pacman failed; if a package wasn't found, update the system (omarchy update or sudo pacman -Syu) and run this again"
+				die "pacman failed; if a package wasn't found or couldn't be downloaded, update the system (omarchy update or sudo pacman -Syu) and run this again"
 		fi
 		yt=
 		;;
