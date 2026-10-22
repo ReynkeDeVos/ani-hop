@@ -388,6 +388,7 @@ mod tests {
             query: query.into(),
             index: 2,
             title: "Hunter x Hunter".into(),
+            nth: 2,
             episodes: Vec::new(),
         };
         let m = super::Media::from_ani_cli("Hunter x Hunter (2)", at("hunter x hunter"));

@@ -1089,7 +1089,8 @@ impl App {
                     .iter()
                     .filter(|m| self.local.get(&m.id).is_some_and(|n| *n > 0))
                     .count();
-                let which = if self.user.is_some() {
+                // ani-cli's shows have no progress, so all their episodes count as unwatched
+                let which = if self.user.is_some() && list.iter().all(|m| m.on_anilist()) {
                     "unwatched"
                 } else {
                     "all"

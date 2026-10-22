@@ -8,7 +8,7 @@
 use crate::anilist::Media;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
@@ -34,7 +34,25 @@ pub struct Source {
     pub query: String,
     pub index: usize,
     pub title: String,
+    /// which of the entries with this title it is (1: the first); 0 if saved before 0.6.1
+    #[serde(default)]
+    pub nth: usize,
     pub episodes: Vec<String>,
+}
+
+impl Source {
+    /// Entry `index` of `hits`, counting which of the entries with its title it is.
+    fn at(query: &str, hits: &[String], index: usize, episodes: Vec<String>) -> Source {
+        let title = hits[index - 1].clone();
+        let nth = hits[..index].iter().filter(|h| **h == title).count();
+        Source {
+            query: query.into(),
+            index,
+            title,
+            nth,
+            episodes,
+        }
+    }
 }
 
 pub fn home() -> PathBuf {
@@ -409,20 +427,19 @@ pub fn or_ani_cli(
         ok => return ok, // no results is an answer too
     };
     let (hits, _) = search(query).map_err(|a| format!("{e} · ani-cli: {a}"))?;
-    let mut seen: HashMap<&String, usize> = HashMap::new();
+    let mut taken: HashSet<String> = hits.iter().cloned().collect();
+    let mut first = HashSet::new();
     let shows = hits.iter().enumerate().map(|(i, title)| {
-        let n = *seen.entry(title).and_modify(|n| *n += 1).or_insert(1);
-        let name = match n {
-            1 => title.clone(),
-            n => format!("{title} ({n})"),
+        // later entries of a title get the lowest free number: the provider may have its own "X (2)"
+        let name = match first.insert(title) {
+            true => title.clone(),
+            false => (2..)
+                .map(|n| format!("{title} ({n})"))
+                .find(|n| !taken.contains(n))
+                .unwrap(),
         };
-        let at = Source {
-            query: query.into(),
-            index: i + 1,
-            title: title.clone(),
-            episodes: Vec::new(),
-        };
-        Media::from_ani_cli(&name, at)
+        taken.insert(name.clone());
+        Media::from_ani_cli(&name, Source::at(query, &hits, i + 1, Vec::new()))
     });
     Ok(shows.collect())
 }
@@ -494,6 +511,9 @@ pub fn save_override(id: u64, query: &str, title: &str) -> std::io::Result<()> {
 }
 
 pub fn default_query(m: &Media) -> String {
+    if let Some(at) = &m.ani_cli {
+        return at.query.clone();
+    }
     m.title
         .romaji
         .clone()
@@ -519,41 +539,44 @@ pub fn save_resolved(all: &HashMap<u64, Source>) {
 pub fn locate(m: &Media, src: &Source) -> Result<Source, String> {
     let (hits, _) = search(&src.query)?;
     match position(src, &hits) {
-        Some(index) => Ok(Source {
-            index,
-            ..src.clone()
-        }),
+        Some(index) => Ok(Source::at(&src.query, &hits, index, src.episodes.clone())),
         None => resolve(m),
     }
 }
 
-/// Where `src` is in fresh `hits`: its old place while the title is still there (the second of
-/// two equal titles stays the second), else the first with that title.
+/// Where `src` is in fresh `hits`: the nth entry with its title, as equal titles (a remake)
+/// keep their order when others move in. Saved before 0.6.1: its old place, or its only match.
 fn position(src: &Source, hits: &[String]) -> Option<usize> {
-    if hits.get(src.index.wrapping_sub(1)) == Some(&src.title) {
-        return Some(src.index);
+    let same: Vec<usize> = (1..=hits.len())
+        .filter(|&i| hits[i - 1] == src.title)
+        .collect();
+    match src.nth {
+        0 if same.contains(&src.index) => Some(src.index),
+        0 if same.len() == 1 => Some(same[0]),
+        0 => None,
+        n => same.get(n - 1).copied(),
     }
-    hits.iter().position(|h| *h == src.title).map(|i| i + 1)
 }
 
 pub fn resolve(m: &Media) -> Result<Source, String> {
     let saved = overrides().remove(&m.id.to_string());
     // picked from ani-cli's own results: that very entry, unless "Change source…" chose another
-    if saved.is_none()
-        && let Some(at) = &m.ani_cli
-    {
+    let picked = m.ani_cli.as_ref().filter(|_| saved.is_none());
+    if let Some(at) = picked {
         let (hits, eps) = search(&at.query)?;
-        let index = position(at, &hits)
-            .ok_or_else(|| format!("{} is gone from ani-cli's results", at.title))?;
-        let episodes = match eps {
-            Some(eps) => eps,
-            None => episodes(&at.query, index)?,
-        };
-        return Ok(Source {
-            index,
-            episodes,
-            ..at.clone()
-        });
+        if let Some(eps) = eps {
+            // a single hit: ani-cli shows no title to check, and it's the only show there is
+            return Ok(Source::at(&at.query, &hits, 1, eps));
+        }
+        if let Some(index) = position(at, &hits) {
+            return Ok(Source::at(
+                &at.query,
+                &hits,
+                index,
+                episodes(&at.query, index)?,
+            ));
+        }
+        // gone, or picked as a single hit whose title ani-cli never showed: match titles below
     }
     // provider search chokes on some symbols (HUNTER×HUNTER), so fall back to plainer queries
     let plain = |t: &String| {
@@ -562,9 +585,10 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
             .collect::<Vec<_>>()
             .join(" ")
     };
-    let mut queries: Vec<String> = match &saved {
-        Some((q, _)) => vec![q.clone()],
-        None => [
+    let mut queries: Vec<String> = match (&saved, picked) {
+        (Some((q, _)), _) => vec![q.clone()],
+        (None, Some(at)) => vec![at.query.clone()],
+        (None, None) => [
             m.title.romaji.clone(),
             m.title.english.clone(),
             m.title.romaji.as_ref().map(plain),
@@ -583,12 +607,7 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
     }
     let (query, (hits, eps)) = found?;
     if let Some(eps) = eps {
-        return Ok(Source {
-            query,
-            index: 1,
-            title: hits[0].clone(),
-            episodes: eps,
-        });
+        return Ok(Source::at(&query, &hits, 1, eps));
     }
     let candidates = match saved.and_then(|(_, t)| hits.iter().position(|h| *h == t)) {
         Some(pos) => vec![pos],
@@ -610,12 +629,7 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
         }
     }
     let (i, episodes) = pick.unwrap();
-    Ok(Source {
-        query,
-        index: i + 1,
-        title: hits[i].clone(),
-        episodes,
-    })
+    Ok(Source::at(&query, &hits, i + 1, episodes))
 }
 
 /// Streams one episode with ani-skip; blocks until mpv is closed.
@@ -1151,11 +1165,19 @@ mod tests {
         assert_eq!(names, ["A", "B", "A (2)"]);
         assert!(shows.iter().all(|m| !m.on_anilist()));
         assert!(shows[0].id != shows[2].id && shows[0].id != shows[1].id);
-        let at: Vec<(usize, &str)> = (shows.iter())
+        let at: Vec<(usize, &str, usize)> = (shows.iter())
             .map(|m| m.ani_cli.as_ref().unwrap())
-            .map(|s| (s.index, s.title.as_str()))
+            .map(|s| (s.index, s.title.as_str(), s.nth))
             .collect();
-        assert_eq!(at, [(1, "A"), (2, "B"), (3, "A")]);
+        assert_eq!(at, [(1, "A", 1), (2, "B", 1), (3, "A", 2)]);
+
+        // the provider's own "A (2)" keeps its name, so the second A takes the next number
+        let clash = |_: &str| Ok((vec!["A".into(), "A".into(), "A (2)".into()], None));
+        let shows = or_ani_cli(Err("e".into()), "a", clash).unwrap();
+        let names: Vec<&str> = shows.iter().map(|m| m.name()).collect();
+        assert_eq!(names, ["A", "A (3)", "A (2)"]);
+        let ids: HashSet<u64> = shows.iter().map(|m| m.id).collect();
+        assert_eq!(ids.len(), 3);
 
         // one hit: ani-cli shows no title, only its episodes
         let single = |q: &str| Ok((vec![q.to_string()], Some(vec!["1".into(), "2".into()])));
@@ -1172,27 +1194,38 @@ mod tests {
     #[test]
     fn keeps_the_second_of_two_equal_titles() {
         let hits: Vec<String> = ["HxH", "Fantasy", "HxH"].map(String::from).into();
-        let src = Source {
-            query: "hxh".into(),
-            index: 3,
-            title: "HxH".into(),
-            episodes: Vec::new(),
-        };
+        let src = Source::at("hxh", &hits, 3, Vec::new());
+        assert_eq!((src.title.as_str(), src.nth), ("HxH", 2));
         assert_eq!(position(&src, &hits), Some(3));
-        assert_eq!(position(&src, &hits[..2]), Some(1)); // moved: the first with that title
-        assert_eq!(position(&src, &hits[1..2]), None);
-        let src = Source { index: 9, ..src };
-        assert_eq!(position(&src, &hits), Some(1));
+        // a new show in front: still the second HxH
+        let moved: Vec<String> = ["New", "HxH", "Fantasy", "HxH"].map(String::from).into();
+        assert_eq!(position(&src, &moved), Some(4));
+        assert_eq!(position(&src, &hits[..2]), None); // the second one is gone
+        // saved before 0.6.1: its old place, its only match, or resolve again
+        let old = Source { nth: 0, ..src };
+        assert_eq!(position(&old, &hits), Some(3));
+        assert_eq!(position(&old, &hits[1..]), Some(2));
+        assert_eq!(position(&old, &moved), None);
+    }
+
+    #[test]
+    fn a_single_hit_is_found_again_by_its_title() {
+        // picked as the only hit: ani-cli showed no title, so the typed query stands in for it
+        let query = "frieren beyond journey's end season 2";
+        let at = Source::at(query, &[query.to_string()], 1, Vec::new());
+        let m = Media::from_ani_cli(query, at);
+        let hits = [
+            "Frieren: Beyond Journey's End Season 2 Specials",
+            "Frieren: Beyond Journey's End Season 2",
+        ]
+        .map(String::from);
+        assert_eq!(position(m.ani_cli.as_ref().unwrap(), &hits), None);
+        assert_eq!(best_matches(&m, &hits), [1]); // what resolve falls back to
     }
 
     #[test]
     fn ani_cli_shows_never_replace_anilist_downloads() {
-        let at = Source {
-            query: "q".into(),
-            index: 1,
-            title: "Show".into(),
-            episodes: Vec::new(),
-        };
+        let at = Source::at("q", &["Show".into()], 1, Vec::new());
         let found = Media::from_ani_cli("Show", at);
         let anilist = Media {
             id: 21,

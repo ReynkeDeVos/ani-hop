@@ -131,8 +131,8 @@ AniList answered normally at the time (HTTP 200).
 - **FNV-1a, not `DefaultHasher`.** std says `DefaultHasher`'s algorithm "is not specified, and so it and its hashes should not be relied upon over releases" ([std docs](https://doc.rust-lang.org/std/hash/struct.DefaultHasher.html)). FNV-1a is one fold over the bytes.
 - **The entry it came from travels with it.** A new field `ani_cli: Option<Source>` on `Media` holds the query, the position and the provider title (episodes stay empty there). AniList never sends it, so it is `None` for every AniList show. Saved copies in `downloads.json` and the queue keep it, so a resumed download also finds the right entry. The field is skipped when empty, so the files of today stay the same.
 - **Why not "Change source…".** `sources.json` keeps only (query, title), and `resolve` then takes the *first* hit with that title ([`src/ani.rs:537`](../src/ani.rs#L537)). That can't point at the second `Hunter x Hunter`. Adding the index to that tuple would make every existing `sources.json` unreadable, and `read_json` would quietly drop all saved choices ([`src/ani.rs:73-78`](../src/ani.rs#L73-L78)).
-- **Equal titles get numbers:** `Hunter x Hunter` and `Hunter x Hunter (2)`, in ani-cli's order. The name is what the list shows, what the id hashes and what the folder is called, so the two never share a menu key ([`src/menu.rs:66-80`](../src/menu.rs#L66-L80)) or a download folder. After resolving, the preview tells them apart: "ani-cli: Hunter x Hunter · 62 episodes" ([`src/ui.rs:701-706`](../src/ui.rs#L701-L706)).
-- **Playing exactly that entry.** `resolve` uses the stored entry and doesn't match titles. It runs one search with the stored query and finds the entry again by position. If the provider's order moved, it takes the first hit with the same title. Then it reads that entry's episodes. A source cached from an earlier run goes through `locate`. Today `locate` also takes the first equal title ([`src/ani.rs:491`](../src/ani.rs#L491)), so it gets the same rule: keep the old position while the title is still there. "Change source…" still wins: `resolve` uses the stored entry only when no source was chosen.
+- **Equal titles get numbers:** `Hunter x Hunter` and `Hunter x Hunter (2)`, in ani-cli's order. The number is the lowest one not already a title in the list, as the provider may have its own `X (2)` (8.2). The name is what the list shows, what the id hashes and what the folder is called, so the two never share a menu key ([`src/menu.rs:66-80`](../src/menu.rs#L66-L80)) or a download folder. After resolving, the preview tells them apart: "ani-cli: Hunter x Hunter · 62 episodes" ([`src/ui.rs:701-706`](../src/ui.rs#L701-L706)).
+- **Playing exactly that entry.** `resolve` uses the stored entry and doesn't match titles. It runs one search with the stored query and finds the entry again: the nth entry with its title, so the second `Hunter x Hunter` stays the second when other shows move in front (8.2). A single hit is taken as it is, and an entry that can't be found, or one picked as a single hit whose title ani-cli never showed, is matched by title the way AniList shows are. Then it reads that entry's episodes. A source cached from an earlier run goes through `locate`. Before, `locate` took the first equal title ([`src/ani.rs:491`](../src/ani.rs#L491)); it now uses the same rule. "Change source…" still wins: `resolve` uses the stored entry only when no source was chosen.
 
 **Downloads must keep AniList's data.** `ani::folder` falls back to `download_root()/name` ([`src/ani.rs:811`](../src/ani.rs#L811)). `download` writes the show into `downloads.json` before it checks whether the episode is already there ([`src/ani.rs:931-935`](../src/ani.rs#L931-L935)). So without a rule, downloading from an ani-cli hit named like an existing AniList folder replaces that folder's saved `Media`. Downloads would lose its poster, details and progress, and downloaded files would lose ani-skip, which needs the saved MAL id ([`src/ani.rs:729`](../src/ani.rs#L729)). The rule: a show found through ani-cli is written only into a new entry; an AniList show is always written. In the other direction, downloading the same show later from its AniList page upgrades the entry to the AniList data. The folder is still shared when the names match. That is right for the same show. For a different show with the same name, its episodes would mix into that folder, and an episode number already there would be skipped (section 5.3).
 
@@ -193,6 +193,8 @@ What the id-keyed parts then do with such a show:
 | `CHANGELOG.md`, `Cargo.toml` | — | entry and version bump, as for every PR |
 
 ### 5.2 Sketch
+
+The built code differs where the code review changed it (8.2): `Source` has an `nth` field and a constructor `Source::at`, `position` uses `nth`, `or_ani_cli` skips numbers that are already titles, and `resolve` falls back to title matching instead of failing.
 
 ```rust
 // anilist.rs
@@ -278,7 +280,7 @@ fn replaces(m: &Media, saved: &Media) -> bool {
 - **AniList hangs:** up to 20 s of loading skeleton before the fallback. Rate limiting can take longer, as `gql` waits as long as AniList asks, up to 3 times ([`src/anilist.rs:213-237`](../src/anilist.rs#L213-L237)). AniList is up in that case.
 - **Equal titles:** both are listed, as "Hunter x Hunter" and "Hunter x Hunter (2)", and each plays its own entry. The number depends on the search, though. Another query may list the 62-episode one first, and then *it* is called "Hunter x Hunter". Its id differs (different query), so cached sources can't mix. But its folder name is the same, so downloads of both shows through different searches would share one folder *(inferred)*.
 - **Same name as an AniList download folder:** the AniList data stays (rule above). Episodes land in that folder, which is right for the same show. For a different show with the same name, an episode number that is already there is skipped as downloaded ([`src/ani.rs:933-935`](../src/ani.rs#L933-L935)).
-- **The provider's order changes later:** `position` follows the title. If the title is gone, opening the show says "… is gone from ani-cli's results", and "Change source…" still works.
+- **The provider's order changes later:** `position` finds the nth entry with the title, so shows moving in front don't matter. If two equal titles swap places, the wrong one plays; ani-cli shows no slug that would tell them apart. If the entry is gone, `resolve` matches titles and the preview shows which entry it found; "Change source…" still works.
 - **Single hit:** ani-cli shows no title, so the show is called by the typed query, and so is its download folder.
 - **Single hit with one episode:** the search itself fetches the stream links (about 1 s, run above). If that fails, the fallback shows `<AniList error> · ani-cli: No sources found for sub!` although the show exists (section 3.3). This is an existing limit of the menu reader.
 - **Single hit with no episodes yet:** `<AniList error> · ani-cli: Invalid episode selection` (run above).
@@ -322,6 +324,8 @@ By hand. Blocking AniList in `/etc/hosts` only tests a refused connection, not t
 
 ## 8. Review
 
+### 8.1 Review of this note
+
 An independent review of the first version found seven problems. Each was checked against the code and ani-cli before changing this note.
 
 | # | Finding | Checked | How this note handles it |
@@ -335,3 +339,17 @@ An independent review of the first version found seven problems. Each was checke
 | 7 | "Neither knows the title" contradicted the empty-result rule | True | **Accepted,** reworded (4.1). |
 
 The review agreed with the automatic fallback and the high-bit ids, and so does this version. The size went from about 30 lines and one test to about 70 lines and 60 lines of tests.
+
+### 8.2 Review of the code (PR #9)
+
+Two independent reviews of the built code: the same reviewer as in 8.1, and a second one whose findings were each checked by a separate skeptic. All findings below held up.
+
+| # | Finding | Found by | Fix |
+|---|---|---|---|
+| 1 | Hits `[A, A, A (2)]` named two entries `A (2)`, with one id: picking the third opened the second | both | Later entries of a title get the lowest number that isn't already a title in the list: `A`, `A (3)`, `A (2)`. Test with three distinct ids |
+| 2 | A new show in front of two equal titles made the second resolve to the first | both | `Source.nth` (which of the entries with this title), and `position` takes the nth. Sources saved before 0.6.1 have `nth` 0: their old place, their only match, or a fresh resolve when it's ambiguous |
+| 3 | A show picked as a single hit is saved under the typed query, so it was "gone" once the query found more shows, and a picked entry failed once the query found only one | both | A single hit is taken as it is; an entry not found falls through to title matching, as for AniList shows. Test: the typed query finds "Frieren: Beyond Journey's End Season 2" among two hits |
+| 4 | "Change source…" offered the numbered name ("Hunter x Hunter (2)") as the search | second | `default_query` uses the stored query for ani-cli shows |
+| 5 | Bulk download said "unwatched" for ani-cli shows, but they have no progress, so every episode is queued | second | It says "all" unless every marked show is on AniList |
+
+Left as limits: two equal titles that swap places, and a single-episode single hit that needs its stream links to be found (3.3).
