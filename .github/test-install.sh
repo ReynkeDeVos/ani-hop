@@ -71,8 +71,11 @@ fi
 
 step "second run (update): sh install.sh"
 start=$(date +%s)
-as_tester 'sh /install.sh' || fail "second run"
+as_tester 'sh /install.sh' >/tmp/second.log 2>&1 || { cat /tmp/second.log; fail "second run"; }
+cat /tmp/second.log
 echo "second run took $(($(date +%s) - start))s"
+# everything is there now, so pacman must not install or upgrade anything
+! grep -q 'resolving dependencies' /tmp/second.log || fail "second run ran a pacman transaction"
 check "second run"
 
 if grep -q '^ID=fedora' /etc/os-release; then

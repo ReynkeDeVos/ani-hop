@@ -86,8 +86,8 @@ It reads `ID` and `ID_LIKE` from `/etc/os-release`, so Ubuntu, Mint and Pop!_OS 
 
 | Step | Arch | Debian / Ubuntu | Fedora | anything else |
 |---|---|---|---|---|
-| yay or paru installed | `yay -Syu --needed ani-hop-bin ani-skip-git`, then stop | | | |
-| system packages (sudo) | `pacman -Syu --needed mpv yt-dlp ffmpeg curl patch diffutils xdg-utils` (Arch doesn't do partial upgrades) | `apt-get install -y --no-install-recommends mpv ffmpeg curl patch xdg-utils xz-utils` | `dnf install -y mpv yt-dlp curl patch diffutils xdg-utils` plus ffmpeg (below) | print the list, yt-dlp included, and carry on |
+| yay or paru installed, and `ani-hop-bin` in the AUR | `yay -S --needed ani-hop-bin ani-skip-git`, then stop | | | |
+| system packages (sudo) | only the ones `pacman -T` reports missing, with `pacman -S --needed`: no system upgrade, which is the user's (Omarchy refuses `-Syu` outside `omarchy update`). Without `-y` the package database isn't refreshed, so it installs what fits the system as last upgraded; after an interrupted `-Syu` the user has to finish that upgrade first ([partial upgrades](https://wiki.archlinux.org/title/System_maintenance#Partial_upgrades_are_unsupported)) | `apt-get install -y --no-install-recommends mpv ffmpeg curl patch xdg-utils xz-utils` | `dnf install -y mpv yt-dlp curl patch diffutils xdg-utils` plus ffmpeg (below) | print the list, yt-dlp included, and carry on |
 | yt-dlp | from pacman | upstream binary into `~/.local/bin` | from dnf | from the distro (upstream's build needs glibc) |
 | codecs | | | asks first, then enables RPM Fusion free and installs its `ffmpeg`; otherwise `ffmpeg-free` and the two commands to switch later | |
 | ani-cli, ani-skip | upstream into `~/.local/bin` | same | same | same |
@@ -198,7 +198,7 @@ Both are built (`ani::old_ani_cli`, `ani::ani_cli_update`, `ani::update_command`
 
 1. **ani-cli version.** Run `ani-cli -V` along with the existing dependency check. If it is older than a `TESTED_ANI_CLI` constant (5.1 today), say so on the dependency screen with the right command:
    - the script is user-writable: `ani-cli -U`
-   - `/usr/bin` with yay or paru: `yay -Syu`
+   - `/usr/bin` with yay or paru: `yay -Syu`, or `omarchy update` on Omarchy
    - under `brew --prefix`: `brew upgrade ani-cli`
    - under `/nix/store`: update the channel
 
@@ -206,7 +206,7 @@ Both are built (`ani::old_ani_cli`, `ani::ani_cli_update`, `ani::update_command`
 2. **New ani-hop release.** At most once a day, request `https://github.com/ReynkeDeVos/ani-hop/releases/latest` without following the redirect. The `Location` header names the newest tag, and this needs no API call or rate limit ([GitHub](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)). If the tag is newer than `CARGO_PKG_VERSION`, show one line with the command for the install channel, judged by where the running binary lives:
    - `~/.local/bin`: the `install.sh` line
    - under `brew --prefix`: `brew upgrade`
-   - `/usr/bin`: `yay -Syu`
+   - `/usr/bin`: `yay -Syu`, or `omarchy update` on Omarchy
    - otherwise: `cargo install --locked --force --git …`
 3. Not worth doing: running updates for the user, and checking yt-dlp, which [warns by itself after 90 days](https://github.com/yt-dlp/yt-dlp#update).
 
@@ -276,7 +276,7 @@ All done in 0.6.0:
 - [x] LICENSE, plus `license`, `description`, `repository`, `homepage` and `rust-version` in [Cargo.toml](../Cargo.toml).
 - [x] `install.sh` as in section 4, plus its container test job.
 - [x] `stream()` passes `ANI_CLI_PLAYER=mpv` when the user hasn't set it. This fixes WSL ([ani-cli L464](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L464)) and macOS with IINA ([L461](https://github.com/pystardust/ani-cli/blob/master/ani-cli#L461)).
-- [x] `install_command`: yay/paru and pacman (now with `-Syu`), the `install.sh` line elsewhere on Linux, and brew on macOS or when ani-hop came from Homebrew (without ani-skip and xdg-utils, which Homebrew lacks).
+- [x] `install_command`: yay/paru and pacman (`-S --needed`, since 0.6.2 without a system upgrade), the `install.sh` line elsewhere on Linux, and brew on macOS or when ani-hop came from Homebrew (without ani-skip and xdg-utils, which Homebrew lacks).
 - [x] The update hints from section 5.
 - [x] macOS: `open_url` uses `open`, and DEPS skips `xdg-open` there.
 - [x] `running()` and the poster cleanup use a lock file per process in `~/.cache/ani-hop/run/`, held for the whole run and probed with [`File::try_lock`](https://doc.rust-lang.org/std/fs/struct.File.html), instead of `/proc`. This also survives pid reuse. Leftover files of dead processes are removed at the next start.

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.2 – 2026-10-22
+
+### Fixed
+
+- Running the install line again no longer upgrades the whole system on Arch: it installs only the packages that are missing, so an update just replaces ani-hop, ani-cli and ani-skip. Omarchy, which allows system upgrades only through `omarchy update`, stopped the old script.
+- "Install missing packages" no longer upgrades the system on Arch either, and on Omarchy the update hints say `omarchy update` instead of `yay -Syu`.
+
 ## 0.6.1 – 2026-10-22
 
 ### Fixed
