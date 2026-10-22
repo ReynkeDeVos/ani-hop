@@ -98,14 +98,13 @@ main() {
 	[ ! -e /run/ostree-booted ] || os=other
 
 	# ani-hop-bin brings ani-cli and the rest, ani-skip-git the skipping; both update with
-	# the system. -Syu, because Arch doesn't do partial upgrades. Until ani-hop-bin is in the
-	# AUR, Arch takes the pacman path below.
+	# the system. Until ani-hop-bin is in the AUR, Arch takes the pacman path below.
 	if [ "$os" = arch ]; then
 		for helper in yay paru; do
 			have "$helper" || continue
 			"$helper" -Si ani-hop-bin >/dev/null 2>&1 || continue
 			say "Installing ani-hop-bin from the AUR with $helper"
-			arch_install "$helper" -Syu --needed ani-hop-bin ani-skip-git
+			arch_install "$helper" -S --needed ani-hop-bin ani-skip-git
 			# an earlier run's copy would come first on PATH
 			if [ -e "$BIN/ani-hop" ]; then
 				rm -f "$BIN/ani-hop"
@@ -125,7 +124,14 @@ main() {
 	say "Installing system packages"
 	case $os in
 	arch)
-		arch_install as_root pacman -Syu --needed mpv yt-dlp ffmpeg curl patch diffutils xdg-utils
+		# Only what's missing, and no system upgrade: that's the user's, or omarchy update's,
+		# and Omarchy refuses -Syu outside it. -S without -y is no partial upgrade.
+		missing=$(pacman -T mpv yt-dlp ffmpeg curl patch diffutils xdg-utils || true)
+		if [ -n "$missing" ]; then
+			# shellcheck disable=SC2086 # one package per word
+			arch_install as_root pacman -S --needed $missing ||
+				die "pacman failed; if a package wasn't found, update the system (omarchy update or sudo pacman -Syu) and run this again"
+		fi
 		yt=
 		;;
 	debian)
