@@ -131,17 +131,21 @@ main() {
 	[ ! -e /run/ostree-booted ] || os=other
 
 	# ani-hop-bin brings ani-cli and the rest, ani-skip-git the skipping; both update with
-	# the system. Until ani-hop-bin is in the AUR, Arch takes the pacman path below.
+	# the system. The steps below still run, to fill in what the packages leave out (an ani-cli
+	# too old, a skip script mpv doesn't load); only the release download is skipped.
+	hop=$BIN/ani-hop
 	if [ "$os" = arch ]; then
 		for helper in yay paru; do
 			have "$helper" || continue
 			"$helper" -Si ani-hop-bin >/dev/null 2>&1 || continue
 			say "Installing ani-hop-bin from the AUR with $helper"
-			arch_install "$helper" -S --needed ani-hop-bin ani-skip-git
-			drop "$BIN/ani-hop"
-			packaged
-			drop_copies
-			exit
+			arch_install "$helper" -S --needed ani-hop-bin ani-skip-git ||
+				warn "the AUR install failed, so ani-hop comes from the release"
+			if [ -x /usr/bin/ani-hop ]; then
+				hop=/usr/bin/ani-hop
+				drop "$BIN/ani-hop"
+			fi
+			break
 		done
 	fi
 
@@ -235,14 +239,16 @@ main() {
 		place skip.lua "$SKIP_LUA" 644
 	fi
 
-	say "Installing ani-hop into $BIN"
-	get "$RELEASE/$archive" "$archive"
-	get "$RELEASE/$archive.sha256" "$archive.sha256"
-	# compared by hand: busybox's sha256sum -c trips over the empty line dist ends the file with
-	[ "$(cut -d' ' -f1 "$tmp/$archive.sha256")" = "$(sha256sum <"$tmp/$archive" | cut -d' ' -f1)" ] ||
-		die "checksum mismatch for $archive"
-	tar -xJf "$tmp/$archive" -C "$tmp" || die "could not unpack $archive (is xz installed?)"
-	place "ani-hop-$target/ani-hop" "$BIN/ani-hop" 755
+	if [ "$hop" = "$BIN/ani-hop" ]; then
+		say "Installing ani-hop into $BIN"
+		get "$RELEASE/$archive" "$archive"
+		get "$RELEASE/$archive.sha256" "$archive.sha256"
+		# compared by hand: busybox's sha256sum -c trips over the empty line dist ends the file with
+		[ "$(cut -d' ' -f1 "$tmp/$archive.sha256")" = "$(sha256sum <"$tmp/$archive" | cut -d' ' -f1)" ] ||
+			die "checksum mismatch for $archive"
+		tar -xJf "$tmp/$archive" -C "$tmp" || die "could not unpack $archive (is xz installed?)"
+		place "ani-hop-$target/ani-hop" "$BIN/ani-hop" 755
+	fi
 
 	case ":$PATH:" in
 	*":$BIN:"*)
@@ -267,7 +273,7 @@ main() {
 		;;
 	esac
 
-	version=$("$BIN/ani-hop" --version) || die "$BIN/ani-hop was installed but does not run"
+	version=$("$hop" --version) || die "$hop was installed but does not run"
 	cli=$BIN/ani-cli
 	[ -z "$pkg_cli" ] || cli=/usr/bin/ani-cli
 	say "Done: $version, ani-cli $("$cli" -V 2>/dev/null || echo '(not working yet)')"
