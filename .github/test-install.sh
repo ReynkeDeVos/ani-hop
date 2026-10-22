@@ -99,6 +99,12 @@ for f in .local/bin/ani-cli .local/bin/ani-skip .config/mpv/scripts/skip.lua; do
 done
 grep -q 'ani-cli 5.1.0$' /tmp/packaged.log || fail "the packaged ani-cli isn't the one reported"
 
+step "a packaged ani-skip without its mpv script: ours"
+rm /etc/mpv/scripts/mpv.lua
+as_tester 'sh /install.sh' >/tmp/nolua.log 2>&1 || { cat /tmp/nolua.log; fail "no-script run"; }
+grep -q "read_options" ~tester/.config/mpv/scripts/skip.lua || fail "no skip.lua although mpv has no skip script"
+[ ! -e ~tester/.local/bin/ani-skip ] || fail "ani-skip should still be the package's"
+
 step "a packaged ani-cli that's too old: ours again"
 printf '#!/bin/sh\necho 4.10\n' >/usr/bin/ani-cli
 as_tester 'sh /install.sh' >/tmp/old.log 2>&1 || { cat /tmp/old.log; fail "too-old run"; }

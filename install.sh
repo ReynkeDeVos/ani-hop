@@ -56,20 +56,29 @@ new_enough() {
 
 SKIP_LUA=${XDG_CONFIG_HOME:-$HOME/.config}/mpv/scripts/skip.lua
 
-# Removes an earlier run's copy that a package now replaces; ours would come first on PATH,
-# and mpv would load the skip script twice.
+# ani-skip's mpv script is the one that reads the "skip" script-opts ani-skip hands to mpv.
+SKIP_MARK='read_options(.*"skip")'
+
+# What the system provides, however it got there: an ani-cli ani-hop can use, ani-skip, and
+# ani-skip's mpv script where mpv loads it for everyone.
+packaged() {
+	pkg_cli=$(new_enough "$(/usr/bin/ani-cli -V 2>/dev/null || true)" && echo 1 || true)
+	pkg_skip=$([ -x /usr/bin/ani-skip ] && echo 1 || true)
+	sys_lua=$(grep -l "$SKIP_MARK" /etc/mpv/scripts/*.lua 2>/dev/null | head -n 1 || true)
+}
+
 drop() {
 	[ -e "$1" ] || return 0
 	rm -f "$1"
-	say "Removed $1, the package's copy is used instead"
+	say "Removed $1, the system's copy is used instead"
 }
+
+# Removes an earlier run's copies the system's now replace: ours would come first on PATH,
+# and mpv would load the skip script twice.
 drop_copies() {
-	[ -z "$1" ] || drop "$BIN/ani-cli"
-	[ -z "$2" ] && return
-	drop "$BIN/ani-skip"
-	for lua in /etc/mpv/scripts/*.lua; do
-		if [ -e "$SKIP_LUA" ] && cmp -s "$lua" "$SKIP_LUA" 2>/dev/null; then drop "$SKIP_LUA"; fi
-	done
+	[ -z "$pkg_cli" ] || drop "$BIN/ani-cli"
+	[ -z "$pkg_skip" ] || drop "$BIN/ani-skip"
+	if [ -n "$sys_lua" ] && grep -q "$SKIP_MARK" "$SKIP_LUA" 2>/dev/null; then drop "$SKIP_LUA"; fi
 }
 
 # The last step is a rename inside the target dir, so a failed download never leaves half
@@ -130,7 +139,8 @@ main() {
 			say "Installing ani-hop-bin from the AUR with $helper"
 			arch_install "$helper" -S --needed ani-hop-bin ani-skip-git
 			drop "$BIN/ani-hop"
-			drop_copies cli skip
+			packaged
+			drop_copies
 			exit
 		done
 	fi
@@ -197,7 +207,7 @@ main() {
 		done
 		;;
 	debian)
-		v=$(apt-cache policy ani-cli 2>/dev/null | sed -n 's/^ *Candidate: //p')
+		v=$(LC_ALL=C apt-cache policy ani-cli 2>/dev/null | sed -n 's/^ *Candidate: //p')
 		v=${v#*:}
 		if new_enough "${v%%-*}"; then as_root apt-get install -y ani-cli || true; fi
 		;;
@@ -207,9 +217,8 @@ main() {
 		;;
 	esac
 	# what's really there decides, also a package installed by hand
-	pkg_cli=$(new_enough "$(/usr/bin/ani-cli -V 2>/dev/null || true)" && echo 1 || true)
-	pkg_skip=$([ -x /usr/bin/ani-skip ] && echo 1 || true)
-	drop_copies "$pkg_cli" "$pkg_skip"
+	packaged
+	drop_copies
 	if [ -z "$pkg_cli" ]; then
 		say "Installing ani-cli into $BIN"
 		get "$ANI_CLI" ani-cli
@@ -218,8 +227,11 @@ main() {
 	if [ -z "$pkg_skip" ]; then
 		say "Installing ani-skip into $BIN"
 		get "$ANI_SKIP/ani-skip" ani-skip
-		get "$ANI_SKIP/integrations/mpv.lua" skip.lua
 		place ani-skip "$BIN/ani-skip" 755
+	fi
+	# its mpv script also when ani-skip is packaged but brings none mpv loads
+	if [ -z "$sys_lua" ]; then
+		get "$ANI_SKIP/integrations/mpv.lua" skip.lua
 		place skip.lua "$SKIP_LUA" 644
 	fi
 
