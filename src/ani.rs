@@ -1242,7 +1242,9 @@ mod tests {
         let hits = ["A", "A", "A Season 2"].map(String::from);
         let at = Source::at("a", &hits, 2, Vec::new());
         let m = Media::from_ani_cli("A (2)", at);
-        assert_eq!(best_matches(&matched(&m), &hits[1..]), [0]);
+        let renamed = ["A TV", "A Season 2"].map(String::from); // no exact "A" left
+        assert_eq!(best_matches(&matched(&m), &renamed), [0]);
+        assert_eq!(best_matches(&m, &renamed), [1]);
     }
 
     #[test]
