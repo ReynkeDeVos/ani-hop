@@ -85,4 +85,60 @@ if grep -q '^ID=fedora' /etc/os-release; then
 	check "RPM Fusion run"
 fi
 
+step "a packaged ani-cli and ani-skip replace ours"
+# stand-ins for the distro's packages, which only the AUR has new enough today
+printf '#!/bin/sh\necho 5.1.0\n' >/usr/bin/ani-cli
+printf '#!/bin/sh\necho 1.0.1\n' >/usr/bin/ani-skip
+chmod 755 /usr/bin/ani-cli /usr/bin/ani-skip
+mkdir -p /etc/mpv/scripts
+cp ~tester/.config/mpv/scripts/skip.lua /etc/mpv/scripts/mpv.lua
+as_tester 'sh /install.sh' >/tmp/packaged.log 2>&1 || { cat /tmp/packaged.log; fail "packaged run"; }
+cat /tmp/packaged.log
+for f in .local/bin/ani-cli .local/bin/ani-skip .config/mpv/scripts/skip.lua; do
+	[ ! -e ~tester/$f ] || fail "$f should be gone, the package's copy replaces it"
+done
+grep -q 'ani-cli 5.1.0$' /tmp/packaged.log || fail "the packaged ani-cli isn't the one reported"
+
+step "a packaged ani-skip without its mpv script: ours"
+rm /etc/mpv/scripts/mpv.lua
+as_tester 'sh /install.sh' >/tmp/nolua.log 2>&1 || { cat /tmp/nolua.log; fail "no-script run"; }
+grep -q "read_options" ~tester/.config/mpv/scripts/skip.lua || fail "no skip.lua although mpv has no skip script"
+[ ! -e ~tester/.local/bin/ani-skip ] || fail "ani-skip should still be the package's"
+
+step "a packaged ani-cli that's too old: ours again"
+printf '#!/bin/sh\necho 4.10\n' >/usr/bin/ani-cli
+as_tester 'sh /install.sh' >/tmp/old.log 2>&1 || { cat /tmp/old.log; fail "too-old run"; }
+[ -x ~tester/.local/bin/ani-cli ] || fail "no ani-cli of ours next to a too old one"
+[ ! -e ~tester/.local/bin/ani-skip ] || fail "ani-skip should still be the package's"
+
+if grep -q '^ID=arch' /etc/os-release; then
+	step "arch: ani-hop-bin from the AUR, the rest filled in"
+	# a stand-in yay: ani-hop-bin "exists", and installing it puts a real ani-hop into /usr/bin;
+	# the system's ani-cli stays the too old one and ani-skip brings no mpv script
+	cat >/usr/local/bin/yay <<-'EOF'
+		#!/bin/sh
+		case "$*" in *-Si*) exit 0 ;; esac
+		for p; do
+			[ "$p" != ani-hop-bin ] || sudo install -m 755 "$HOME/.local/bin/ani-hop" /usr/bin/ani-hop
+		done
+	EOF
+	chmod 755 /usr/local/bin/yay
+	# so this run has to put them back itself
+	rm ~tester/.local/bin/ani-cli ~tester/.config/mpv/scripts/skip.lua
+	as_tester 'sh /install.sh' >/tmp/aur.log 2>&1 || { cat /tmp/aur.log; fail "AUR run"; }
+	cat /tmp/aur.log
+	[ -x /usr/bin/ani-hop ] || fail "the stand-in yay installed no ani-hop"
+	[ ! -e ~tester/.local/bin/ani-hop ] || fail "the release's ani-hop should be gone"
+	! grep -q 'Installing ani-hop into' /tmp/aur.log || fail "downloaded the release despite ani-hop-bin"
+	~tester/.local/bin/ani-cli -V | grep -q '^5\.' || fail "no ani-cli of ours next to a too old one"
+	grep -q 'read_options' ~tester/.config/mpv/scripts/skip.lua || fail "no skip.lua although mpv has no skip script"
+
+	step "arch: a failed ani-hop-bin install falls back to the release"
+	printf '#!/bin/sh\ncase "$*" in *-Si*) exit 0 ;; esac\nexit 1\n' >/usr/local/bin/yay
+	as_tester 'sh /install.sh' >/tmp/aurfail.log 2>&1 || { cat /tmp/aurfail.log; fail "failed-AUR run"; }
+	cat /tmp/aurfail.log
+	grep -q 'Installing ani-hop into' /tmp/aurfail.log || fail "no release download after the AUR failed"
+	[ -x ~tester/.local/bin/ani-hop ] || fail "no ani-hop of ours after the AUR failed"
+fi
+
 step "PASS"

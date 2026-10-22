@@ -3,7 +3,8 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh
 #
-# System packages come from the distro, with sudo. ani-hop, ani-cli, ani-skip and, where the
+# System packages come from the distro, with sudo, and so do ani-cli and ani-skip where it has
+# them new enough (on Arch the AUR, through yay or paru). Otherwise they, ani-hop and, where the
 # distro's is too old (Debian, Ubuntu), yt-dlp go into ~/.local/bin, so `ani-cli -U` needs no sudo.
 # Run it again to update them. ANI_HOP_RELEASE_URL picks another release, for example
 # https://github.com/ReynkeDeVos/ani-hop/releases/download/v0.6.0
@@ -47,6 +48,38 @@ arch_install() {
 }
 
 get() { curl -fsSL --retry 3 -o "$tmp/$2" "$1" || die "could not download $1"; }
+
+# Whether version $1 is at least 5.1, which ani-hop needs.
+new_enough() {
+	[ -n "$1" ] && [ "$(printf '%s\n5.1\n' "$1" | sort -V 2>/dev/null | head -n 1)" = 5.1 ]
+}
+
+SKIP_LUA=${XDG_CONFIG_HOME:-$HOME/.config}/mpv/scripts/skip.lua
+
+# ani-skip's mpv script is the one that reads the "skip" script-opts ani-skip hands to mpv.
+SKIP_MARK='read_options(.*"skip")'
+
+# What the system provides, however it got there: an ani-cli ani-hop can use, ani-skip, and
+# ani-skip's mpv script where mpv loads it for everyone.
+packaged() {
+	pkg_cli=$(new_enough "$(/usr/bin/ani-cli -V 2>/dev/null || true)" && echo 1 || true)
+	pkg_skip=$([ -x /usr/bin/ani-skip ] && echo 1 || true)
+	sys_lua=$(grep -l "$SKIP_MARK" /etc/mpv/scripts/*.lua 2>/dev/null | head -n 1 || true)
+}
+
+drop() {
+	[ -e "$1" ] || return 0
+	rm -f "$1"
+	say "Removed $1, the system's copy is used instead"
+}
+
+# Removes an earlier run's copies the system's now replace: ours would come first on PATH,
+# and mpv would load the skip script twice.
+drop_copies() {
+	[ -z "$pkg_cli" ] || drop "$BIN/ani-cli"
+	[ -z "$pkg_skip" ] || drop "$BIN/ani-skip"
+	if [ -n "$sys_lua" ] && grep -q "$SKIP_MARK" "$SKIP_LUA" 2>/dev/null; then drop "$SKIP_LUA"; fi
+}
 
 # The last step is a rename inside the target dir, so a failed download never leaves half
 # a file behind and a running ani-hop can be replaced.
@@ -98,19 +131,22 @@ main() {
 	[ ! -e /run/ostree-booted ] || os=other
 
 	# ani-hop-bin brings ani-cli and the rest, ani-skip-git the skipping; both update with
-	# the system. Until ani-hop-bin is in the AUR, Arch takes the pacman path below.
+	# the system. The steps below still run, to fill in what the packages leave out (an ani-cli
+	# too old, a skip script mpv doesn't load); only the release download is skipped.
+	hop=$BIN/ani-hop
 	if [ "$os" = arch ]; then
 		for helper in yay paru; do
 			have "$helper" || continue
 			"$helper" -Si ani-hop-bin >/dev/null 2>&1 || continue
 			say "Installing ani-hop-bin from the AUR with $helper"
-			arch_install "$helper" -S --needed ani-hop-bin ani-skip-git
-			# an earlier run's copy would come first on PATH
-			if [ -e "$BIN/ani-hop" ]; then
-				rm -f "$BIN/ani-hop"
-				say "Removed the old $BIN/ani-hop"
+			# an older /usr/bin/ani-hop left by a failed install mustn't replace a newer copy of ours
+			if arch_install "$helper" -S --needed ani-hop-bin ani-skip-git && [ -x /usr/bin/ani-hop ]; then
+				hop=/usr/bin/ani-hop
+				drop "$BIN/ani-hop"
+			else
+				warn "the AUR install failed, so ani-hop comes from the release"
 			fi
-			exit
+			break
 		done
 	fi
 
@@ -159,22 +195,61 @@ main() {
 		place yt-dlp "$BIN/yt-dlp" 755
 	fi
 
-	say "Installing ani-cli and ani-skip into $BIN"
-	get "$ANI_CLI" ani-cli
-	get "$ANI_SKIP/ani-skip" ani-skip
-	get "$ANI_SKIP/integrations/mpv.lua" skip.lua
-	place ani-cli "$BIN/ani-cli" 755
-	place ani-skip "$BIN/ani-skip" 755
-	place skip.lua "${XDG_CONFIG_HOME:-$HOME/.config}/mpv/scripts/skip.lua" 644
+	# ani-cli and ani-skip: the system's packages where they're new enough, as those update with
+	# the system; the AUR only has what's missing installed, without a system upgrade.
+	case $os in
+	arch)
+		for helper in yay paru; do
+			have "$helper" || continue
+			want=
+			pacman -T ani-cli >/dev/null || want=" ani-cli"
+			pacman -T ani-skip >/dev/null || want="$want ani-skip-git"
+			[ -n "$want" ] || break
+			say "Installing$want from the AUR with $helper"
+			# shellcheck disable=SC2086 # one package per word
+			arch_install "$helper" -S --needed $want || warn "the AUR install failed, so upstream's copies are used"
+			break
+		done
+		;;
+	debian)
+		v=$(LC_ALL=C apt-cache policy ani-cli 2>/dev/null | sed -n 's/^ *Candidate: //p')
+		v=${v#*:}
+		if new_enough "${v%%-*}"; then as_root apt-get install -y ani-cli || true; fi
+		;;
+	fedora)
+		v=$(dnf -q repoquery --latest-limit=1 --qf '%{version}\n' ani-cli 2>/dev/null || true)
+		if new_enough "$v"; then as_root dnf install -y ani-cli || true; fi
+		;;
+	esac
+	# what's really there decides, also a package installed by hand
+	packaged
+	drop_copies
+	if [ -z "$pkg_cli" ]; then
+		say "Installing ani-cli into $BIN"
+		get "$ANI_CLI" ani-cli
+		place ani-cli "$BIN/ani-cli" 755
+	fi
+	if [ -z "$pkg_skip" ]; then
+		say "Installing ani-skip into $BIN"
+		get "$ANI_SKIP/ani-skip" ani-skip
+		place ani-skip "$BIN/ani-skip" 755
+	fi
+	# its mpv script also when ani-skip is packaged but brings none mpv loads
+	if [ -z "$sys_lua" ]; then
+		get "$ANI_SKIP/integrations/mpv.lua" skip.lua
+		place skip.lua "$SKIP_LUA" 644
+	fi
 
-	say "Installing ani-hop into $BIN"
-	get "$RELEASE/$archive" "$archive"
-	get "$RELEASE/$archive.sha256" "$archive.sha256"
-	# compared by hand: busybox's sha256sum -c trips over the empty line dist ends the file with
-	[ "$(cut -d' ' -f1 "$tmp/$archive.sha256")" = "$(sha256sum <"$tmp/$archive" | cut -d' ' -f1)" ] ||
-		die "checksum mismatch for $archive"
-	tar -xJf "$tmp/$archive" -C "$tmp" || die "could not unpack $archive (is xz installed?)"
-	place "ani-hop-$target/ani-hop" "$BIN/ani-hop" 755
+	if [ "$hop" = "$BIN/ani-hop" ]; then
+		say "Installing ani-hop into $BIN"
+		get "$RELEASE/$archive" "$archive"
+		get "$RELEASE/$archive.sha256" "$archive.sha256"
+		# compared by hand: busybox's sha256sum -c trips over the empty line dist ends the file with
+		[ "$(cut -d' ' -f1 "$tmp/$archive.sha256")" = "$(sha256sum <"$tmp/$archive" | cut -d' ' -f1)" ] ||
+			die "checksum mismatch for $archive"
+		tar -xJf "$tmp/$archive" -C "$tmp" || die "could not unpack $archive (is xz installed?)"
+		place "ani-hop-$target/ani-hop" "$BIN/ani-hop" 755
+	fi
 
 	case ":$PATH:" in
 	*":$BIN:"*)
@@ -199,8 +274,10 @@ main() {
 		;;
 	esac
 
-	version=$("$BIN/ani-hop" --version) || die "$BIN/ani-hop was installed but does not run"
-	say "Done: $version, ani-cli $("$BIN/ani-cli" -V 2>/dev/null || echo '(not working yet)')"
+	version=$("$hop" --version) || die "$hop was installed but does not run"
+	cli=$BIN/ani-cli
+	[ -z "$pkg_cli" ] || cli=/usr/bin/ani-cli
+	say "Done: $version, ani-cli $("$cli" -V 2>/dev/null || echo '(not working yet)')"
 }
 
 main "$@"

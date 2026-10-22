@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.3 – 2026-10-22
+
+### Changed
+
+- The install line takes ani-cli and ani-skip from your distro where it has them new enough, so they update with the system: on Arch from the AUR through yay or paru, installing only what's missing. Debian, Ubuntu and Fedora have no recent enough ani-cli yet, so there they still come from upstream. Copies an earlier run put into `~/.local/bin` are removed when the package replaces them, and so is a second copy of the skip script for mpv.
+
 ## 0.6.2 – 2026-10-22
 
 ### Fixed
