@@ -139,11 +139,12 @@ main() {
 			have "$helper" || continue
 			"$helper" -Si ani-hop-bin >/dev/null 2>&1 || continue
 			say "Installing ani-hop-bin from the AUR with $helper"
-			arch_install "$helper" -S --needed ani-hop-bin ani-skip-git ||
-				warn "the AUR install failed, so ani-hop comes from the release"
-			if [ -x /usr/bin/ani-hop ]; then
+			# an older /usr/bin/ani-hop left by a failed install mustn't replace a newer copy of ours
+			if arch_install "$helper" -S --needed ani-hop-bin ani-skip-git && [ -x /usr/bin/ani-hop ]; then
 				hop=/usr/bin/ani-hop
 				drop "$BIN/ani-hop"
+			else
+				warn "the AUR install failed, so ani-hop comes from the release"
 			fi
 			break
 		done

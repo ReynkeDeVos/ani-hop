@@ -123,13 +123,22 @@ if grep -q '^ID=arch' /etc/os-release; then
 		done
 	EOF
 	chmod 755 /usr/local/bin/yay
+	# so this run has to put them back itself
+	rm ~tester/.local/bin/ani-cli ~tester/.config/mpv/scripts/skip.lua
 	as_tester 'sh /install.sh' >/tmp/aur.log 2>&1 || { cat /tmp/aur.log; fail "AUR run"; }
 	cat /tmp/aur.log
+	[ -x /usr/bin/ani-hop ] || fail "the stand-in yay installed no ani-hop"
 	[ ! -e ~tester/.local/bin/ani-hop ] || fail "the release's ani-hop should be gone"
-	grep -q 'Done: ani-hop ' /tmp/aur.log || fail "/usr/bin/ani-hop isn't the one reported"
-	[ -x ~tester/.local/bin/ani-cli ] || fail "no ani-cli of ours next to a too old one"
-	[ -s ~tester/.config/mpv/scripts/skip.lua ] || fail "no skip.lua although mpv has no skip script"
 	! grep -q 'Installing ani-hop into' /tmp/aur.log || fail "downloaded the release despite ani-hop-bin"
+	~tester/.local/bin/ani-cli -V | grep -q '^5\.' || fail "no ani-cli of ours next to a too old one"
+	grep -q 'read_options' ~tester/.config/mpv/scripts/skip.lua || fail "no skip.lua although mpv has no skip script"
+
+	step "arch: a failed ani-hop-bin install falls back to the release"
+	printf '#!/bin/sh\ncase "$*" in *-Si*) exit 0 ;; esac\nexit 1\n' >/usr/local/bin/yay
+	as_tester 'sh /install.sh' >/tmp/aurfail.log 2>&1 || { cat /tmp/aurfail.log; fail "failed-AUR run"; }
+	cat /tmp/aurfail.log
+	grep -q 'Installing ani-hop into' /tmp/aurfail.log || fail "no release download after the AUR failed"
+	[ -x ~tester/.local/bin/ani-hop ] || fail "no ani-hop of ours after the AUR failed"
 fi
 
 step "PASS"
