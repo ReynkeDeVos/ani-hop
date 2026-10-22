@@ -37,6 +37,9 @@ pub struct Media {
     pub studios: Studios,
     pub next_airing_episode: Option<Airing>,
     pub media_list_entry: Option<Entry>,
+    /// where ani-cli listed a show AniList didn't provide (its episodes stay empty)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ani_cli: Option<crate::ani::Source>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -78,7 +81,33 @@ pub struct Entry {
     pub progress: u32,
 }
 
+/// Ids from here up are shows only ani-cli's provider knows (AniList's are 32-bit Ints).
+const ANI_CLI_ONLY: u64 = 1 << 63;
+
 impl Media {
+    /// A show found through ani-cli alone. The id hashes the search and the entry, not the
+    /// shown name, so the same pick has it again next time and a provider's own "X (2)" can't
+    /// take a numbered one's (FNV-1a: std's hasher may change between releases).
+    pub fn from_ani_cli(name: &str, at: crate::ani::Source) -> Media {
+        let key = format!("{}\n{}\n{}", at.query, at.title, at.nth);
+        let hash = (key.bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
+        });
+        Media {
+            id: ANI_CLI_ONLY | hash,
+            title: Title {
+                romaji: Some(name.into()),
+                english: None,
+            },
+            ani_cli: Some(at),
+            ..Default::default()
+        }
+    }
+
+    pub fn on_anilist(&self) -> bool {
+        self.id < ANI_CLI_ONLY
+    }
+
     pub fn name(&self) -> &str {
         let (romaji, english) = (self.title.romaji.as_deref(), self.title.english.as_deref());
         let pick = if ENGLISH_TITLES.load(Ordering::Relaxed) {
@@ -352,6 +381,31 @@ mod tests {
             (eps["S1"].title.as_str(), eps["S1"].about.as_str()),
             ("", "")
         );
+    }
+
+    #[test]
+    fn ani_cli_shows_keep_their_id_and_stay_off_anilist() {
+        let at = |query: &str| crate::ani::Source {
+            query: query.into(),
+            index: 2,
+            title: "Hunter x Hunter".into(),
+            nth: 2,
+            episodes: Vec::new(),
+        };
+        let m = super::Media::from_ani_cli("Hunter x Hunter (2)", at("hunter x hunter"));
+        // saved in resolved.json, audio.json and downloads.json, so it must never change
+        assert_eq!(m.id, 10_198_325_430_496_578_357);
+        let other = super::Media::from_ani_cli("Hunter x Hunter (2)", at("hunter"));
+        assert_ne!(m.id, other.id);
+        assert!(!m.on_anilist() && super::Media::default().on_anilist());
+        assert_eq!(m.name(), "Hunter x Hunter (2)");
+        let back: super::Media = serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
+        assert_eq!(back.id, m.id); // above 2^53
+        assert_eq!(back.ani_cli.unwrap().index, 2);
+        let anilist = serde_json::to_string(&super::Media::default()).unwrap();
+        assert!(!anilist.contains("aniCli"));
+        let old: super::Media = serde_json::from_str(r#"{"id": 1}"#).unwrap();
+        assert!(old.ani_cli.is_none());
     }
 
     #[test]

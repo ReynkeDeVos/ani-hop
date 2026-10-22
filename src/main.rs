@@ -804,7 +804,10 @@ impl App {
 
     /// Episode titles and summaries, once a session per show.
     pub fn want_episodes(&mut self, m: &Media) {
-        if let Vacant(e) = self.ep_info.entry(m.id) {
+        // ani.zip knows shows by AniList id only
+        if m.on_anilist()
+            && let Vacant(e) = self.ep_info.entry(m.id)
+        {
             e.insert(HashMap::new());
             let m = m.clone();
             self.spawn(move || Msg::EpInfo(m.id, load_episodes(&m)));
@@ -979,7 +982,7 @@ impl App {
                         format!("{} on disk", local.len()),
                     ));
                 }
-                if self.user.is_some() {
+                if self.user.is_some() && m.on_anilist() {
                     let status = m
                         .media_list_entry
                         .as_ref()
@@ -997,7 +1000,9 @@ impl App {
                     "⇄  Change source…",
                     src.map(|s| s.title.clone()).unwrap_or_default(),
                 ));
-                v.push(Item::new("web", "↗  Open on AniList", ""));
+                if m.on_anilist() {
+                    v.push(Item::new("web", "↗  Open on AniList", ""));
+                }
                 v
             }
             View::Episodes(m, mode) => {
@@ -1084,7 +1089,8 @@ impl App {
                     .iter()
                     .filter(|m| self.local.get(&m.id).is_some_and(|n| *n > 0))
                     .count();
-                let which = if self.user.is_some() {
+                // as the downloader decides: episodes past each show's progress
+                let which = if list.iter().any(|m| m.progress() > 0) {
                     "unwatched"
                 } else {
                     "all"
@@ -1447,7 +1453,8 @@ impl App {
                 let c = self.client.clone();
                 let title = format!("Search: {text}");
                 self.push_loading(&title, Feed::Whole, None, move || {
-                    c.browse("SEARCH_MATCH", Some(&text), 1)
+                    let found = c.browse("SEARCH_MATCH", Some(&text), 1);
+                    ani::or_ani_cli(found, &text, ani::search)
                 });
             }
             Input::ClientId => {
@@ -1670,16 +1677,26 @@ impl App {
 
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Shows(id, res) => self.fill(id, res, |v, list| {
-                if let View::Shows(l, feed) = v {
-                    if let Feed::Pages(_, next, _) = feed
-                        && list.len() < PER_PAGE
-                    {
-                        *next = None;
+            Msg::Shows(id, res) => {
+                let fallback = res
+                    .as_ref()
+                    .is_ok_and(|l| l.iter().any(|m| !m.on_anilist()))
+                    && self.stack.iter().any(|s| s.id == id);
+                self.fill(id, res, |v, list| {
+                    if let View::Shows(l, feed) = v {
+                        if let Feed::Pages(_, next, _) = feed
+                            && list.len() < PER_PAGE
+                        {
+                            *next = None;
+                        }
+                        *l = list;
                     }
-                    *l = list;
+                });
+                if fallback {
+                    let text = "AniList search failed, showing ani-cli's matches without posters or details";
+                    self.toast(text, true);
                 }
-            }),
+            }
             Msg::More(id, res) => {
                 let screen = self.stack.iter_mut().find(|s| s.id == id);
                 if let Some(View::Shows(_, Feed::Pages(_, _, fetching))) =
@@ -1832,7 +1849,11 @@ impl App {
                 }
                 match res {
                     Err(e) => self.toast(e, true),
-                    Ok(()) if self.user.is_some() && ani::ep_num(&ep) > m.progress() as f64 => {
+                    Ok(())
+                        if self.user.is_some()
+                            && m.on_anilist()
+                            && ani::ep_num(&ep) > m.progress() as f64 =>
+                    {
                         let title = format!("Mark episode {ep} of {} as watched?", m.name());
                         self.push(title, View::Confirm(Pending::Progress(m, ep)));
                         self.top().menu.select_key("yes");

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.1 – 2026-10-22
+
+### Fixed
+
+- Search works while AniList is down: when AniList's search fails, ani-hop searches through ani-cli instead and lists what it finds, so you can still open a show, play and download episodes. These shows have no poster, details or AniList progress sync, which their preview says. Shows with the same title are listed apart, as "Hunter x Hunter" and "Hunter x Hunter (2)", and each plays the one you picked. Downloading one never replaces the poster and details Downloads keeps for an AniList show.
+- A show whose title appears twice on ani-cli's provider stays on the entry it was matched to, instead of switching to the other one on a later start.
+
 ## 0.6.0 – 2026-10-21
 
 ### Added
