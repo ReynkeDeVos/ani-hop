@@ -397,6 +397,36 @@ pub fn search(query: &str) -> Result<(Vec<String>, Option<Vec<String>>), String>
     }
 }
 
+/// AniList's results, or if AniList failed, ani-cli's: one show per provider entry, equal
+/// titles numbered so each gets its own id and folder. `search` is `search`, passed in for tests.
+pub fn or_ani_cli(
+    anilist: Result<Vec<Media>, String>,
+    query: &str,
+    search: impl FnOnce(&str) -> Result<(Vec<String>, Option<Vec<String>>), String>,
+) -> Result<Vec<Media>, String> {
+    let e = match anilist {
+        Err(e) => e,
+        ok => return ok, // no results is an answer too
+    };
+    let (hits, _) = search(query).map_err(|a| format!("{e} · ani-cli: {a}"))?;
+    let mut seen: HashMap<&String, usize> = HashMap::new();
+    let shows = hits.iter().enumerate().map(|(i, title)| {
+        let n = *seen.entry(title).and_modify(|n| *n += 1).or_insert(1);
+        let name = match n {
+            1 => title.clone(),
+            n => format!("{title} ({n})"),
+        };
+        let at = Source {
+            query: query.into(),
+            index: i + 1,
+            title: title.clone(),
+            episodes: Vec::new(),
+        };
+        Media::from_ani_cli(&name, at)
+    });
+    Ok(shows.collect())
+}
+
 fn episodes(query: &str, index: usize) -> Result<Vec<String>, String> {
     match probe(&["-S", &index.to_string(), query])? {
         Some((_, eps)) => Ok(eps),
@@ -488,17 +518,43 @@ pub fn save_resolved(all: &HashMap<u64, Source>) {
 /// the provider's order shifts when new seasons show up. One search, not a full resolve.
 pub fn locate(m: &Media, src: &Source) -> Result<Source, String> {
     let (hits, _) = search(&src.query)?;
-    match hits.iter().position(|h| *h == src.title) {
-        Some(i) => Ok(Source {
-            index: i + 1,
+    match position(src, &hits) {
+        Some(index) => Ok(Source {
+            index,
             ..src.clone()
         }),
         None => resolve(m),
     }
 }
 
+/// Where `src` is in fresh `hits`: its old place while the title is still there (the second of
+/// two equal titles stays the second), else the first with that title.
+fn position(src: &Source, hits: &[String]) -> Option<usize> {
+    if hits.get(src.index.wrapping_sub(1)) == Some(&src.title) {
+        return Some(src.index);
+    }
+    hits.iter().position(|h| *h == src.title).map(|i| i + 1)
+}
+
 pub fn resolve(m: &Media) -> Result<Source, String> {
     let saved = overrides().remove(&m.id.to_string());
+    // picked from ani-cli's own results: that very entry, unless "Change source…" chose another
+    if saved.is_none()
+        && let Some(at) = &m.ani_cli
+    {
+        let (hits, eps) = search(&at.query)?;
+        let index = position(at, &hits)
+            .ok_or_else(|| format!("{} is gone from ani-cli's results", at.title))?;
+        let episodes = match eps {
+            Some(eps) => eps,
+            None => episodes(&at.query, index)?,
+        };
+        return Ok(Source {
+            index,
+            episodes,
+            ..at.clone()
+        });
+    }
     // provider search chokes on some symbols (HUNTER×HUNTER), so fall back to plainer queries
     let plain = |t: &String| {
         t.split(|c: char| !c.is_alphanumeric())
@@ -918,6 +974,12 @@ pub fn discard(dir: &Path, eps: &[String]) {
     let _ = drop_if_empty(dir);
 }
 
+/// Whether `m` may become the show saved for a download folder: one ani-cli found never
+/// replaces one AniList knows, whose details and MAL id (for ani-skip) Downloads needs.
+fn replaces(m: &Media, saved: &Media) -> bool {
+    m.on_anilist() || saved.id == 0 // 0: a new entry
+}
+
 /// Downloads one episode, calling `progress` with yt-dlp's status lines.
 pub fn download(
     m: &Media,
@@ -928,8 +990,13 @@ pub fn download(
 ) -> Result<(), String> {
     let dir = folder(m);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    edit_index(|all| all.entry(dir.clone()).or_default().media = m.clone())
-        .map_err(|e| e.to_string())?;
+    edit_index(|all| {
+        let d = all.entry(dir.clone()).or_default();
+        if replaces(m, &d.media) {
+            d.media = m.clone();
+        }
+    })
+    .map_err(|e| e.to_string())?;
     if local_episodes(&dir).iter().any(|(e, _)| e == ep) {
         return Ok(()); // yt-dlp wouldn't replace it, so it stays the audio it was
     }
@@ -1067,6 +1134,75 @@ mod tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn falls_back_to_ani_cli_only_when_anilist_fails() {
+        let unused = |_: &str| -> Result<(Vec<String>, Option<Vec<String>>), String> {
+            panic!("ani-cli searched although AniList answered")
+        };
+        let list = vec![Media::default()];
+        assert_eq!(or_ani_cli(Ok(list), "x", unused).unwrap().len(), 1);
+        assert!(or_ani_cli(Ok(vec![]), "x", unused).unwrap().is_empty());
+
+        let hits = |_: &str| Ok((vec!["A".into(), "B".into(), "A".into()], None));
+        let shows = or_ani_cli(Err("AniList: down".into()), "a", hits).unwrap();
+        let names: Vec<&str> = shows.iter().map(|m| m.name()).collect();
+        assert_eq!(names, ["A", "B", "A (2)"]);
+        assert!(shows.iter().all(|m| !m.on_anilist()));
+        assert!(shows[0].id != shows[2].id && shows[0].id != shows[1].id);
+        let at: Vec<(usize, &str)> = (shows.iter())
+            .map(|m| m.ani_cli.as_ref().unwrap())
+            .map(|s| (s.index, s.title.as_str()))
+            .collect();
+        assert_eq!(at, [(1, "A"), (2, "B"), (3, "A")]);
+
+        // one hit: ani-cli shows no title, only its episodes
+        let single = |q: &str| Ok((vec![q.to_string()], Some(vec!["1".into(), "2".into()])));
+        let shows = or_ani_cli(Err("e".into()), "Frieren 2", single).unwrap();
+        assert_eq!(shows.len(), 1);
+        assert_eq!(shows[0].name(), "Frieren 2");
+        assert_eq!(shows[0].ani_cli.as_ref().unwrap().index, 1);
+
+        let none = |_: &str| Err("No results found!".to_string());
+        let e = or_ani_cli(Err("AniList: down".into()), "a", none).unwrap_err();
+        assert_eq!(e, "AniList: down · ani-cli: No results found!");
+    }
+
+    #[test]
+    fn keeps_the_second_of_two_equal_titles() {
+        let hits: Vec<String> = ["HxH", "Fantasy", "HxH"].map(String::from).into();
+        let src = Source {
+            query: "hxh".into(),
+            index: 3,
+            title: "HxH".into(),
+            episodes: Vec::new(),
+        };
+        assert_eq!(position(&src, &hits), Some(3));
+        assert_eq!(position(&src, &hits[..2]), Some(1)); // moved: the first with that title
+        assert_eq!(position(&src, &hits[1..2]), None);
+        let src = Source { index: 9, ..src };
+        assert_eq!(position(&src, &hits), Some(1));
+    }
+
+    #[test]
+    fn ani_cli_shows_never_replace_anilist_downloads() {
+        let at = Source {
+            query: "q".into(),
+            index: 1,
+            title: "Show".into(),
+            episodes: Vec::new(),
+        };
+        let found = Media::from_ani_cli("Show", at);
+        let anilist = Media {
+            id: 21,
+            ..Media::default()
+        };
+        let new_entry = Media::default();
+        assert!(replaces(&found, &new_entry));
+        assert!(!replaces(&found, &anilist));
+        assert!(replaces(&anilist, &found));
+        assert!(replaces(&anilist, &anilist));
     }
 
     #[test]

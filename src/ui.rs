@@ -659,6 +659,12 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
         facts.push(d.into());
     }
     lines.push(Line::from(facts));
+    if !m.on_anilist() {
+        lines.push(Line::styled(
+            "Found through ani-cli: no AniList details or progress sync",
+            Color::Yellow,
+        ));
+    }
     let when = [
         m.season.as_deref().map(pretty),
         m.season_year.map(|y| y.to_string()),
