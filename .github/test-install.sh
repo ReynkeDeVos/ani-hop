@@ -85,4 +85,24 @@ if grep -q '^ID=fedora' /etc/os-release; then
 	check "RPM Fusion run"
 fi
 
+step "a packaged ani-cli and ani-skip replace ours"
+# stand-ins for the distro's packages, which only the AUR has new enough today
+printf '#!/bin/sh\necho 5.1.0\n' >/usr/bin/ani-cli
+printf '#!/bin/sh\necho 1.0.1\n' >/usr/bin/ani-skip
+chmod 755 /usr/bin/ani-cli /usr/bin/ani-skip
+mkdir -p /etc/mpv/scripts
+cp ~tester/.config/mpv/scripts/skip.lua /etc/mpv/scripts/mpv.lua
+as_tester 'sh /install.sh' >/tmp/packaged.log 2>&1 || { cat /tmp/packaged.log; fail "packaged run"; }
+cat /tmp/packaged.log
+for f in .local/bin/ani-cli .local/bin/ani-skip .config/mpv/scripts/skip.lua; do
+	[ ! -e ~tester/$f ] || fail "$f should be gone, the package's copy replaces it"
+done
+grep -q 'ani-cli 5.1.0$' /tmp/packaged.log || fail "the packaged ani-cli isn't the one reported"
+
+step "a packaged ani-cli that's too old: ours again"
+printf '#!/bin/sh\necho 4.10\n' >/usr/bin/ani-cli
+as_tester 'sh /install.sh' >/tmp/old.log 2>&1 || { cat /tmp/old.log; fail "too-old run"; }
+[ -x ~tester/.local/bin/ani-cli ] || fail "no ani-cli of ours next to a too old one"
+[ ! -e ~tester/.local/bin/ani-skip ] || fail "ani-skip should still be the package's"
+
 step "PASS"
