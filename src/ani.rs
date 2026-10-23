@@ -14,7 +14,7 @@ use std::io::{BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// The running ani-cli download: pid, show folder, episode.
@@ -23,6 +23,10 @@ type Running = (u32, PathBuf, String);
 /// (stopped by quitting, the running download). One lock, so quitting or stopping an
 /// episode can't race the worker starting the next one.
 static DOWNLOAD: Mutex<(bool, Option<Running>)> = Mutex::new((false, None));
+/// Downloads held by `pause`, until `resume`.
+static PAUSED: AtomicBool = AtomicBool::new(false);
+/// A download that was stopped, by quitting, pausing or taking it out of the queue.
+pub const STOPPED: &str = "stopped";
 
 const FAKE_ROFI: &str = r#"#!/bin/sh
 # ani-hop: captures ani-cli's menu instead of showing one
@@ -34,22 +38,29 @@ exit 1
 const FAKE_FFMPEG: &str = r#"#!/bin/sh
 # ani-hop: ani-cli downloads a show whose audio is a separate track with ffmpeg, which writes
 # the .mp4 as it goes, so one cut short would look finished. This writes .part, like yt-dlp,
-# renames it once ffmpeg got all of it and reports how far it got on stdout.
+# renames it once ffmpeg got all of it and reports how far it got, and of how long, on stdout.
 PATH=${PATH#"${0%/*}:"}
 for a; do case $a in *.mp4) out=$a ;; esac; done
 [ "$1" = -extension_picky ] && [ -n "$out" ] || exec ffmpeg "$@"
+ref= src= prev=
 for a; do
 	shift
 	[ "$a" = "$out" ] && set -- "$@" -y -nostdin -nostats -loglevel level+warning -progress pipe:1 -f mp4 && a=$out.part
+	case $prev in -referer) ref=${ref:-$a} ;; -i) src=${src:-$a} ;; esac
+	prev=$a
 	set -- "$@" "$a"
 done
 log=$out.part.log
-# ani-hop stops a download by signalling ani-cli's children, and this is one
-trap 'kill $pid 2>/dev/null; rm -f "$log"; exit 1' INT HUP TERM
+# ani-hop stops a download by signalling ani-cli's children, and this is one. By parent, not
+# saved pids: ffprobe's is free again once it's done, maybe someone else's by then.
+trap 'pkill -P $$ 2>/dev/null; rm -f "$log"; exit 1' INT HUP TERM
+# the episode's length, from its playlist, alongside the download
+ffprobe -v error -extension_picky 0 -referer "$ref" -show_entries format=duration -of default=nw=1 "$src" 2>/dev/null &
 ffmpeg "$@" 2>"$log" &
-pid=$!
-wait $pid
+wait $!
 ok=$?
+# still asking after all, it would hold ani-hop's end of stdout open
+pkill -P $$ 2>/dev/null
 cat "$log" >&2
 # ffmpeg exits 0 after skipping a segment it can't get, which only the input side warns about,
 # and after errors in what it got. shortcut: a segment that arrives short or empty with no
@@ -1050,20 +1061,26 @@ pub fn discard(dir: &Path, eps: &[String]) {
 }
 
 fn discard_parts(dir: &Path, eps: &[String]) {
+    for p in parts(dir, eps) {
+        let _ = fs::remove_file(p);
+    }
+}
+
+/// What downloads of `eps` that didn't finish left in `dir`.
+pub fn parts(dir: &Path, eps: &[String]) -> Vec<PathBuf> {
     let done: Vec<String> = local_episodes(dir).into_iter().map(|(e, _)| e).collect();
     let Ok(rd) = fs::read_dir(dir) else {
-        return;
+        return Vec::new();
     };
-    for p in rd.flatten().map(|e| e.path()) {
-        let name = p.file_name().unwrap_or_default().to_string_lossy();
-        let partial = eps.iter().filter(|ep| !done.contains(ep)).any(|ep| {
-            name.contains(&format!(" Episode {ep}.mp4."))
-                || name.ends_with(&format!(" Episode {ep}.vtt"))
-        });
-        if partial {
-            let _ = fs::remove_file(&p);
-        }
-    }
+    (rd.flatten().map(|e| e.path()))
+        .filter(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            eps.iter().filter(|ep| !done.contains(ep)).any(|ep| {
+                name.contains(&format!(" Episode {ep}.mp4."))
+                    || name.ends_with(&format!(" Episode {ep}.vtt"))
+            })
+        })
+        .collect()
 }
 
 /// Whether `m` may become the show saved for a download folder: one ani-cli found never
@@ -1072,21 +1089,22 @@ fn replaces(m: &Media, saved: &Media) -> bool {
     m.on_anilist() || saved.id == 0 // 0: a new entry
 }
 
-/// Downloads one episode, calling `progress` with yt-dlp's status lines. `wanted` is asked
-/// right before it starts, under the lock `cancel` takes, so a stop is never missed.
+/// Downloads one episode, calling `progress` with yt-dlp's status lines or how far ffmpeg got,
+/// and whether that's kept after a pause (yt-dlp's is). `wanted` is asked right before it
+/// starts, under the lock stopping and pausing take, so neither is ever missed.
 pub fn download(
     m: &Media,
     src: &Source,
     ep: &str,
     dub: bool,
     wanted: impl FnOnce() -> bool,
-    mut progress: impl FnMut(&str),
+    mut progress: impl FnMut(&str, bool),
 ) -> Result<(), String> {
     let dir = folder(m);
     let child = {
         let mut dl = DOWNLOAD.lock().unwrap();
-        if dl.0 || !wanted() {
-            return Err("stopped".into());
+        if dl.0 || PAUSED.load(Ordering::Relaxed) || !wanted() {
+            return Err(STOPPED.into());
         }
         // under the lock, so stopping another episode can't drop the folder in between; also
         // for an episode already there, so a folder found through ani-cli gets the AniList show
@@ -1113,19 +1131,25 @@ pub fn download(
         dl.1 = Some((child.id(), dir.clone(), ep.to_string()));
         child
     };
+    let mut length = None;
     let (_, stderr) = follow(child, |l| {
-        if let Some(rest) = l.strip_prefix("[download]") {
-            progress(rest.trim());
+        // yt-dlp's percentages and errors, not where it writes to or, going on from where it
+        // was, a line for each piece it has already
+        let noise =
+            |r: &&str| r.starts_with("Destination:") || r.ends_with("has already been downloaded");
+        if let Some(rest) = (l.strip_prefix("[download]").map(str::trim)).filter(|r| !noise(r)) {
+            progress(rest, true);
+        } else if let Some(d) = l.strip_prefix("duration=") {
+            length = d.parse().ok().filter(|d: &f64| *d >= 1.0);
         } else if let Some(t) = l
             .strip_prefix("out_time=")
             .filter(|t| t.starts_with(|c: char| c.is_ascii_digit()))
         {
-            // ffmpeg, through FAKE_FFMPEG: how much of the episode it has, without an hour of 00
-            let t = t.split('.').next().unwrap_or(t);
-            progress(&format!("{} so far", t.strip_prefix("00:").unwrap_or(t)));
+            progress(&so_far(t, length), false);
         }
     });
-    DOWNLOAD.lock().unwrap().1 = None;
+    // gone already: a stop killed it
+    let killed = DOWNLOAD.lock().unwrap().1.take().is_none();
     // ani-cli exits 0 even if yt-dlp failed, so the file is the only reliable signal
     match local_episodes(&dir).into_iter().find(|(e, _)| e == ep) {
         Some((_, file)) if silent(&file) => {
@@ -1143,13 +1167,40 @@ pub fn download(
             });
             Ok(())
         }
+        None if killed => Err(STOPPED.into()),
         None => Err(last_error(&stderr)),
     }
 }
 
-/// Stops the running download for good; yt-dlp resumes the .part file next time, ffmpeg
-/// (FAKE_FFMPEG) starts over. (Closing the terminal needs nothing: the hangup reaches our
-/// whole process group.)
+/// Holds downloads: the running one stops where it is, keeping what it got, and none starts
+/// until `resume`. Only while that's episode `ep` in `dir`, the one the user was asked about
+/// or saw: by the time the answer is handled the next may run, maybe through ffmpeg, which
+/// would start over unasked. False then, and nothing changes.
+pub fn pause(dir: &Path, ep: &str) -> bool {
+    let mut dl = DOWNLOAD.lock().unwrap();
+    if !(dl.1.as_ref()).is_some_and(|(_, d, e)| d == dir && e == ep) {
+        return false;
+    }
+    PAUSED.store(true, Ordering::Relaxed);
+    if let Some((pid, ..)) = dl.1.take() {
+        kill(pid);
+    }
+    true
+}
+
+/// Lets downloads go on after `pause`; the caller wakes the worker. No lock: queue edits call
+/// this, and downloads take the queue's lock under DOWNLOAD's.
+pub fn resume() {
+    PAUSED.store(false, Ordering::Relaxed);
+}
+
+pub fn paused() -> bool {
+    PAUSED.load(Ordering::Relaxed)
+}
+
+/// Stops the running download for good; yt-dlp goes on from its .part files next time,
+/// ffmpeg (FAKE_FFMPEG) starts over. (Closing the terminal needs nothing: the
+/// hangup reaches our whole process group.)
 pub fn stop_download() {
     let mut dl = DOWNLOAD.lock().unwrap();
     dl.0 = true;
@@ -1206,6 +1257,23 @@ pub fn running(pid: &str) -> bool {
 /// better to leave a dead ani-hop's queue alone than take a live one's.
 fn held(lock: &Path) -> bool {
     fs::File::open(lock).is_ok_and(|f| f.try_lock_shared().is_err())
+}
+
+/// How much of the episode ffmpeg has (through FAKE_FFMPEG), as a share of its `length` in
+/// seconds once ffprobe told it, without an hour of 00.
+fn so_far(out_time: &str, length: Option<f64>) -> String {
+    let short = |t: &str| t.strip_prefix("00:").unwrap_or(t).to_string();
+    let t = out_time.split('.').next().unwrap_or(out_time);
+    let secs = (t.split(':')).try_fold(0.0, |s, x| x.parse().map(|x: f64| s * 60.0 + x));
+    match (secs, length) {
+        (Ok(s), Some(l)) => {
+            let l = l as u64;
+            let of = short(&format!("{:02}:{:02}:{:02}", l / 3600, l / 60 % 60, l % 60));
+            let pct = (s / l as f64 * 100.0).min(100.0) as u32;
+            format!("{pct}% · {} of {of}", short(t))
+        }
+        _ => format!("{} so far", short(t)),
+    }
 }
 
 #[cfg(test)]
@@ -1395,6 +1463,11 @@ mod tests {
         file.lock().unwrap();
         assert!(held(&path));
         drop(file);
+        // a process another test forks right then holds the file too, until its exec closes it
+        let start = std::time::Instant::now();
+        while held(&path) && start.elapsed().as_secs() < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(!held(&path));
         fs::remove_file(&path).unwrap();
         assert!(!held(&path));
@@ -1542,15 +1615,36 @@ mod tests {
     }
 
     #[test]
+    fn download_progress_says_how_far_along() {
+        assert_eq!(
+            so_far("00:26:16.123456", Some(1693.1)),
+            "93% · 26:16 of 28:13"
+        );
+        assert_eq!(
+            so_far("01:02:03.5", Some(4000.0)),
+            "93% · 01:02:03 of 01:06:40"
+        );
+        assert_eq!(so_far("00:28:14.0", Some(1693.1)), "100% · 28:14 of 28:13");
+        assert_eq!(so_far("00:06:45.000000", None), "06:45 so far");
+    }
+
+    #[test]
     fn fake_ffmpeg_renames_only_finished_downloads() {
         let dir = std::env::temp_dir().join(format!("ani-hop-ffmpeg-{}", std::process::id()));
         let (fake, real) = (dir.join("fake"), dir.join("real"));
         // stands in for the real one: logs its arguments, writes its last one, warns $WARN
-        let logger = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LOG\"\nfor a; do o=$a; done\n: > \"$o\"\n[ -z \"$WARN\" ] || echo \"$WARN\" >&2\nexit $CODE\n";
-        for (bin, script) in [(&fake, FAKE_FFMPEG), (&real, logger)] {
+        // (with $SLOW it keeps going, its pid in $LOG.ffmpeg)
+        let logger = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LOG\"\nfor a; do o=$a; done\n: > \"$o\"\n[ -z \"$SLOW\" ] || { echo $$ > \"$LOG.ffmpeg\"; exec sleep 60; }\n[ -z \"$WARN\" ] || echo \"$WARN\" >&2\nexit $CODE\n";
+        // and the real ffprobe: says what it was asked as the length, or with $HANG never answers
+        let probe = "#!/bin/sh\n[ -z \"$HANG\" ] || { echo $$ > \"$LOG.probe\"; exec sleep 60; }\necho \"duration=$*\"\n";
+        for (bin, name, script) in [
+            (&fake, "ffmpeg", FAKE_FFMPEG),
+            (&real, "ffmpeg", logger),
+            (&real, "ffprobe", probe),
+        ] {
             fs::create_dir_all(bin).unwrap();
-            fs::write(bin.join("ffmpeg"), script).unwrap();
-            fs::set_permissions(bin.join("ffmpeg"), fs::Permissions::from_mode(0o755)).unwrap();
+            fs::write(bin.join(name), script).unwrap();
+            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
         }
         let (log, out) = (dir.join("log"), dir.join("A Episode 1.mp4"));
         let part = dir.join("A Episode 1.mp4.part");
@@ -1567,36 +1661,122 @@ mod tests {
                 .output()
                 .unwrap();
             let err = String::from_utf8_lossy(&o.stderr).into_owned();
-            (o.status.success(), fs::read_to_string(&log).unwrap(), err)
+            let length = String::from_utf8_lossy(&o.stdout).into_owned();
+            (
+                o.status.success(),
+                fs::read_to_string(&log).unwrap(),
+                err,
+                length,
+            )
         };
-        let ani_cli = ["-extension_picky", "0", "-i", "v.m3u8", "-c", "copy"];
-        let (ok, args, _) = run("0", "", &ani_cli);
+        // ani-cli's call for a show whose audio is a separate track
+        #[rustfmt::skip]
+        let ani_cli = ["-extension_picky", "0", "-referer", "r", "-i", "v.m3u8", "-extension_picky",
+            "0", "-referer", "r2", "-i", "a.m3u8", "-c", "copy"];
+        let (ok, args, _, length) = run("0", "", &ani_cli);
         assert!(ok && out.exists() && !part.exists());
+        let asked = "-v error -extension_picky 0 -referer r -show_entries format=duration";
+        assert_eq!(
+            length,
+            format!("duration={asked} -of default=nw=1 v.m3u8\n")
+        );
         assert!(args.ends_with(&format!("-f\nmp4\n{}\n", part.display())));
-        let (ok, _, _) = run("1", "", &ani_cli);
+        let (ok, _, _, _) = run("1", "", &ani_cli);
         assert!(
             !ok && !out.exists() && part.exists(),
             "a failed one stays .part"
         );
         // ffmpeg exits 0 after skipping a segment it couldn't get
         let skipped = "[in#0/hls @ 0x1] Segment 7 of playlist 0 failed too many times, skipping";
-        let (ok, _, err) = run("0", skipped, &ani_cli);
+        let (ok, _, err, _) = run("0", skipped, &ani_cli);
         assert!(!ok && !out.exists() && part.exists());
         assert!(err.starts_with(skipped) && err.ends_with("parts of it failed to download\n"));
         let broken = "[NULL @ 0x1] [error] Invalid NAL unit size (1234 > 567).";
-        let (ok, _, _) = run("0", broken, &ani_cli);
+        let (ok, _, _, _) = run("0", broken, &ani_cli);
         assert!(
             !ok && !out.exists() && part.exists(),
             "errors in what it got"
         );
-        let (ok, _, _) = run("0", "[mp4 @ 0x1] [warning] Non-monotonic DTS", &ani_cli);
+        // a probe that never answers doesn't keep the download from ending
+        let start = std::time::Instant::now();
+        let o = Command::new(fake.join("ffmpeg"))
+            .args(ani_cli)
+            .arg(&out)
+            .env(
+                "PATH",
+                format!("{}:{}:/usr/bin:/bin", fake.display(), real.display()),
+            )
+            .env("LOG", &log)
+            .env("CODE", "0")
+            .env("HANG", "1")
+            .output()
+            .unwrap();
+        assert!(o.status.success() && start.elapsed().as_secs() < 30);
+        // stopped (pause, stop, quit): the .part stays for the next try to replace, ffmpeg and
+        // ffprobe go
+        let _ = fs::remove_file(&out);
+        let mut shim = Command::new(fake.join("ffmpeg"))
+            .args(ani_cli)
+            .arg(&out)
+            .env(
+                "PATH",
+                format!("{}:{}:/usr/bin:/bin", fake.display(), real.display()),
+            )
+            .env("LOG", &log)
+            .env("CODE", "0")
+            .env("SLOW", "1")
+            .env("HANG", "1")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = |name: &str| fs::read_to_string(dir.join(format!("log.{name}"))).ok();
+        let gone = |p: &str| {
+            !Command::new("kill")
+                .args(["-0", p.trim()])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let wait_for = |done: &dyn Fn() -> bool| {
+            let start = std::time::Instant::now();
+            while !done() && start.elapsed().as_secs() < 10 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            done()
+        };
+        assert!(wait_for(
+            &|| pid("ffmpeg").is_some() && pid("probe").is_some()
+        ));
+        let id = shim.id().to_string();
+        Command::new("kill").args(["-TERM", &id]).status().unwrap();
+        assert!(!shim.wait().unwrap().success());
+        assert!(part.exists() && !out.exists() && !dir.join("A Episode 1.mp4.part.log").exists());
+        for name in ["ffmpeg", "probe"] {
+            let p = pid(name).unwrap();
+            assert!(wait_for(&|| gone(&p)), "{name} is gone");
+        }
+        let (ok, _, _, _) = run("0", "[mp4 @ 0x1] [warning] Non-monotonic DTS", &ani_cli);
         assert!(ok && out.exists(), "the muxer's warnings lose nothing");
         assert!(!dir.join("A Episode 1.mp4.part.log").exists());
         // yt-dlp's own calls (merging, fixups) go through untouched
-        let (ok, args, _) = run("0", "", &["-y", "-i", "v.mp4"]);
+        let (ok, args, _, _) = run("0", "", &["-y", "-i", "v.mp4"]);
         assert!(ok && out.exists());
         assert_eq!(args, format!("-y\n-i\nv.mp4\n{}\n", out.display()));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pause_asked_about_one_episode_leaves_the_next_alone() {
+        let dir = Path::new("/tmp/ani-hop-pause-test/Show");
+        let mut sleep = Command::new("sleep").arg("30").spawn().unwrap();
+        DOWNLOAD.lock().unwrap().1 = Some((sleep.id(), dir.to_path_buf(), "2".into()));
+        // asked about 1, which finished; 2 runs now
+        assert!(!pause(dir, "1") && !paused());
+        assert!(DOWNLOAD.lock().unwrap().1.is_some());
+        assert!(pause(dir, "2") && paused());
+        assert!(DOWNLOAD.lock().unwrap().1.is_none());
+        assert!(!sleep.wait().unwrap().success(), "2 was stopped");
+        resume();
     }
 
     #[test]

@@ -14,7 +14,7 @@ A fast terminal UI for anime: browse trending, top rated and search results, the
 | **Posters in the terminal** | Drawn with the Kitty graphics protocol, even inside tmux/herdr. |
 | **AniList built in** | Your lists, watched episodes marked, and progress saved after every episode. |
 | **Find an episode by what happens in it** | Watched episodes show their title and summary, and the filter searches them. Episodes you haven't seen stay blank, so nothing spoils. |
-| **Downloads in the background** | Keep browsing while they run; unfinished ones resume after a restart. |
+| **Downloads in the background** | Keep browsing while they run, or pause them; unfinished ones come back after a restart. |
 | **Sub or dub** | Japanese or the English dub, each with or without English subtitles, for all shows or just one. Downloads follow the choice; if an episode has no dub yet, the stream falls back to subtitles. |
 | **Skips openings and endings** | With ani-skip, in streams and downloads alike; switch it off in the settings. |
 
