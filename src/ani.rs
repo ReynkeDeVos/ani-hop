@@ -1083,15 +1083,13 @@ pub fn download(
     mut progress: impl FnMut(&str),
 ) -> Result<(), String> {
     let dir = folder(m);
-    if local_episodes(&dir).iter().any(|(e, _)| e == ep) {
-        return Ok(()); // yt-dlp wouldn't replace it, so it stays the audio it was
-    }
     let child = {
         let mut dl = DOWNLOAD.lock().unwrap();
         if dl.0 || !wanted() {
             return Err("stopped".into());
         }
-        // under the lock, so stopping another episode can't drop the folder in between
+        // under the lock, so stopping another episode can't drop the folder in between; also
+        // for an episode already there, so a folder found through ani-cli gets the AniList show
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         edit_index(|all| {
             let d = all.entry(dir.clone()).or_default();
@@ -1100,6 +1098,9 @@ pub fn download(
             }
         })
         .map_err(|e| e.to_string())?;
+        if local_episodes(&dir).iter().any(|(e, _)| e == ep) {
+            return Ok(()); // yt-dlp wouldn't replace it, so it stays the audio it was
+        }
         let child = ani_cli()
             .args(["-d", "-S", &src.index.to_string(), "-e", ep, &src.query])
             .env("ANI_CLI_DOWNLOAD_DIR", &dir)
