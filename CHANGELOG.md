@@ -2,6 +2,18 @@
 
 ## 0.6.4 – 2026-10-23
 
+### Added
+
+- ^f loads the next page of Trending now, Top rated and All-time popular from anywhere in the list, not only through "More…" at its end.
+
+### Changed
+
+- Trending now, Top rated and All-time popular stay cached for an hour with every page loaded through More…, so opening one again sends AniList no request. Before, only the first page was kept, for 2 minutes.
+- Empty lists say so, and errors say what failed: "Can't reach AniList (…)", the show that wasn't saved, the episode that didn't play, Change source… when ani-cli can't find a show.
+- The resume question says No deletes the partial files. Marking an episode watched says when that adds the show to Watching or moves it to Completed.
+- Each thing is said once: the screen's name in the breadcrumb, the AniList state in the header, an episode's start in its pop-up. Input screens no longer list keys that don't apply there.
+- "Default audio…" and "Audio for this show…" are now "Audio…", so the chosen audio fits. Footer keys follow the screen (esc clear, enter download), cut titles end in "…", and setup shows the full command it runs and marks ani-skip and posters as optional.
+
 ### Fixed
 
 - A download folder or source title with wide characters, like the Japanese `~/ビデオ`, no longer crashes the app at around 80 columns.
@@ -9,13 +21,6 @@
 - Going back from the screen for several marked shows keeps their marks.
 - Pasting the client secret instead of the client ID is refused; before, it blocked the AniList login until the saved ID was deleted by hand.
 - Starting offline no longer says the AniList login failed.
-
-### Changed
-
-- Empty lists say so, and errors say what failed: "Can't reach AniList (…)", the show that wasn't saved, the episode that didn't play, Change source… when ani-cli can't find a show.
-- The resume question says No deletes the partial files. Marking an episode watched says when that adds the show to Watching or moves it to Completed.
-- Each thing is said once: the screen's name in the breadcrumb, the AniList state in the header, an episode's start in its pop-up. Input screens no longer list keys that don't apply there.
-- "Default audio…" and "Audio for this show…" are now "Audio…", so the chosen audio fits. Footer keys follow the screen (esc clear, enter download), cut titles end in "…", and setup shows the full command it runs and marks ani-skip and posters as optional.
 
 ## 0.6.3 – 2026-10-22
 

@@ -336,6 +336,32 @@ fn list_cache(key: &str) -> PathBuf {
     ani::cache_dir().join("lists").join(format!("{key}.json"))
 }
 
+/// A cached list: its shows and, for a ranking, the page "More…" fetches next.
+type Cached = (Vec<Media>, Option<u32>);
+
+/// What a cached list shows when it opens, and whether that's fresh enough to skip AniList.
+/// A ranking hardly moves in an hour and keeps every page loaded; a list of yours changes as
+/// you watch, so 2 minutes. Past that only the first page shows, which the refresh replaces.
+fn from_cache(
+    cached: Option<Cached>,
+    age: Option<Duration>,
+    feed: &mut Feed,
+) -> (Vec<Media>, bool) {
+    let ttl = match feed {
+        Feed::Pages(..) => 60 * 60,
+        _ => 120,
+    };
+    let fresh = cached.is_some() && age.is_some_and(|a| a < Duration::from_secs(ttl));
+    let (mut list, next) = cached.unwrap_or_default();
+    if let Feed::Pages(_, n, _) = feed {
+        match fresh {
+            true => *n = next,
+            false => list.truncate(PER_PAGE),
+        }
+    }
+    (list, fresh)
+}
+
 fn client_id() -> Option<String> {
     fs::read_to_string(ani::config_dir().join("client_id"))
         .ok()
@@ -689,19 +715,19 @@ impl App {
     fn push_loading(
         &mut self,
         title: &str,
-        feed: Feed,
+        mut feed: Feed,
         cache: Option<String>,
         f: impl FnOnce() -> Result<Vec<Media>, String> + Send + 'static,
     ) {
         let path = cache.map(|k| list_cache(&k));
-        let cached: Option<Vec<Media>> = path.as_ref().and_then(|p| ani::read_json(p));
-        // fetched less than 2 minutes ago: good enough, saves AniList requests
+        let cached: Option<Cached> = path.as_ref().and_then(|p| ani::read_json(p));
         let age = path
             .as_ref()
             .and_then(|p| fs::metadata(p).ok()?.modified().ok()?.elapsed().ok());
-        let recent = cached.is_some() && age.is_some_and(|a| a < Duration::from_secs(120));
-        let id = self.push(title, View::Shows(cached.unwrap_or_default(), feed));
-        if recent {
+        let (list, fresh) = from_cache(cached, age, &mut feed);
+        let paged = matches!(feed, Feed::Pages(..));
+        let id = self.push(title, View::Shows(list, feed));
+        if fresh {
             return;
         }
         self.top().loading = true;
@@ -709,7 +735,8 @@ impl App {
         self.spawn(move || {
             let res = f();
             if let (Ok(list), Some(p)) = (&res, path) {
-                let _ = ani::write_json(&p, list);
+                let next = (paged && list.len() >= PER_PAGE).then_some(2);
+                let _ = ani::write_json(&p, &(list, next));
                 // a save landed while this was in flight: keep it, but not as fresh
                 if LIST_CHANGES.load(Ordering::Relaxed) != changes {
                     let file = fs::File::options().write(true).open(&p);
@@ -1135,9 +1162,13 @@ impl App {
         if k.kind == KeyEventKind::Release {
             return;
         }
-        if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c' | 'q'))
-        {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(k.code, KeyCode::Char('c' | 'q')) {
             return self.request_quit();
+        }
+        // the next page of a ranking from anywhere in it, not just on "More…" at its end
+        if ctrl && k.code == KeyCode::Char('f') {
+            return self.more();
         }
         match self.top().menu.key(k) {
             Some(Act::Accept) => self.accept(),
@@ -1195,21 +1226,10 @@ impl App {
                 _ => self.pop(1),
             },
             // marked shows don't count here, "More…" is what the cursor is on
-            View::Shows(_, Feed::Pages(sort, Some(page), fetching))
+            View::Shows(_, Feed::Pages(..))
                 if screen.menu.current().is_some_and(|i| i.key == "more") =>
             {
-                // one page at a time; the first one's refresh would drop what comes after it
-                match (screen.loading, *fetching) {
-                    (true, true) => return,
-                    (true, false) => return self.toast("Still refreshing the first page…", false),
-                    _ => {}
-                }
-                let (sort, page, id, c) = (sort.clone(), *page, screen.id, self.client.clone());
-                self.top().loading = true;
-                if let View::Shows(_, Feed::Pages(_, _, f)) = &mut self.top().view {
-                    *f = true;
-                }
-                self.spawn(move || Msg::More(id, c.browse(&sort, None, page)));
+                self.more()
             }
             View::Shows(list, _) => {
                 let picked: Vec<Media> = keys
@@ -1395,12 +1415,39 @@ impl App {
         }
     }
 
+    /// Fetches the next page of the ranking on top, as "More…" and ^f do.
+    fn more(&mut self) {
+        let screen = self.stack.last().unwrap();
+        let View::Shows(_, Feed::Pages(sort, next, fetching)) = &screen.view else {
+            return;
+        };
+        let Some(page) = *next else {
+            return self.toast("No more shows", false);
+        };
+        // one page at a time; the first one's refresh would drop what comes after it
+        match (screen.loading, *fetching) {
+            (true, true) => return,
+            (true, false) => return self.toast("Still refreshing the first page…", false),
+            _ => {}
+        }
+        let (sort, id, c) = (sort.clone(), screen.id, self.client.clone());
+        self.top().loading = true;
+        if let View::Shows(_, Feed::Pages(_, _, f)) = &mut self.top().view {
+            *f = true;
+        }
+        self.spawn(move || Msg::More(id, c.browse(&sort, None, page)));
+    }
+
+    /// Cache key of a ranking, per user: its entries carry that user's list status and progress.
+    fn ranking_key(&self, sort: &str) -> String {
+        format!("{}-{sort}", self.user.as_ref().map_or(0, |u| u.0))
+    }
+
     fn main_action(&mut self, key: &str, label: &str) {
         let c = self.client.clone();
         if let Some(sort) = key.strip_prefix("browse:") {
             let sort = sort.to_string();
-            // per user: entries carry that user's list status and progress
-            let cache = format!("{}-{sort}", self.user.as_ref().map_or(0, |u| u.0));
+            let cache = self.ranking_key(&sort);
             let feed = Feed::Pages(sort.clone(), Some(2), false);
             return self.push_loading(label, feed, Some(cache), move || c.browse(&sort, None, 1));
         }
@@ -1665,6 +1712,24 @@ impl App {
         }
     }
 
+    /// Caches a ranking with every page loaded. Its first page's age stays its freshness, so
+    /// loading more never keeps that page longer than an hour.
+    fn save_pages(&self, id: u64) {
+        let screen = self.stack.iter().find(|s| s.id == id);
+        let Some(View::Shows(list, Feed::Pages(sort, next, _))) = screen.map(|s| &s.view) else {
+            return;
+        };
+        let path = list_cache(&self.ranking_key(sort));
+        let fetched = fs::metadata(&path).and_then(|m| m.modified());
+        let _ = ani::write_json(&path, &(list, next));
+        if let Ok(t) = fetched {
+            let _ = fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_modified(t));
+        }
+    }
+
     /// Marks this user's cached lists as old, so the next visit shows them and refreshes.
     fn outdate_lists(&self) {
         LIST_CHANGES.fetch_add(1, Ordering::Relaxed);
@@ -1707,10 +1772,8 @@ impl App {
                     && self.stack.iter().any(|s| s.id == id);
                 self.fill(id, res, |v, list| {
                     if let View::Shows(l, feed) = v {
-                        if let Feed::Pages(_, next, _) = feed
-                            && list.len() < PER_PAGE
-                        {
-                            *next = None;
+                        if let Feed::Pages(_, next, _) = feed {
+                            *next = (list.len() >= PER_PAGE).then_some(2);
                         }
                         *l = list;
                     }
@@ -1740,6 +1803,7 @@ impl App {
                         first = Some(l.get(start).map(|m| m.id.to_string()));
                     }
                 });
+                self.save_pages(id);
                 match (first, self.stack.iter_mut().find(|s| s.id == id)) {
                     (Some(Some(key)), Some(s)) => s.menu.select_key(&key),
                     (Some(None), Some(_)) => self.toast("No more shows", false),
@@ -1943,6 +2007,35 @@ mod tests {
             "abc.def"
         );
         assert_eq!(super::parse_token("  abc.def \n"), "abc.def");
+    }
+
+    #[test]
+    fn rankings_keep_their_pages_for_an_hour() {
+        use super::{Feed, Media, from_cache};
+        use std::time::Duration;
+        let min = |m: u64| Some(Duration::from_secs(m * 60));
+        let pages = || Some((vec![Media::default(); 120], Some(4)));
+        let mut feed = Feed::Pages("TRENDING_DESC".into(), Some(2), false);
+        let (list, fresh) = from_cache(pages(), min(59), &mut feed);
+        assert!(fresh && list.len() == 120);
+        assert!(
+            matches!(feed, Feed::Pages(_, Some(4), _)),
+            "More… goes on with page 4"
+        );
+        let mut feed = Feed::Pages("TRENDING_DESC".into(), Some(2), false);
+        let (list, fresh) = from_cache(pages(), min(61), &mut feed);
+        assert!(
+            !fresh && list.len() == 50,
+            "past the hour: page 1, refreshed"
+        );
+        assert!(matches!(feed, Feed::Pages(_, Some(2), _)));
+        let (list, fresh) = from_cache(pages(), min(3), &mut Feed::Whole);
+        assert!(
+            !fresh && list.len() == 120,
+            "your own lists: 2 minutes, all shown"
+        );
+        let (list, fresh) = from_cache(None, None, &mut Feed::Whole);
+        assert!(!fresh && list.is_empty());
     }
 
     #[test]

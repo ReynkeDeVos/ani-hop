@@ -629,6 +629,7 @@ fn banner(app: &App) -> Vec<Line<'static>> {
         key("←↓↑→ ^hjkl", "back, down, up, select"),
         key("tab", "mark for bulk actions"),
         key("^a", "mark all"),
+        key("^f", "more of a ranking"),
         key("enter", "select"),
         key("esc", "clear filter / back"),
         key("^c", "quit"),
@@ -801,6 +802,9 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     let mut keys = vec![("enter", enter), ("esc", esc)];
     if screen.menu.multi && !screen.menu.items.is_empty() {
         keys.splice(0..0, [("tab", "mark"), ("^a", "all")]);
+    }
+    if matches!(screen.view, View::Shows(_, Feed::Pages(_, Some(_), _))) {
+        keys.insert(keys.len() - 2, ("^f", "more")); // before enter and esc
     }
     keys.push(("^c", "quit"));
     let hints = Line::from(
