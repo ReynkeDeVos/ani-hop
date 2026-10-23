@@ -955,11 +955,15 @@ impl App {
             self.toast(format!("Stopped downloading {}", which(&stop)), false);
             self.stop(&m, &stop);
         } else if action == "pause" && hold && !ani::paused() {
-            ani::pause(None);
-            self.toast(
-                "Paused downloads · enter on a queued episode resumes them",
-                false,
-            );
+            // the one it was offered for (holds: dl_now); one that started since may be
+            // ffmpeg's, whose pause asks first
+            let ep = self.dl_now.as_ref().map_or("", |n| n.ep.as_str());
+            if ani::pause(&ani::folder(&m), ep) {
+                self.toast(
+                    "Paused downloads · enter on a queued episode resumes them",
+                    false,
+                );
+            }
         } else if action == "resume" && ani::paused() {
             ani::resume();
             let _ = self.dl_wake.send(());
@@ -1784,7 +1788,7 @@ impl App {
                         // only the episode it warned about; one that started since would
                         // start over unasked. Checked where it runs: its messages may not be
                         // here yet.
-                        if ani::pause(Some((&ani::folder(m), ep))) {
+                        if ani::pause(&ani::folder(m), ep) {
                             self.toast(
                                 "Paused downloads · enter on a queued episode resumes them",
                                 false,

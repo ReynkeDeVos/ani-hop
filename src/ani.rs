@@ -1173,13 +1173,12 @@ pub fn download(
 }
 
 /// Holds downloads: the running one stops where it is, keeping what it got, and none starts
-/// until `resume`. With `only` (folder, episode), just while that's the one running, since a
-/// question about it may be answered after the next one started; false then.
-pub fn pause(only: Option<(&Path, &str)>) -> bool {
+/// until `resume`. Only while that's episode `ep` in `dir`, the one the user was asked about
+/// or saw: by the time the answer is handled the next may run, maybe through ffmpeg, which
+/// would start over unasked. False then, and nothing changes.
+pub fn pause(dir: &Path, ep: &str) -> bool {
     let mut dl = DOWNLOAD.lock().unwrap();
-    let running =
-        |(dir, ep): (&Path, &str)| (dl.1.as_ref()).is_some_and(|(_, d, e)| d == dir && e == ep);
-    if only.is_some_and(|o| !running(o)) {
+    if !(dl.1.as_ref()).is_some_and(|(_, d, e)| d == dir && e == ep) {
         return false;
     }
     PAUSED.store(true, Ordering::Relaxed);
@@ -1772,9 +1771,9 @@ mod tests {
         let mut sleep = Command::new("sleep").arg("30").spawn().unwrap();
         DOWNLOAD.lock().unwrap().1 = Some((sleep.id(), dir.to_path_buf(), "2".into()));
         // asked about 1, which finished; 2 runs now
-        assert!(!pause(Some((dir, "1"))) && !paused());
+        assert!(!pause(dir, "1") && !paused());
         assert!(DOWNLOAD.lock().unwrap().1.is_some());
-        assert!(pause(Some((dir, "2"))) && paused());
+        assert!(pause(dir, "2") && paused());
         assert!(DOWNLOAD.lock().unwrap().1.is_none());
         assert!(!sleep.wait().unwrap().success(), "2 was stopped");
         resume();
