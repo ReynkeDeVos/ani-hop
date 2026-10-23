@@ -127,7 +127,8 @@ pub struct Job {
 }
 
 enum Msg {
-    Shows(u64, Result<Vec<Media>, String>),
+    /// a list's shows, and where to cache them with LIST_CHANGES from when it was asked for
+    Shows(u64, Result<Vec<Media>, String>, Option<(PathBuf, u64)>),
     /// the next page of a ranking
     More(u64, Result<Vec<Media>, String>),
     Hits(u64, Result<Vec<String>, String>),
@@ -210,17 +211,21 @@ pub struct App {
 
 fn main() -> std::io::Result<()> {
     // no options beyond these, everything else happens in the UI
+    let usage =
+        "Usage: ani-hop [--version | --help]\nStarts the terminal UI, everything happens in there.";
     match std::env::args().nth(1).as_deref() {
         None => {}
         Some("-V" | "--version") => {
             println!("ani-hop {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        Some("-h" | "--help") => {
+            println!("{usage}");
+            return Ok(());
+        }
         Some(arg) => {
-            println!(
-                "Usage: ani-hop [--version]\nStarts the terminal UI, everything happens in there."
-            );
-            std::process::exit(if matches!(arg, "-h" | "--help") { 0 } else { 2 });
+            eprintln!("ani-hop: unknown option {arg}\n{usage}");
+            std::process::exit(2);
         }
     }
     ani::setup()?;
@@ -330,6 +335,32 @@ fn user_path() -> PathBuf {
 
 fn list_cache(key: &str) -> PathBuf {
     ani::cache_dir().join("lists").join(format!("{key}.json"))
+}
+
+/// A cached list: its shows and, for a ranking, the page "More…" fetches next.
+type Cached = (Vec<Media>, Option<u32>);
+
+/// What a cached list shows when it opens, and whether that's fresh enough to skip AniList.
+/// A ranking hardly moves in an hour and keeps every page loaded; a list of yours changes as
+/// you watch, so 2 minutes. Past that only the first page shows, which the refresh replaces.
+fn from_cache(
+    cached: Option<Cached>,
+    age: Option<Duration>,
+    feed: &mut Feed,
+) -> (Vec<Media>, bool) {
+    let ttl = match feed {
+        Feed::Pages(..) => 60 * 60,
+        _ => 120,
+    };
+    let fresh = cached.is_some() && age.is_some_and(|a| a < Duration::from_secs(ttl));
+    let (mut list, next) = cached.unwrap_or_default();
+    if let Feed::Pages(_, n, _) = feed {
+        match fresh {
+            true => *n = next,
+            false => list.truncate(PER_PAGE),
+        }
+    }
+    (list, fresh)
 }
 
 fn client_id() -> Option<String> {
@@ -624,7 +655,7 @@ impl App {
                 ),
                 true,
             ),
-            (true, None) => self.toast("All set: every tool is installed", false),
+            (true, None) => self.toast("All set: everything ani-hop needs is installed", false),
         }
         self.refresh();
     }
@@ -685,35 +716,23 @@ impl App {
     fn push_loading(
         &mut self,
         title: &str,
-        feed: Feed,
+        mut feed: Feed,
         cache: Option<String>,
         f: impl FnOnce() -> Result<Vec<Media>, String> + Send + 'static,
     ) {
         let path = cache.map(|k| list_cache(&k));
-        let cached: Option<Vec<Media>> = path.as_ref().and_then(|p| ani::read_json(p));
-        // fetched less than 2 minutes ago: good enough, saves AniList requests
+        let cached: Option<Cached> = path.as_ref().and_then(|p| ani::read_json(p));
         let age = path
             .as_ref()
             .and_then(|p| fs::metadata(p).ok()?.modified().ok()?.elapsed().ok());
-        let recent = cached.is_some() && age.is_some_and(|a| a < Duration::from_secs(120));
-        let id = self.push(title, View::Shows(cached.unwrap_or_default(), feed));
-        if recent {
+        let (list, fresh) = from_cache(cached, age, &mut feed);
+        let id = self.push(title, View::Shows(list, feed));
+        if fresh {
             return;
         }
         self.top().loading = true;
-        let changes = LIST_CHANGES.load(Ordering::Relaxed);
-        self.spawn(move || {
-            let res = f();
-            if let (Ok(list), Some(p)) = (&res, path) {
-                let _ = ani::write_json(&p, list);
-                // a save landed while this was in flight: keep it, but not as fresh
-                if LIST_CHANGES.load(Ordering::Relaxed) != changes {
-                    let file = fs::File::options().write(true).open(&p);
-                    let _ = file.map(|f| f.set_modified(std::time::UNIX_EPOCH));
-                }
-            }
-            Msg::Shows(id, res)
-        });
+        let cache = path.map(|p| (p, LIST_CHANGES.load(Ordering::Relaxed)));
+        self.spawn(move || Msg::Shows(id, f(), cache));
     }
 
     fn pop(&mut self, n: usize) {
@@ -755,7 +774,6 @@ impl App {
         ui::effects_running(self)
             || self.stack.last().unwrap().loading
             || self.dl_pending > 0
-            || self.playing.as_ref().is_some_and(|p| p.step.is_some())
             || self
                 .toast
                 .as_ref()
@@ -882,11 +900,7 @@ impl App {
                     "Skip openings and endings",
                     if ani::skip_on() { "on" } else { "off" },
                 ),
-                Item::new(
-                    "audio",
-                    "Default audio…",
-                    ani::audio_label(ani::audio(None)),
-                ),
+                Item::new("audio", "Audio…", ani::audio_label(ani::audio(None))),
                 Item::new(
                     "folder",
                     "Download folder…",
@@ -898,7 +912,7 @@ impl App {
                         "Log out of AniList",
                         user.as_ref().map_or("", |u| u.1.as_str()),
                     ),
-                    (None, _) => Item::new("login", "Log in to AniList", ""),
+                    (None, _) => Item::new("login", "Log in to AniList…", ""),
                 },
             ],
             View::Setup => {
@@ -911,11 +925,7 @@ impl App {
                     v.push(Item::new("update", "Update ani-cli", cmd));
                 }
                 if self.user.is_none() {
-                    v.push(Item::new(
-                        "login",
-                        "Log in to AniList",
-                        "your lists + progress sync",
-                    ));
+                    v.push(Item::new("login", "Log in to AniList…", ""));
                 }
                 v.push(Item::new("continue", "Continue", ""));
                 v
@@ -988,11 +998,11 @@ impl App {
                         .as_ref()
                         .map(|e| list_label(&e.status))
                         .unwrap_or("not on list");
-                    v.push(Item::new("status", "★  List status…", status));
+                    v.push(Item::new("status", "●  List status…", status));
                 }
                 v.push(Item::new(
                     "audio",
-                    "♪  Audio for this show…",
+                    "♪  Audio…",
                     ani::audio_label(ani::audio(Some(m.id))),
                 ));
                 v.push(Item::new(
@@ -1058,7 +1068,11 @@ impl App {
                     .map(|(s, l)| Item::new(*s, *l, if cur == Some(s) { "current" } else { "" }))
                     .collect();
                 if cur.is_some() {
-                    v.push(Item::new("remove", "Remove from list", ""));
+                    v.push(Item::new(
+                        "remove",
+                        "Remove from list",
+                        "loses progress and score",
+                    ));
                 }
                 v
             }
@@ -1106,11 +1120,26 @@ impl App {
                 if local > 0 {
                     v.push(Item::new(
                         "delete",
-                        format!("✗  Delete downloads of {local} shows"),
+                        format!("✗  Delete downloads of {}", plural(local, "show")),
                         "",
                     ));
                 }
                 v
+            }
+            // No discards what was downloaded so far; esc asks again next start
+            View::Confirm(Pending::Resume(..)) => vec![
+                Item::new("no", "No", "deletes partial files"),
+                Item::new("yes", "Yes", ""),
+            ],
+            View::Confirm(Pending::Progress(m, ep)) => {
+                // marking it watched can also put the show on another list
+                let to = progress_status(m, ani::ep_num(ep) as u32);
+                let hint = match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
+                    Some(s) if s == to => String::new(),
+                    Some(_) => format!("moves it to {}", list_label(to)),
+                    None => format!("adds it to {}", list_label(to)),
+                };
+                vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
             }
             View::Confirm(_) => vec![Item::new("no", "No", ""), Item::new("yes", "Yes", "")],
             View::Input(_) => Vec::new(),
@@ -1121,9 +1150,13 @@ impl App {
         if k.kind == KeyEventKind::Release {
             return;
         }
-        if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c' | 'q'))
-        {
+        let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(k.code, KeyCode::Char('c' | 'q')) {
             return self.request_quit();
+        }
+        // the next page of a ranking from anywhere in it, not just on "More…" at its end
+        if ctrl && k.code == KeyCode::Char('f') {
+            return self.more();
         }
         match self.top().menu.key(k) {
             Some(Act::Accept) => self.accept(),
@@ -1181,31 +1214,21 @@ impl App {
                 _ => self.pop(1),
             },
             // marked shows don't count here, "More…" is what the cursor is on
-            View::Shows(_, Feed::Pages(sort, Some(page), fetching))
+            View::Shows(_, Feed::Pages(..))
                 if screen.menu.current().is_some_and(|i| i.key == "more") =>
             {
-                // one page at a time; the first one's refresh would drop what comes after it
-                match (screen.loading, *fetching) {
-                    (true, true) => return,
-                    (true, false) => return self.toast("Still refreshing the first page…", false),
-                    _ => {}
-                }
-                let (sort, page, id, c) = (sort.clone(), *page, screen.id, self.client.clone());
-                self.top().loading = true;
-                if let View::Shows(_, Feed::Pages(_, _, f)) = &mut self.top().view {
-                    *f = true;
-                }
-                self.spawn(move || Msg::More(id, c.browse(&sort, None, page)));
+                self.more()
             }
             View::Shows(list, _) => {
                 let picked: Vec<Media> = keys
                     .iter()
                     .filter_map(|k| list.iter().find(|m| m.id.to_string() == *k).cloned())
                     .collect();
-                self.top().menu.marked.clear();
+                // marks stay until the bulk action runs, so esc from it keeps them
                 if picked.len() > 1 {
                     self.push(format!("{} shows", picked.len()), View::Bulk(picked));
                 } else if let Some(m) = picked.into_iter().next() {
+                    self.top().menu.marked.clear();
                     self.open_show(m);
                 }
             }
@@ -1256,6 +1279,7 @@ impl App {
             }
             View::Status(m) => {
                 let (m, c) = (m.clone(), self.client.clone());
+                self.toast(format!("Saving {}…", m.name()), false);
                 match (key.as_str(), m.media_list_entry.as_ref().map(|e| e.id)) {
                     ("remove", Some(entry)) => {
                         self.saves_pending += 1;
@@ -1285,6 +1309,7 @@ impl App {
             View::Bulk(list) => {
                 let list = list.clone();
                 if key == "download" {
+                    let shows = plural(list.len(), "show");
                     for m in list {
                         self.download(Job {
                             media: m,
@@ -1293,8 +1318,9 @@ impl App {
                             dub: None,
                         });
                     }
-                    self.toast("Queued, looking up episodes…", false);
+                    self.toast(format!("Queued {shows}, looking up their episodes…"), false);
                     self.pop(1);
+                    self.top().menu.marked.clear();
                 } else {
                     let dirs: Vec<PathBuf> = list
                         .iter()
@@ -1360,14 +1386,11 @@ impl App {
                         let n = paths.len();
                         self.toast(format!("Deleted {} of {n}", n - failed), failed > 0);
                         self.pop(2);
+                        self.top().menu.marked.clear();
                     }
                     Pending::Progress(m, ep) => {
                         let (m, ep, c) = (m.clone(), ani::ep_num(ep) as u32, self.client.clone());
-                        let status = match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
-                            _ if m.episodes == Some(ep) => "COMPLETED",
-                            Some("REPEATING") => "REPEATING",
-                            _ => "CURRENT",
-                        };
+                        let status = progress_status(&m, ep);
                         self.saves_pending += 1;
                         self.spawn(move || {
                             Msg::Saved(m.clone(), c.save(m.id, Some(status), Some(ep)).map(Some))
@@ -1380,12 +1403,39 @@ impl App {
         }
     }
 
+    /// Fetches the next page of the ranking on top, as "More…" and ^f do.
+    fn more(&mut self) {
+        let screen = self.stack.last().unwrap();
+        let View::Shows(_, Feed::Pages(sort, next, fetching)) = &screen.view else {
+            return;
+        };
+        let Some(page) = *next else {
+            return self.toast("No more shows", false);
+        };
+        // one page at a time; the first one's refresh would drop what comes after it
+        match (screen.loading, *fetching) {
+            (true, true) => return,
+            (true, false) => return self.toast("Still refreshing the first page…", false),
+            _ => {}
+        }
+        let (sort, id, c) = (sort.clone(), screen.id, self.client.clone());
+        self.top().loading = true;
+        if let View::Shows(_, Feed::Pages(_, _, f)) = &mut self.top().view {
+            *f = true;
+        }
+        self.spawn(move || Msg::More(id, c.browse(&sort, None, page)));
+    }
+
+    /// Cache key of a ranking, per user: its entries carry that user's list status and progress.
+    fn ranking_key(&self, sort: &str) -> String {
+        format!("{}-{sort}", self.user.as_ref().map_or(0, |u| u.0))
+    }
+
     fn main_action(&mut self, key: &str, label: &str) {
         let c = self.client.clone();
         if let Some(sort) = key.strip_prefix("browse:") {
             let sort = sort.to_string();
-            // per user: entries carry that user's list status and progress
-            let cache = format!("{}-{sort}", self.user.as_ref().map_or(0, |u| u.0));
+            let cache = self.ranking_key(&sort);
             let feed = Feed::Pages(sort.clone(), Some(2), false);
             return self.push_loading(label, feed, Some(cache), move || c.browse(&sort, None, 1));
         }
@@ -1451,13 +1501,20 @@ impl App {
         match input {
             Input::Search => {
                 let c = self.client.clone();
-                let title = format!("Search: {text}");
+                let title = text.clone();
                 self.push_loading(&title, Feed::Whole, None, move || {
                     let found = c.browse("SEARCH_MATCH", Some(&text), 1);
                     ani::or_ani_cli(found, &text, ani::search)
                 });
             }
             Input::ClientId => {
+                // AniList shows a secret right next to it, and a saved wrong one blocks login
+                if !text.chars().all(|c| c.is_ascii_digit()) {
+                    return self.toast(
+                        "The client ID is the number AniList shows, not the secret",
+                        true,
+                    );
+                }
                 if let Err(e) = write_private(&ani::config_dir().join("client_id"), &text) {
                     return self.toast(e.to_string(), true);
                 }
@@ -1533,14 +1590,14 @@ impl App {
         if self.fresh.contains(&m.id) {
             return;
         }
+        if matches!(want, Some(Want::Episodes(_))) {
+            self.toast(format!("Searching ani-cli for {}…", m.name()), false);
+        }
         if let Some(slot) = self.resolving.get_mut(&m.id) {
             if want.is_some() {
                 *slot = want;
             }
             return;
-        }
-        if want.is_some() {
-            self.toast(format!("Searching ani-cli for {}…", m.name()), false);
         }
         self.resolving.insert(m.id, want);
         let m = m.clone();
@@ -1587,7 +1644,8 @@ impl App {
         self.playing = Some(Playing {
             id: m.id,
             ep: ep.clone(),
-            title: format!("{} · Episode {ep}", m.name()),
+            // the number first: a long title loses its end, not the episode
+            title: format!("Episode {ep} · {}", m.name()),
             step: Some(step),
             since: Instant::now(),
             color: m.cover_image.color.clone(),
@@ -1642,6 +1700,24 @@ impl App {
         }
     }
 
+    /// Caches a ranking with every page loaded. Its first page's age stays its freshness, so
+    /// loading more never keeps that page longer than an hour.
+    fn save_pages(&self, id: u64) {
+        let screen = self.stack.iter().find(|s| s.id == id);
+        let Some(View::Shows(list, Feed::Pages(sort, next, _))) = screen.map(|s| &s.view) else {
+            return;
+        };
+        let path = list_cache(&self.ranking_key(sort));
+        let fetched = fs::metadata(&path).and_then(|m| m.modified());
+        let _ = ani::write_json(&path, &(list, next));
+        if let Ok(t) = fetched {
+            let _ = fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|f| f.set_modified(t));
+        }
+    }
+
     /// Marks this user's cached lists as old, so the next visit shows them and refreshes.
     fn outdate_lists(&self) {
         LIST_CHANGES.fetch_add(1, Ordering::Relaxed);
@@ -1677,24 +1753,39 @@ impl App {
 
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Shows(id, res) => {
+            Msg::Shows(id, res, cache) => {
                 let fallback = res
                     .as_ref()
                     .is_ok_and(|l| l.iter().any(|m| !m.on_anilist()))
                     && self.stack.iter().any(|s| s.id == id);
+                let fetched = res.is_ok();
                 self.fill(id, res, |v, list| {
                     if let View::Shows(l, feed) = v {
-                        if let Feed::Pages(_, next, _) = feed
-                            && list.len() < PER_PAGE
-                        {
-                            *next = None;
+                        if let Feed::Pages(_, next, _) = feed {
+                            *next = (list.len() >= PER_PAGE).then_some(2);
                         }
                         *l = list;
                     }
                 });
+                // cached only for a screen still open: a closed one's late answer would
+                // overwrite what a newer one cached, its pages from More… too
+                let screen = self.stack.iter().find(|s| s.id == id);
+                if let (true, Some((path, changes)), Some(View::Shows(list, feed))) =
+                    (fetched, cache, screen.map(|s| &s.view))
+                {
+                    let next = match feed {
+                        Feed::Pages(_, next, _) => *next,
+                        _ => None,
+                    };
+                    let _ = ani::write_json(&path, &(list, next));
+                    // a save landed while this was in flight: keep it, but not as fresh
+                    if LIST_CHANGES.load(Ordering::Relaxed) != changes {
+                        let file = fs::File::options().write(true).open(&path);
+                        let _ = file.map(|f| f.set_modified(std::time::UNIX_EPOCH));
+                    }
+                }
                 if fallback {
-                    let text = "AniList search failed, showing ani-cli's matches without posters or details";
-                    self.toast(text, true);
+                    self.toast("AniList search failed, showing ani-cli's matches", true);
                 }
             }
             Msg::More(id, res) => {
@@ -1718,6 +1809,7 @@ impl App {
                         first = Some(l.get(start).map(|m| m.id.to_string()));
                     }
                 });
+                self.save_pages(id);
                 match (first, self.stack.iter_mut().find(|s| s.id == id)) {
                     (Some(Some(key)), Some(s)) => s.menu.select_key(&key),
                     (Some(None), Some(_)) => self.toast("No more shows", false),
@@ -1755,8 +1847,10 @@ impl App {
                 if e.contains("Invalid token") || e.contains("Unauthorized") {
                     self.log_out();
                     self.back_to_main();
+                    self.toast("AniList rejected the login, log in again", true);
+                } else {
+                    self.toast(e, true);
                 }
-                self.toast(format!("AniList login failed: {e}"), true);
                 self.refresh();
             }
             Msg::EpInfo(id, eps) => {
@@ -1805,7 +1899,14 @@ impl App {
                             _ => {}
                         }
                     }
-                    Err(e) if want.is_some() || here => self.toast(format!("ani-cli: {e}"), true),
+                    Err(e) if want.is_some() || here => {
+                        // the provider may call it something else: picking it by hand fixes that
+                        let tip = match e.starts_with("No results") {
+                            true => " · try Change source…",
+                            false => "",
+                        };
+                        self.toast(format!("ani-cli: {e}{tip}"), true)
+                    }
                     Err(_) => {}
                 }
                 // same pop-up, it doesn't pop in a second time
@@ -1820,7 +1921,11 @@ impl App {
                 self.saves_pending -= 1;
                 match res {
                     Ok(entry) => {
-                        self.toast(format!("Saved {}", m.name()), false);
+                        let text = match entry {
+                            Some(_) => format!("Saved {}", m.name()),
+                            None => format!("Removed {} from your list", m.name()),
+                        };
+                        self.toast(text, false);
                         self.update_media(m.id, entry);
                         self.outdate_lists();
                         if matches!(self.top().view, View::Status(_)) {
@@ -1828,7 +1933,7 @@ impl App {
                         }
                         self.refresh();
                     }
-                    Err(e) => self.toast(e, true),
+                    Err(e) => self.toast(format!("{} not saved · {e}", m.name()), true),
                 }
             }
             Msg::PlayStep(id, ep, step) => {
@@ -1848,7 +1953,7 @@ impl App {
                     self.playing = None;
                 }
                 match res {
-                    Err(e) => self.toast(e, true),
+                    Err(e) => self.toast(format!("Couldn't play episode {ep} · {e}"), true),
                     Ok(())
                         if self.user.is_some()
                             && m.on_anilist()
@@ -1881,6 +1986,15 @@ pub fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
+/// The list a show is on once episode `ep` is marked watched.
+fn progress_status(m: &Media, ep: u32) -> &'static str {
+    match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
+        _ if m.episodes == Some(ep) => "COMPLETED",
+        Some("REPEATING") => "REPEATING",
+        _ => "CURRENT",
+    }
+}
+
 pub fn list_label(status: &str) -> &'static str {
     LISTS
         .iter()
@@ -1899,5 +2013,57 @@ mod tests {
             "abc.def"
         );
         assert_eq!(super::parse_token("  abc.def \n"), "abc.def");
+    }
+
+    #[test]
+    fn rankings_keep_their_pages_for_an_hour() {
+        use super::{Feed, Media, from_cache};
+        use std::time::Duration;
+        let min = |m: u64| Some(Duration::from_secs(m * 60));
+        let pages = || Some((vec![Media::default(); 120], Some(4)));
+        let mut feed = Feed::Pages("TRENDING_DESC".into(), Some(2), false);
+        let (list, fresh) = from_cache(pages(), min(59), &mut feed);
+        assert!(fresh && list.len() == 120);
+        assert!(
+            matches!(feed, Feed::Pages(_, Some(4), _)),
+            "More… goes on with page 4"
+        );
+        let mut feed = Feed::Pages("TRENDING_DESC".into(), Some(2), false);
+        let (list, fresh) = from_cache(pages(), min(61), &mut feed);
+        assert!(
+            !fresh && list.len() == 50,
+            "past the hour: page 1, refreshed"
+        );
+        assert!(matches!(feed, Feed::Pages(_, Some(2), _)));
+        let (list, fresh) = from_cache(pages(), min(3), &mut Feed::Whole);
+        assert!(
+            !fresh && list.len() == 120,
+            "your own lists: 2 minutes, all shown"
+        );
+        let (list, fresh) = from_cache(None, None, &mut Feed::Whole);
+        assert!(!fresh && list.is_empty());
+    }
+
+    #[test]
+    fn watching_an_episode_picks_the_list() {
+        let mut m = super::Media {
+            episodes: Some(12),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::progress_status(&m, 3),
+            "CURRENT",
+            "not on a list yet"
+        );
+        assert_eq!(super::progress_status(&m, 12), "COMPLETED");
+        let entry = |status: &str| super::Entry {
+            id: 1,
+            status: status.into(),
+            progress: 2,
+        };
+        m.media_list_entry = Some(entry("REPEATING"));
+        assert_eq!(super::progress_status(&m, 3), "REPEATING");
+        m.media_list_entry = Some(entry("PAUSED"));
+        assert_eq!(super::progress_status(&m, 3), "CURRENT");
     }
 }
