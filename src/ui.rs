@@ -164,7 +164,7 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
             Span::raw(name.as_str()),
             " ".into(),
         ]),
-        None => Line::from(Span::styled("○ AniList not connected ", DIM)),
+        None => Line::from(Span::styled("○ not logged in to AniList ", DIM)),
     };
     let [crumbs_area, user_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(user.width() as u16)])
@@ -398,18 +398,19 @@ fn input_help(input: &Input) -> Text<'static> {
         Input::ClientId => vec![
             "One-time setup: ani-hop needs your own AniList API client.".into(),
             "".into(),
-            "1. Your browser opened anilist.co/settings/developer".into(),
+            "1. Open anilist.co/settings/developer".into(),
             "   → Create New Client".into(),
             "2. Name: ani-hop".into(),
+            "   Redirect URL:".into(),
             Line::from(vec![
-                "   Redirect URL: ".into(),
+                "   ".into(),
                 Span::styled(PIN_REDIRECT, Style::new().fg(ACCENT).not_dim()),
             ]),
             "3. Paste the client ID here and press enter.".into(),
         ],
         Input::Token => vec![
-            "Approve ani-hop in the browser tab that just opened,".into(),
-            "then paste the token AniList shows and press enter.".into(),
+            "Approve ani-hop in your browser, then paste".into(),
+            "the token AniList shows and press enter.".into(),
             "".into(),
             Line::styled(
                 "Pasting the whole redirect URL works too.",
@@ -417,8 +418,8 @@ fn input_help(input: &Input) -> Text<'static> {
             ),
         ],
         Input::SourceQuery(_) => vec![
-            "Search ani-cli's provider with this text,".into(),
-            "then pick the matching entry. The choice is remembered.".into(),
+            "Search ani-cli with this text, then pick the".into(),
+            "right entry. ani-hop remembers the choice.".into(),
         ],
         Input::DownloadDir => vec![
             "Where new downloads go. ~ works.".into(),
@@ -552,15 +553,18 @@ fn setup(app: &App) -> Vec<Line<'static>> {
         // shortcut: worded for Homebrew, the only way to land here on Linux or macOS; word
         // it per OS if another one is added
         let names: Vec<&str> = app.missing.iter().map(|d| d.0).collect();
+        let brew: Vec<&str> = (names.iter().copied())
+            .filter(|n| !matches!(*n, "ani-skip" | "xdg-open"))
+            .collect();
         v.push("".into());
-        v.push(Line::styled(
-            format!("Install: {}", names.join(" ")),
-            Color::Yellow,
-        ));
-        v.push(Line::styled(
-            "with Homebrew (brew.sh); ani-skip from github.com/synacktraa/ani-skip",
-            DIM,
-        ));
+        if !brew.is_empty() {
+            let text = format!("Install with Homebrew (brew.sh): {}", brew.join(" "));
+            v.push(Line::styled(text, Color::Yellow));
+        }
+        if names.contains(&"ani-skip") {
+            let text = "ani-skip (optional): github.com/synacktraa/ani-skip";
+            v.push(Line::styled(text, DIM));
+        }
         if names.contains(&"xdg-open") {
             // only on Linux (deps() leaves it out on macOS), and Homebrew has no xdg-utils
             v.push(Line::styled("xdg-open: xdg-utils from your distro", DIM));
@@ -581,13 +585,16 @@ fn setup(app: &App) -> Vec<Line<'static>> {
         });
     }
     v.extend(["".into(), Line::styled("AniList", Style::new().bold())]);
-    v.push(match &app.user {
-        Some((_, name)) => Line::from(vec![mark(true), format!("logged in as {name}").into()]),
-        None => Line::styled(
-            "  Log in to get Watching/Planning first and progress synced after each episode.",
-            DIM,
-        ),
-    });
+    match &app.user {
+        Some((_, name)) => v.push(Line::from(vec![
+            mark(true),
+            format!("logged in as {name}").into(),
+        ])),
+        None => v.extend([
+            Line::styled("  Log in to get Watching/Planning first", DIM),
+            Line::styled("  and progress saved after each episode.", DIM),
+        ]),
+    }
     v
 }
 
@@ -616,7 +623,8 @@ fn banner(app: &App) -> Vec<Line<'static>> {
     }
     v.push("".into());
     v.extend([
-        key("type", "filter, fzf syntax: 'exact ^start end$ !not"),
+        key("type", "filter, fzf syntax:"),
+        key("", "'exact ^start end$ !not"),
         key("←↓↑→ ^hjkl", "back, down, up, select"),
         key("tab", "mark for bulk actions"),
         key("^a", "mark all"),

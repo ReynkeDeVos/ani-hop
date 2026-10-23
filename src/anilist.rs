@@ -248,7 +248,9 @@ impl Client {
             if let Some(t) = &self.token {
                 req = req.header("Authorization", format!("Bearer {t}"));
             }
-            let mut res = req.send_json(&body).map_err(|e| e.to_string())?;
+            let mut res = req
+                .send_json(&body)
+                .map_err(|e| format!("Can't reach AniList ({e})"))?;
             let num = |k: &str| res.headers().get(k)?.to_str().ok()?.parse::<u64>().ok();
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -265,10 +267,9 @@ impl Client {
             if status == 429 {
                 continue;
             }
-            let mut res: Value = res
-                .body_mut()
-                .read_json()
-                .map_err(|_| "AniList: unexpected response".to_string())?;
+            let mut res: Value = res.body_mut().read_json().map_err(|_| {
+                format!("AniList: unexpected response (HTTP {status}), try again later")
+            })?;
             if let Some(err) = res["errors"][0]["message"].as_str() {
                 return Err(format!("AniList: {err}"));
             }

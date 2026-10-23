@@ -210,17 +210,21 @@ pub struct App {
 
 fn main() -> std::io::Result<()> {
     // no options beyond these, everything else happens in the UI
+    let usage =
+        "Usage: ani-hop [--version | --help]\nStarts the terminal UI, everything happens in there.";
     match std::env::args().nth(1).as_deref() {
         None => {}
         Some("-V" | "--version") => {
             println!("ani-hop {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
+        Some("-h" | "--help") => {
+            println!("{usage}");
+            return Ok(());
+        }
         Some(arg) => {
-            println!(
-                "Usage: ani-hop [--version]\nStarts the terminal UI, everything happens in there."
-            );
-            std::process::exit(if matches!(arg, "-h" | "--help") { 0 } else { 2 });
+            eprintln!("ani-hop: unknown option {arg}\n{usage}");
+            std::process::exit(2);
         }
     }
     ani::setup()?;
@@ -624,7 +628,7 @@ impl App {
                 ),
                 true,
             ),
-            (true, None) => self.toast("All set: every tool is installed", false),
+            (true, None) => self.toast("All set: everything ani-hop needs is installed", false),
         }
         self.refresh();
     }
@@ -1049,7 +1053,11 @@ impl App {
                     .map(|(s, l)| Item::new(*s, *l, if cur == Some(s) { "current" } else { "" }))
                     .collect();
                 if cur.is_some() {
-                    v.push(Item::new("remove", "Remove from list", ""));
+                    v.push(Item::new(
+                        "remove",
+                        "Remove from list",
+                        "loses progress and score",
+                    ));
                 }
                 v
             }
@@ -1097,11 +1105,26 @@ impl App {
                 if local > 0 {
                     v.push(Item::new(
                         "delete",
-                        format!("✗  Delete downloads of {local} shows"),
+                        format!("✗  Delete downloads of {}", plural(local, "show")),
                         "",
                     ));
                 }
                 v
+            }
+            // No discards what was downloaded so far; esc asks again next start
+            View::Confirm(Pending::Resume(..)) => vec![
+                Item::new("no", "No", "deletes partial files"),
+                Item::new("yes", "Yes", ""),
+            ],
+            View::Confirm(Pending::Progress(m, ep)) => {
+                // marking it watched can also put the show on another list
+                let to = progress_status(m, ani::ep_num(ep) as u32);
+                let hint = match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
+                    Some(s) if s == to => String::new(),
+                    Some(_) => format!("moves it to {}", list_label(to)),
+                    None => format!("adds it to {}", list_label(to)),
+                };
+                vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
             }
             View::Confirm(_) => vec![Item::new("no", "No", ""), Item::new("yes", "Yes", "")],
             View::Input(_) => Vec::new(),
@@ -1278,6 +1301,7 @@ impl App {
             View::Bulk(list) => {
                 let list = list.clone();
                 if key == "download" {
+                    let shows = plural(list.len(), "show");
                     for m in list {
                         self.download(Job {
                             media: m,
@@ -1286,7 +1310,7 @@ impl App {
                             dub: None,
                         });
                     }
-                    self.toast("Queued, looking up episodes…", false);
+                    self.toast(format!("Queued {shows}, looking up their episodes…"), false);
                     self.pop(1);
                     self.top().menu.marked.clear();
                 } else {
@@ -1358,11 +1382,7 @@ impl App {
                     }
                     Pending::Progress(m, ep) => {
                         let (m, ep, c) = (m.clone(), ani::ep_num(ep) as u32, self.client.clone());
-                        let status = match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
-                            _ if m.episodes == Some(ep) => "COMPLETED",
-                            Some("REPEATING") => "REPEATING",
-                            _ => "CURRENT",
-                        };
+                        let status = progress_status(&m, ep);
                         self.saves_pending += 1;
                         self.spawn(move || {
                             Msg::Saved(m.clone(), c.save(m.id, Some(status), Some(ep)).map(Some))
@@ -1757,8 +1777,10 @@ impl App {
                 if e.contains("Invalid token") || e.contains("Unauthorized") {
                     self.log_out();
                     self.back_to_main();
+                    self.toast("AniList rejected the login, log in again", true);
+                } else {
+                    self.toast(e, true);
                 }
-                self.toast(format!("AniList login failed: {e}"), true);
                 self.refresh();
             }
             Msg::EpInfo(id, eps) => {
@@ -1807,7 +1829,14 @@ impl App {
                             _ => {}
                         }
                     }
-                    Err(e) if want.is_some() || here => self.toast(format!("ani-cli: {e}"), true),
+                    Err(e) if want.is_some() || here => {
+                        // the provider may call it something else: picking it by hand fixes that
+                        let tip = match e.starts_with("No results") {
+                            true => " · try Change source…",
+                            false => "",
+                        };
+                        self.toast(format!("ani-cli: {e}{tip}"), true)
+                    }
                     Err(_) => {}
                 }
                 // same pop-up, it doesn't pop in a second time
@@ -1822,7 +1851,11 @@ impl App {
                 self.saves_pending -= 1;
                 match res {
                     Ok(entry) => {
-                        self.toast(format!("Saved {}", m.name()), false);
+                        let text = match entry {
+                            Some(_) => format!("Saved {}", m.name()),
+                            None => format!("Removed {} from your list", m.name()),
+                        };
+                        self.toast(text, false);
                         self.update_media(m.id, entry);
                         self.outdate_lists();
                         if matches!(self.top().view, View::Status(_)) {
@@ -1830,7 +1863,7 @@ impl App {
                         }
                         self.refresh();
                     }
-                    Err(e) => self.toast(e, true),
+                    Err(e) => self.toast(format!("{} not saved · {e}", m.name()), true),
                 }
             }
             Msg::PlayStep(id, ep, step) => {
@@ -1850,7 +1883,7 @@ impl App {
                     self.playing = None;
                 }
                 match res {
-                    Err(e) => self.toast(e, true),
+                    Err(e) => self.toast(format!("Couldn't play episode {ep} · {e}"), true),
                     Ok(())
                         if self.user.is_some()
                             && m.on_anilist()
@@ -1883,6 +1916,15 @@ pub fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
 
+/// The list a show is on once episode `ep` is marked watched.
+fn progress_status(m: &Media, ep: u32) -> &'static str {
+    match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
+        _ if m.episodes == Some(ep) => "COMPLETED",
+        Some("REPEATING") => "REPEATING",
+        _ => "CURRENT",
+    }
+}
+
 pub fn list_label(status: &str) -> &'static str {
     LISTS
         .iter()
@@ -1901,5 +1943,28 @@ mod tests {
             "abc.def"
         );
         assert_eq!(super::parse_token("  abc.def \n"), "abc.def");
+    }
+
+    #[test]
+    fn watching_an_episode_picks_the_list() {
+        let mut m = super::Media {
+            episodes: Some(12),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::progress_status(&m, 3),
+            "CURRENT",
+            "not on a list yet"
+        );
+        assert_eq!(super::progress_status(&m, 12), "COMPLETED");
+        let entry = |status: &str| super::Entry {
+            id: 1,
+            status: status.into(),
+            progress: 2,
+        };
+        m.media_list_entry = Some(entry("REPEATING"));
+        assert_eq!(super::progress_status(&m, 3), "REPEATING");
+        m.media_list_entry = Some(entry("PAUSED"));
+        assert_eq!(super::progress_status(&m, 3), "CURRENT");
     }
 }

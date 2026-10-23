@@ -167,7 +167,7 @@ const DEPS: [(&str, &str, &str); 7] = [
     ("ani-skip", "ani-skip-git", "skips openings and endings"),
     ("yt-dlp", "yt-dlp", "downloads episodes"),
     ("ffmpeg", "ffmpeg", "finishes downloads"),
-    ("curl", "curl", "ani-cli's requests"),
+    ("curl", "curl", "fetches pages for ani-cli"),
     ("xdg-open", "xdg-utils", "opens the AniList login"),
 ];
 
