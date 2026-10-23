@@ -467,7 +467,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         | View::Sources(m, ..)
         | View::Input(Input::SourceQuery(m))
         | View::Audio(Some(m))
-        | View::Confirm(Pending::Progress(m, _) | Pending::Stop(m, _) | Pending::Pause(m)) => {
+        | View::Confirm(Pending::Progress(m, _) | Pending::Stop(m, _) | Pending::Pause(m, _)) => {
             Some(m.clone())
         }
         _ => None,

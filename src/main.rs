@@ -91,8 +91,8 @@ pub enum Pending {
     Quit,
     /// queued or downloading episodes to take out of the queue
     Stop(Media, Vec<String>),
-    /// downloads, while ffmpeg has one (of this show, or shown from it), which then starts over
-    Pause(Media),
+    /// downloads, while ffmpeg has this episode of the show, which then starts over
+    Pause(Media, String),
     /// unfinished downloads of ani-hops that are gone, and their queue files
     Resume(Vec<Job>, Vec<PathBuf>),
 }
@@ -844,6 +844,11 @@ impl App {
         })
     }
 
+    /// Whether episode `ep` of `m` is the one downloading, not paused.
+    fn downloading(&self, m: &Media, ep: &str) -> bool {
+        !ani::paused() && (self.dl_now.as_ref()).is_some_and(|n| n.id == m.id && n.ep == ep)
+    }
+
     /// Whether enter on `stop` (queued episodes of `m`) is about pausing or resuming them all:
     /// on the one downloading, or with downloads paused, on any queued one.
     fn holds(&self, m: &Media, stop: &[String]) -> bool {
@@ -910,9 +915,10 @@ impl App {
         // ffmpeg can't go on from what it got, so pausing loses that, and asks like stopping
         if action == "pause"
             && let Some(which) = self.restarts(&m)
+            && let Some(ep) = self.dl_now.as_ref().map(|n| n.ep.clone())
         {
             let title = format!("Pause downloads? {which} starts over when resumed");
-            self.push(title, View::Confirm(Pending::Pause(m)));
+            self.push(title, View::Confirm(Pending::Pause(m, ep)));
             return;
         }
         // asks when that deletes what they got, so no stray enter or → can
@@ -1056,13 +1062,18 @@ impl App {
             *list = ani::local_shows().into_iter().map(|(m, _)| m).collect();
         }
         let items = self.items(&self.stack.last().unwrap().view);
-        // a chooser whose action under the cursor went (the episode finished, say) is stale:
-        // back to the list, which shows what changed, rather than another action there
+        // a chooser whose action under the cursor went (the episode finished, say), or a pause
+        // question about an episode no longer downloading, is stale: back to the list, which
+        // shows what changed, rather than another action there
         let top = self.stack.last().unwrap();
-        if matches!(top.view, View::DlChoice(..))
-            && let Some(cur) = top.menu.current()
-            && !items.iter().any(|i| i.key == cur.key)
-        {
+        let stale = match &top.view {
+            View::DlChoice(..) => {
+                (top.menu.current()).is_some_and(|c| !items.iter().any(|i| i.key == c.key))
+            }
+            View::Confirm(Pending::Pause(m, ep)) => !self.downloading(m, ep),
+            _ => false,
+        };
+        if stale {
             return self.pop(1);
         }
         self.top().menu.set_items(items);
@@ -1769,12 +1780,16 @@ impl App {
                         }
                         self.top().menu.marked.clear();
                     }
-                    Pending::Pause(_) => {
-                        ani::pause();
-                        self.toast(
-                            "Paused downloads · enter on a queued episode resumes them",
-                            false,
-                        );
+                    Pending::Pause(m, ep) => {
+                        // only the episode it warned about; one that started since would
+                        // start over unasked
+                        if self.downloading(m, ep) {
+                            ani::pause();
+                            self.toast(
+                                "Paused downloads · enter on a queued episode resumes them",
+                                false,
+                            );
+                        }
                         self.pop(1);
                         if matches!(self.top().view, View::DlChoice(..)) {
                             self.pop(1);
