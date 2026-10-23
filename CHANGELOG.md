@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.6.5 – 2026-10-23
+
+### Added
+
+- Downloads can be stopped: enter on a queued or downloading episode takes it out of the queue and deletes what it got so far.
+
+### Changed
+
+- "Download episodes…" and "Delete downloads…" are one "Downloads…". It lists every episode with its state (not downloaded, queued, downloading with its progress, on disk with its size), and enter does what that state allows: download, stop, or delete after asking. Marked episodes in different states ask which. What's on disk or queued is never downloaded again, also when a whole show is queued, and an episode another running ani-hop has queued says so.
+- Episodes… shows which episodes are queued and how far the one downloading got.
+
+### Fixed
+
+- Shows whose audio comes as a separate track, like Cyberpunk: Edgerunners 2, downloaded without sound. ani-cli after 5.1 fetches that track ([pystardust/ani-cli#1967](https://github.com/pystardust/ani-cli/pull/1967), not in a release yet) through ffmpeg. ani-hop now has that download written to a `.part` file like yt-dlp's, so one cut short by quitting, a dropped connection, or with parts ffmpeg reports missing or broken, is downloaded again instead of kept as finished, and shows how far it got. With an older ani-cli, such an episode is deleted and reported as having no sound instead of kept silent.
+- The download line in the footer ends in "…" before the key hints instead of running into them.
+
 ## 0.6.4 – 2026-10-23
 
 ### Added
