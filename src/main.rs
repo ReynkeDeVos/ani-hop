@@ -127,7 +127,8 @@ pub struct Job {
 }
 
 enum Msg {
-    Shows(u64, Result<Vec<Media>, String>),
+    /// a list's shows, and where to cache them with LIST_CHANGES from when it was asked for
+    Shows(u64, Result<Vec<Media>, String>, Option<(PathBuf, u64)>),
     /// the next page of a ranking
     More(u64, Result<Vec<Media>, String>),
     Hits(u64, Result<Vec<String>, String>),
@@ -725,26 +726,13 @@ impl App {
             .as_ref()
             .and_then(|p| fs::metadata(p).ok()?.modified().ok()?.elapsed().ok());
         let (list, fresh) = from_cache(cached, age, &mut feed);
-        let paged = matches!(feed, Feed::Pages(..));
         let id = self.push(title, View::Shows(list, feed));
         if fresh {
             return;
         }
         self.top().loading = true;
-        let changes = LIST_CHANGES.load(Ordering::Relaxed);
-        self.spawn(move || {
-            let res = f();
-            if let (Ok(list), Some(p)) = (&res, path) {
-                let next = (paged && list.len() >= PER_PAGE).then_some(2);
-                let _ = ani::write_json(&p, &(list, next));
-                // a save landed while this was in flight: keep it, but not as fresh
-                if LIST_CHANGES.load(Ordering::Relaxed) != changes {
-                    let file = fs::File::options().write(true).open(&p);
-                    let _ = file.map(|f| f.set_modified(std::time::UNIX_EPOCH));
-                }
-            }
-            Msg::Shows(id, res)
-        });
+        let cache = path.map(|p| (p, LIST_CHANGES.load(Ordering::Relaxed)));
+        self.spawn(move || Msg::Shows(id, f(), cache));
     }
 
     fn pop(&mut self, n: usize) {
@@ -1765,11 +1753,12 @@ impl App {
 
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Shows(id, res) => {
+            Msg::Shows(id, res, cache) => {
                 let fallback = res
                     .as_ref()
                     .is_ok_and(|l| l.iter().any(|m| !m.on_anilist()))
                     && self.stack.iter().any(|s| s.id == id);
+                let fetched = res.is_ok();
                 self.fill(id, res, |v, list| {
                     if let View::Shows(l, feed) = v {
                         if let Feed::Pages(_, next, _) = feed {
@@ -1778,6 +1767,23 @@ impl App {
                         *l = list;
                     }
                 });
+                // cached only for a screen still open: a closed one's late answer would
+                // overwrite what a newer one cached, its pages from More… too
+                let screen = self.stack.iter().find(|s| s.id == id);
+                if let (true, Some((path, changes)), Some(View::Shows(list, feed))) =
+                    (fetched, cache, screen.map(|s| &s.view))
+                {
+                    let next = match feed {
+                        Feed::Pages(_, next, _) => *next,
+                        _ => None,
+                    };
+                    let _ = ani::write_json(&path, &(list, next));
+                    // a save landed while this was in flight: keep it, but not as fresh
+                    if LIST_CHANGES.load(Ordering::Relaxed) != changes {
+                        let file = fs::File::options().write(true).open(&path);
+                        let _ = file.map(|f| f.set_modified(std::time::UNIX_EPOCH));
+                    }
+                }
                 if fallback {
                     self.toast("AniList search failed, showing ani-cli's matches", true);
                 }
