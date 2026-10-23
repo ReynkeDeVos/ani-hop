@@ -317,6 +317,13 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     // and the next page right on "More…"
     let fetching = matches!(screen.view, View::Shows(_, Feed::Pages(_, _, true)));
     let busy = busy.or_else(|| fetching.then(|| ("more".to_string(), format!("{spin} loading…"))));
+    // and the episode downloading right now on its row
+    let busy = busy.or_else(|| match (&screen.view, &app.dl_now) {
+        (View::Episodes(m, _), Some(n)) if m.id == n.id => {
+            Some((n.ep.clone(), format!("↓ {}", n.text)))
+        }
+        _ => None,
+    });
     let width = list_area.width.saturating_sub(1) as usize; // minus the pointer column
     let rows: Vec<ListItem> = m
         .matches
@@ -444,6 +451,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             .cloned(),
         View::Show(m)
         | View::Episodes(m, _)
+        | View::DlChoice(m, _)
         | View::Status(m)
         | View::Sources(m, ..)
         | View::Input(Input::SourceQuery(m))
@@ -747,7 +755,7 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
             duration(a.time_until_airing)
         )));
     }
-    let local = app.local.get(&m.id).copied().unwrap_or(0);
+    let local = app.local.get(&m.id).map_or(0, Vec::len);
     if local > 0 {
         lines.push(Line::from(format!("↓ {local} on disk")));
     }
@@ -788,11 +796,7 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
 
 fn footer(app: &App, f: &mut Frame, area: Rect) {
     let screen = app.stack.last().unwrap();
-    let enter = match screen.view {
-        View::Episodes(_, EpMode::Download) => "download",
-        View::Episodes(_, EpMode::Delete) => "delete",
-        _ => "select",
-    };
+    let enter = app.dl_verb();
     // esc empties a typed filter (or a prefilled input) before it goes back
     let esc = if screen.menu.query.is_empty() {
         "back"
@@ -833,13 +837,18 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         (_, Some(p)) if p.step.is_none() => {
             Line::from(vec![Span::styled(" ▶ ", ACCENT), p.title.as_str().into()])
         }
-        _ if app.dl_pending > 0 => Line::from(vec![
-            Span::styled(
-                format!(" {} ↓ {} left ", spinner(app), app.dl_pending),
-                ACCENT,
-            ),
-            Span::styled(app.dl_line.as_str(), DIM),
-        ]),
+        _ if crate::dl_pending() > 0 => {
+            let left = format!(" {} ↓ {} left ", spinner(app), crate::dl_pending());
+            let now = (app.dl_now.as_ref())
+                .map_or(String::new(), |n| format!("{} · {}", n.label, n.text));
+            // cut before the key hints, with a column between
+            let room =
+                (area.width as usize).saturating_sub(hints.width() + Span::raw(&left).width() + 1);
+            Line::from(vec![
+                Span::styled(left, ACCENT),
+                Span::styled(fit(now, room), DIM),
+            ])
+        }
         _ => Line::default(),
     };
     // a toast that doesn't fit beside the hints gets the line until it fades

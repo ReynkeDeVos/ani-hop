@@ -17,15 +17,46 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// (stopped, pid of the running ani-cli download). One lock, so quitting can't race
-/// the worker starting the next episode.
-static DOWNLOAD: Mutex<(bool, Option<u32>)> = Mutex::new((false, None));
+/// The running ani-cli download: pid, show folder, episode.
+type Running = (u32, PathBuf, String);
+
+/// (stopped by quitting, the running download). One lock, so quitting or stopping an
+/// episode can't race the worker starting the next one.
+static DOWNLOAD: Mutex<(bool, Option<Running>)> = Mutex::new((false, None));
 
 const FAKE_ROFI: &str = r#"#!/bin/sh
 # ani-hop: captures ani-cli's menu instead of showing one
 while [ $# -gt 0 ]; do [ "$1" = -p ] && p="$2"; shift; done
 { printf '%s\n' "$p"; cat; } > "${ANIHOP_MENU_OUT:-/dev/null}"
 exit 1
+"#;
+
+const FAKE_FFMPEG: &str = r#"#!/bin/sh
+# ani-hop: ani-cli downloads a show whose audio is a separate track with ffmpeg, which writes
+# the .mp4 as it goes, so one cut short would look finished. This writes .part, like yt-dlp,
+# renames it once ffmpeg got all of it and reports how far it got on stdout.
+PATH=${PATH#"${0%/*}:"}
+for a; do case $a in *.mp4) out=$a ;; esac; done
+[ "$1" = -extension_picky ] && [ -n "$out" ] || exec ffmpeg "$@"
+for a; do
+	shift
+	[ "$a" = "$out" ] && set -- "$@" -y -nostdin -nostats -loglevel level+warning -progress pipe:1 -f mp4 && a=$out.part
+	set -- "$@" "$a"
+done
+log=$out.part.log
+# ani-hop stops a download by signalling ani-cli's children, and this is one
+trap 'kill $pid 2>/dev/null; rm -f "$log"; exit 1' INT HUP TERM
+ffmpeg "$@" 2>"$log" &
+pid=$!
+wait $pid
+ok=$?
+cat "$log" >&2
+# ffmpeg exits 0 after skipping a segment it can't get, which only the input side warns about,
+# and after errors in what it got. shortcut: a segment that arrives short or empty with no
+# error at all still passes; checking each segment means a downloader of our own.
+grep -Eq '^\[(in#|hls|https?|tcp|tls|mpegts)|\[(error|fatal|panic)\]' "$log" && ok=1 && echo "parts of it failed to download" >&2
+rm -f "$log"
+[ $ok = 0 ] && mv -f "$out.part" "$out"
 "#;
 
 /// Where an AniList entry lives on the provider, as ani-cli sees it.
@@ -324,8 +355,10 @@ pub fn setup() -> std::io::Result<()> {
     let bin = cache_dir().join("bin");
     fs::create_dir_all(&bin)?;
     fs::create_dir_all(cache_dir().join("probe"))?;
-    fs::write(bin.join("rofi"), FAKE_ROFI)?;
-    fs::set_permissions(bin.join("rofi"), fs::Permissions::from_mode(0o755))?;
+    for (name, script) in [("rofi", FAKE_ROFI), ("ffmpeg", FAKE_FFMPEG)] {
+        fs::write(bin.join(name), script)?;
+        fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755))?;
+    }
     let run = run_dir();
     fs::create_dir_all(&run)?;
     let me = std::process::id();
@@ -951,6 +984,27 @@ fn is_dub(file: &Path) -> bool {
     show.is_some_and(|d| d.dub.contains(&name(file)))
 }
 
+/// Whether ffprobe finds no sound in a file: ani-cli 5.1 and older download only the video
+/// of a show whose audio is a separate track. Without ffprobe nothing counts as silent.
+fn silent(file: &Path) -> bool {
+    let mut url = std::ffi::OsString::from("file:"); // a "Title: …" path isn't a protocol
+    url.push(file);
+    Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "a",
+            "-show_entries",
+            "stream=index",
+        ])
+        .args(["-of", "csv=p=0"])
+        .arg(url)
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success() && o.stdout.is_empty())
+}
+
 pub fn delete_episode(file: &Path) -> std::io::Result<()> {
     let _ = fs::remove_file(file.with_extension("vtt"));
     fs::remove_file(file)?;
@@ -1015,12 +1069,14 @@ fn replaces(m: &Media, saved: &Media) -> bool {
     m.on_anilist() || saved.id == 0 // 0: a new entry
 }
 
-/// Downloads one episode, calling `progress` with yt-dlp's status lines.
+/// Downloads one episode, calling `progress` with yt-dlp's status lines. `wanted` is asked
+/// right before it starts, under the lock `cancel` takes, so a stop is never missed.
 pub fn download(
     m: &Media,
     src: &Source,
     ep: &str,
     dub: bool,
+    wanted: impl FnOnce() -> bool,
     mut progress: impl FnMut(&str),
 ) -> Result<(), String> {
     let dir = folder(m);
@@ -1037,7 +1093,7 @@ pub fn download(
     }
     let child = {
         let mut dl = DOWNLOAD.lock().unwrap();
-        if dl.0 {
+        if dl.0 || !wanted() {
             return Err("stopped".into());
         }
         let child = ani_cli()
@@ -1049,17 +1105,28 @@ pub fn download(
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("ani-cli: {e}"))?;
-        dl.1 = Some(child.id());
+        dl.1 = Some((child.id(), dir.clone(), ep.to_string()));
         child
     };
     let (_, stderr) = follow(child, |l| {
         if let Some(rest) = l.strip_prefix("[download]") {
             progress(rest.trim());
+        } else if let Some(t) = l
+            .strip_prefix("out_time=")
+            .filter(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            // ffmpeg, through FAKE_FFMPEG: how much of the episode it has, without an hour of 00
+            let t = t.split('.').next().unwrap_or(t);
+            progress(&format!("{} so far", t.strip_prefix("00:").unwrap_or(t)));
         }
     });
     DOWNLOAD.lock().unwrap().1 = None;
     // ani-cli exits 0 even if yt-dlp failed, so the file is the only reliable signal
     match local_episodes(&dir).into_iter().find(|(e, _)| e == ep) {
+        Some((_, file)) if silent(&file) => {
+            let _ = delete_episode(&file);
+            Err("no sound, its audio track needs a newer ani-cli".into())
+        }
         Some((_, file)) => {
             let _ = edit_index(|all| {
                 if let Some(d) = all.get_mut(&dir) {
@@ -1075,18 +1142,33 @@ pub fn download(
     }
 }
 
-/// Stops the running download for good; yt-dlp resumes the .part file next time.
-/// (Closing the terminal needs nothing: the hangup reaches our whole process group.)
+/// Stops the running download for good; yt-dlp resumes the .part file next time, ffmpeg
+/// (FAKE_FFMPEG) starts over. (Closing the terminal needs nothing: the hangup reaches our
+/// whole process group.)
 pub fn stop_download() {
     let mut dl = DOWNLOAD.lock().unwrap();
     dl.0 = true;
-    if let Some(pid) = dl.1.take().map(|p| p.to_string()) {
-        // The ani-cli shell first: it holds the signal until yt-dlp is gone and then exits.
-        // Signalled after yt-dlp, it falls back to ffmpeg, which writes a partial .mp4 that
-        // looks finished and keeps downloading after we quit.
-        let _ = Command::new("kill").args(["-TERM", &pid]).status();
-        let _ = Command::new("pkill").args(["-TERM", "-P", &pid]).status();
+    if let Some((pid, ..)) = dl.1.take() {
+        kill(pid);
     }
+}
+
+/// Stops episode `ep` of the show in `dir` if it's the one downloading. The caller took it
+/// out of the queue first, so if it isn't downloading yet, `wanted` keeps it from starting.
+pub fn cancel(dir: &Path, ep: &str) {
+    let mut dl = DOWNLOAD.lock().unwrap();
+    if let Some((pid, ..)) = dl.1.take_if(|(_, d, e)| d == dir && e == ep) {
+        kill(pid);
+    }
+}
+
+/// Ends an ani-cli download and what it runs.
+fn kill(pid: u32) {
+    let pid = pid.to_string();
+    // The ani-cli shell first: it holds the signal until yt-dlp is gone and then exits.
+    // Signalled after yt-dlp, it falls back to ffmpeg and keeps downloading after we quit.
+    let _ = Command::new("kill").args(["-TERM", &pid]).status();
+    let _ = Command::new("pkill").args(["-TERM", "-P", &pid]).status();
 }
 
 /// Whether downloads were stopped by quitting, so a failed one was cut short, not broken.
@@ -1435,6 +1517,64 @@ mod tests {
         let fresh = dir.join("new/first.json");
         write_json(&fresh, &vec![1]).unwrap();
         assert_eq!(read_json::<Vec<u32>>(&fresh), [1]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn fake_ffmpeg_renames_only_finished_downloads() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-ffmpeg-{}", std::process::id()));
+        let (fake, real) = (dir.join("fake"), dir.join("real"));
+        // stands in for the real one: logs its arguments, writes its last one, warns $WARN
+        let logger = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LOG\"\nfor a; do o=$a; done\n: > \"$o\"\n[ -z \"$WARN\" ] || echo \"$WARN\" >&2\nexit $CODE\n";
+        for (bin, script) in [(&fake, FAKE_FFMPEG), (&real, logger)] {
+            fs::create_dir_all(bin).unwrap();
+            fs::write(bin.join("ffmpeg"), script).unwrap();
+            fs::set_permissions(bin.join("ffmpeg"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (log, out) = (dir.join("log"), dir.join("A Episode 1.mp4"));
+        let part = dir.join("A Episode 1.mp4.part");
+        let run = |code: &str, warn: &str, args: &[&str]| {
+            let _ = fs::remove_file(&out);
+            let path = format!("{}:{}:/usr/bin:/bin", fake.display(), real.display());
+            let o = Command::new(fake.join("ffmpeg"))
+                .args(args)
+                .arg(&out)
+                .env("PATH", path)
+                .env("LOG", &log)
+                .env("CODE", code)
+                .env("WARN", warn)
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&o.stderr).into_owned();
+            (o.status.success(), fs::read_to_string(&log).unwrap(), err)
+        };
+        let ani_cli = ["-extension_picky", "0", "-i", "v.m3u8", "-c", "copy"];
+        let (ok, args, _) = run("0", "", &ani_cli);
+        assert!(ok && out.exists() && !part.exists());
+        assert!(args.ends_with(&format!("-f\nmp4\n{}\n", part.display())));
+        let (ok, _, _) = run("1", "", &ani_cli);
+        assert!(
+            !ok && !out.exists() && part.exists(),
+            "a failed one stays .part"
+        );
+        // ffmpeg exits 0 after skipping a segment it couldn't get
+        let skipped = "[in#0/hls @ 0x1] Segment 7 of playlist 0 failed too many times, skipping";
+        let (ok, _, err) = run("0", skipped, &ani_cli);
+        assert!(!ok && !out.exists() && part.exists());
+        assert!(err.starts_with(skipped) && err.ends_with("parts of it failed to download\n"));
+        let broken = "[NULL @ 0x1] [error] Invalid NAL unit size (1234 > 567).";
+        let (ok, _, _) = run("0", broken, &ani_cli);
+        assert!(
+            !ok && !out.exists() && part.exists(),
+            "errors in what it got"
+        );
+        let (ok, _, _) = run("0", "[mp4 @ 0x1] [warning] Non-monotonic DTS", &ani_cli);
+        assert!(ok && out.exists(), "the muxer's warnings lose nothing");
+        assert!(!dir.join("A Episode 1.mp4.part.log").exists());
+        // yt-dlp's own calls (merging, fixups) go through untouched
+        let (ok, args, _) = run("0", "", &["-y", "-i", "v.mp4"]);
+        assert!(ok && out.exists());
+        assert_eq!(args, format!("-y\n-i\nv.mp4\n{}\n", out.display()));
         fs::remove_dir_all(&dir).unwrap();
     }
 
