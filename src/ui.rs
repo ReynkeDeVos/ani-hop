@@ -532,20 +532,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     let command =
         |cmd: String| Line::from(vec![Span::styled("❯ ", ACCENT), Span::styled(cmd, DIM)]);
     let mut v: Vec<Line> = logo().collect();
-    v.extend(["".into(), Line::styled("Tools", Style::new().bold())]);
-    for (bin, _, what) in ani::deps() {
-        let old = bin == "ani-cli" && app.old_ani_cli.is_some();
-        v.push(row(
-            !old && !app.missing.iter().any(|d| d.0 == bin),
-            bin,
-            what,
-        ));
-    }
-    v.push(row(
-        kitty::supported(),
-        "graphics",
-        "posters need Ghostty or kitty",
-    ));
+    // what to do first: a long checklist must not push it out of a small terminal
     let pkgs: Vec<&str> = app.missing.iter().map(|d| d.1).collect();
     if let Some(cmd) = ani::install_command(&pkgs).filter(|_| !pkgs.is_empty()) {
         v.extend(["".into(), command(cmd)]);
@@ -584,6 +571,20 @@ fn setup(app: &App) -> Vec<Line<'static>> {
             None => Line::styled("Update it with your package manager", DIM),
         });
     }
+    v.extend(["".into(), Line::styled("Tools", Style::new().bold())]);
+    for (bin, _, what) in ani::deps() {
+        let old = bin == "ani-cli" && app.old_ani_cli.is_some();
+        v.push(row(
+            !old && !app.missing.iter().any(|d| d.0 == bin),
+            bin,
+            what,
+        ));
+    }
+    v.push(row(
+        kitty::supported(),
+        "graphics",
+        "posters need Ghostty or kitty",
+    ));
     v.extend(["".into(), Line::styled("AniList", Style::new().bold())]);
     match &app.user {
         Some((_, name)) => v.push(Line::from(vec![
