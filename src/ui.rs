@@ -289,6 +289,18 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         DIM,
     ));
     f.render_widget(Line::from(info), info_area);
+    // an empty list says so, instead of a bare 0
+    let empty = match &screen.view {
+        _ if !m.items.is_empty() || screen.loading => None,
+        View::Shows(_, Feed::Local) => Some("Nothing downloaded yet"),
+        View::Shows(..) => Some("No shows found"),
+        View::Episodes(..) => Some("No episodes found"),
+        _ => None,
+    };
+    if let Some(text) = empty {
+        let line = Line::from(vec!["   ".into(), Span::styled(text, DIM)]);
+        return f.render_widget(line, list_area);
+    }
 
     // the episode being started shows it right where enter was pressed
     let busy = app.playing.as_ref().and_then(|p| {
@@ -331,18 +343,28 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                     },
                 )
             }));
-            let used: usize = spans.iter().map(|s| s.width()).sum();
+            let mut used: usize = spans.iter().map(|s| s.width()).sum();
+            // a title too long for the row ends in "…", like a cut hint
+            if used > width {
+                while used >= width
+                    && let Some(s) = spans.pop()
+                {
+                    used -= s.width();
+                }
+                spans.push(Span::styled(
+                    "…",
+                    if item.done { SOFT } else { Style::new() },
+                ));
+                used += 1;
+            }
             let room = width.saturating_sub(used + 2);
-            let (mut hint, color) = match &busy {
+            let (hint, color) = match &busy {
                 Some((key, text)) if *key == item.key => (text.clone(), ACCENT),
                 _ => (item.hint.clone(), DIM),
             };
             if !hint.is_empty() && room > 3 {
-                if hint.chars().count() > room {
-                    hint = hint.chars().take(room - 1).collect::<String>() + "…";
-                }
-                let hint = Span::styled(hint, color);
-                spans.push(" ".repeat(width - used - hint.width()).into());
+                let hint = Span::styled(fit(hint, room), color);
+                spans.push(" ".repeat(width.saturating_sub(used + hint.width())).into());
                 spans.push(hint);
             }
             ListItem::new(Line::from(spans))
@@ -384,7 +406,7 @@ fn input_help(input: &Input) -> Text<'static> {
             "2. Name: ani-hop".into(),
             Line::from(vec![
                 "   Redirect URL: ".into(),
-                Span::styled(PIN_REDIRECT, ACCENT),
+                Span::styled(PIN_REDIRECT, Style::new().fg(ACCENT).not_dim()),
             ]),
             "3. Paste the client ID here and press enter.".into(),
         ],
@@ -392,7 +414,10 @@ fn input_help(input: &Input) -> Text<'static> {
             "Approve ani-hop in the browser tab that just opened,".into(),
             "then paste the token AniList shows and press enter.".into(),
             "".into(),
-            Line::styled("Pasting the whole redirect URL works too.", DIM),
+            Line::styled(
+                "Pasting the whole redirect URL works too.",
+                Style::new().italic(),
+            ),
         ],
         Input::SourceQuery(_) => vec![
             "Search ani-cli's provider with this text,".into(),
@@ -405,7 +430,7 @@ fn input_help(input: &Input) -> Text<'static> {
             "Shows already downloaded stay in the old folder.".into(),
         ],
     };
-    Text::from(lines).fg(DIM)
+    Text::from(lines).style(SOFT)
 }
 
 fn preview(app: &mut App, f: &mut Frame, area: Rect) {
@@ -494,12 +519,20 @@ fn setup(app: &App) -> Vec<Line<'static>> {
         false => Span::styled("  ✗ ", Color::Red),
     };
     let row = |good: bool, name: &str, what: &'static str| {
+        // extras: without them ani-hop works, just plainer
+        let mark = match good || !matches!(name, "ani-skip" | "graphics") {
+            true => mark(good),
+            false => Span::styled("  ○ ", Color::Yellow),
+        };
         Line::from(vec![
-            mark(good),
+            mark,
             format!("{name:<10}").into(),
             Span::styled(what, DIM),
         ])
     };
+    // enter on Install or Update runs this, which the hint shows cut short
+    let command =
+        |cmd: String| Line::from(vec![Span::styled("❯ ", ACCENT), Span::styled(cmd, DIM)]);
     let mut v: Vec<Line> = logo().collect();
     v.extend(["".into(), Line::styled("Tools", Style::new().bold())]);
     for (bin, _, what) in ani::deps() {
@@ -513,23 +546,12 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v.push(row(
         kitty::supported(),
         "graphics",
-        "posters need Ghostty or Kitty",
+        "posters need Ghostty or kitty",
     ));
-    if let Some(old) = &app.old_ani_cli {
-        v.push("".into());
-        v.push(Line::styled(
-            format!(
-                "ani-cli {old} is too old, ani-hop needs {}",
-                ani::TESTED_ANI_CLI
-            ),
-            Color::Yellow,
-        ));
-        if ani::ani_cli_update().is_none() {
-            v.push(Line::styled("Update it with your package manager", DIM));
-        }
-    }
     let pkgs: Vec<&str> = app.missing.iter().map(|d| d.1).collect();
-    if !pkgs.is_empty() && ani::install_command(&pkgs).is_none() {
+    if let Some(cmd) = ani::install_command(&pkgs).filter(|_| !pkgs.is_empty()) {
+        v.extend(["".into(), command(cmd)]);
+    } else if !pkgs.is_empty() {
         // shortcut: worded for Homebrew, the only way to land here on Linux or macOS; word
         // it per OS if another one is added
         let names: Vec<&str> = app.missing.iter().map(|d| d.0).collect();
@@ -546,6 +568,20 @@ fn setup(app: &App) -> Vec<Line<'static>> {
             // only on Linux (deps() leaves it out on macOS), and Homebrew has no xdg-utils
             v.push(Line::styled("xdg-open: xdg-utils from your distro", DIM));
         }
+    }
+    if let Some(old) = &app.old_ani_cli {
+        v.push("".into());
+        v.push(Line::styled(
+            format!(
+                "ani-cli {old} is too old, ani-hop needs {}",
+                ani::TESTED_ANI_CLI
+            ),
+            Color::Yellow,
+        ));
+        v.push(match ani::ani_cli_update() {
+            Some(cmd) => command(cmd),
+            None => Line::styled("Update it with your package manager", DIM),
+        });
     }
     v.extend(["".into(), Line::styled("AniList", Style::new().bold())]);
     v.push(match &app.user {
@@ -644,12 +680,13 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
     }
     lines.push("".into());
     let mut facts = Vec::new();
+    // no-break spaces: wrapping never splits a fact like "10 episodes"
     if let Some(s) = m.average_score {
-        facts.push(Span::styled(format!("★ {s}%"), Color::Yellow));
+        facts.push(Span::styled(format!("★\u{a0}{s}%"), Color::Yellow));
     }
     let detail = [
         m.format.as_deref().map(pretty),
-        m.episodes.map(|e| format!("{e} episodes")),
+        m.episodes.map(|e| format!("{e}\u{a0}episodes")),
         m.status.as_deref().map(pretty),
     ];
     for d in detail.into_iter().flatten() {
@@ -658,7 +695,10 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
         }
         facts.push(d.into());
     }
-    lines.push(Line::from(facts));
+    // ani-cli's shows have none of these: no rows of blanks for them
+    if !facts.is_empty() {
+        lines.push(Line::from(facts));
+    }
     if !m.on_anilist() {
         lines.push(Line::styled(
             "Found through ani-cli: no AniList details or progress sync",
@@ -677,14 +717,17 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
         .map(|s| s.name.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    lines.push(Line::from(
-        [when, studio]
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" · "),
-    ));
-    lines.push(Line::styled(m.genres.join(" · "), MATCH));
+    let made = [when, studio]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    if !made.is_empty() {
+        lines.push(made.into());
+    }
+    if !m.genres.is_empty() {
+        lines.push(Line::styled(m.genres.join(" · "), MATCH));
+    }
     lines.push("".into());
     if let Some(e) = &m.media_list_entry {
         let total = m.episodes.map_or("?".into(), |t| t.to_string());
@@ -706,7 +749,7 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
     }
     if let Some(s) = app.sources.get(&m.id) {
         lines.push(Line::styled(
-            format!("ani-cli: {} · {} episodes", s.title, s.episodes.len()),
+            format!("ani-cli: {} · {}\u{a0}episodes", s.title, s.episodes.len()),
             DIM,
         ));
     }
@@ -741,7 +784,18 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
 
 fn footer(app: &App, f: &mut Frame, area: Rect) {
     let screen = app.stack.last().unwrap();
-    let mut keys = vec![("enter", "select"), ("esc", "back")];
+    let enter = match screen.view {
+        View::Episodes(_, EpMode::Download) => "download",
+        View::Episodes(_, EpMode::Delete) => "delete",
+        _ => "select",
+    };
+    // esc empties a typed filter (or a prefilled input) before it goes back
+    let esc = if screen.menu.query.is_empty() {
+        "back"
+    } else {
+        "clear"
+    };
+    let mut keys = vec![("enter", enter), ("esc", esc)];
     if screen.menu.multi {
         keys.splice(0..0, [("tab", "mark"), ("^a", "all")]);
     }
@@ -756,15 +810,17 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
             })
             .collect::<Vec<_>>(),
     );
-    let [status_area, hints_area] = Layout::horizontal([
-        Constraint::Fill(1),
-        Constraint::Length(hints.width() as u16),
-    ])
-    .areas(area);
-    let status = match (&app.toast, &app.playing) {
-        (Some((text, err, at)), _) if at.elapsed().as_secs() < 4 => Line::styled(
+    let toast = app.toast.as_ref().filter(|t| t.2.elapsed().as_secs() < 4);
+    let status = match (toast, &app.playing) {
+        // shortcut: what's still underway is told apart by its "…"; give toasts a kind once a
+        // finished one can end in "…"
+        (Some((text, err, _)), _) => Line::styled(
             format!(" {text}"),
-            if *err { Color::Red } else { Color::Green },
+            match (*err, text.ends_with('…')) {
+                (true, _) => Color::Red,
+                (false, true) => ACCENT,
+                _ => Color::Green,
+            },
         ),
         (_, Some(p)) => match p.step {
             Some(step) => Line::from(vec![
@@ -783,8 +839,22 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         ]),
         _ => Line::default(),
     };
+    // a toast that doesn't fit beside the hints gets the line until it fades
+    let crowded = toast.is_some() && status.width() + hints.width() > area.width as usize;
+    let hints_width = if crowded { 0 } else { hints.width() as u16 };
+    let [status_area, hints_area] =
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(hints_width)]).areas(area);
     f.render_widget(status, status_area);
     f.render_widget(hints, hints_area);
+}
+
+/// `s` cut to `room` columns with "…", measured as drawn: CJK characters take two.
+fn fit(mut s: String, room: usize) -> String {
+    if Span::raw(s.as_str()).width() > room {
+        while Span::raw(s.as_str()).width() >= room && s.pop().is_some() {}
+        s.push('…');
+    }
+    s
 }
 
 fn hex(s: &str) -> Option<Color> {
@@ -852,5 +922,13 @@ mod tests {
         assert_eq!(pretty("NOT_YET_RELEASED"), "Upcoming");
         assert_eq!(pretty("SPECIAL"), "Special");
         assert_eq!(pretty("ONA"), "ONA");
+    }
+
+    #[test]
+    fn cuts_hints_by_width_not_chars() {
+        // ~/ビデオ is the Japanese videos folder: 11 chars, 14 columns
+        assert_eq!(fit("~/ビデオ/Anime".into(), 11), "~/ビデオ/A…");
+        assert_eq!(fit("~/ビデオ/Anime".into(), 14), "~/ビデオ/Anime");
+        assert_eq!(fit("on".into(), 0), "…");
     }
 }

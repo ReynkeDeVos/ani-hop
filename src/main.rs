@@ -755,7 +755,6 @@ impl App {
         ui::effects_running(self)
             || self.stack.last().unwrap().loading
             || self.dl_pending > 0
-            || self.playing.as_ref().is_some_and(|p| p.step.is_some())
             || self
                 .toast
                 .as_ref()
@@ -898,7 +897,7 @@ impl App {
                         "Log out of AniList",
                         user.as_ref().map_or("", |u| u.1.as_str()),
                     ),
-                    (None, _) => Item::new("login", "Log in to AniList", ""),
+                    (None, _) => Item::new("login", "Log in to AniList…", ""),
                 },
             ],
             View::Setup => {
@@ -913,7 +912,7 @@ impl App {
                 if self.user.is_none() {
                     v.push(Item::new(
                         "login",
-                        "Log in to AniList",
+                        "Log in to AniList…",
                         "your lists + progress sync",
                     ));
                 }
@@ -988,7 +987,7 @@ impl App {
                         .as_ref()
                         .map(|e| list_label(&e.status))
                         .unwrap_or("not on list");
-                    v.push(Item::new("status", "★  List status…", status));
+                    v.push(Item::new("status", "●  List status…", status));
                 }
                 v.push(Item::new(
                     "audio",
@@ -1202,10 +1201,11 @@ impl App {
                     .iter()
                     .filter_map(|k| list.iter().find(|m| m.id.to_string() == *k).cloned())
                     .collect();
-                self.top().menu.marked.clear();
+                // marks stay until the bulk action runs, so esc from it keeps them
                 if picked.len() > 1 {
                     self.push(format!("{} shows", picked.len()), View::Bulk(picked));
                 } else if let Some(m) = picked.into_iter().next() {
+                    self.top().menu.marked.clear();
                     self.open_show(m);
                 }
             }
@@ -1256,6 +1256,7 @@ impl App {
             }
             View::Status(m) => {
                 let (m, c) = (m.clone(), self.client.clone());
+                self.toast(format!("Saving {}…", m.name()), false);
                 match (key.as_str(), m.media_list_entry.as_ref().map(|e| e.id)) {
                     ("remove", Some(entry)) => {
                         self.saves_pending += 1;
@@ -1295,6 +1296,7 @@ impl App {
                     }
                     self.toast("Queued, looking up episodes…", false);
                     self.pop(1);
+                    self.top().menu.marked.clear();
                 } else {
                     let dirs: Vec<PathBuf> = list
                         .iter()
@@ -1360,6 +1362,7 @@ impl App {
                         let n = paths.len();
                         self.toast(format!("Deleted {} of {n}", n - failed), failed > 0);
                         self.pop(2);
+                        self.top().menu.marked.clear();
                     }
                     Pending::Progress(m, ep) => {
                         let (m, ep, c) = (m.clone(), ani::ep_num(ep) as u32, self.client.clone());
@@ -1458,6 +1461,13 @@ impl App {
                 });
             }
             Input::ClientId => {
+                // AniList shows a secret right next to it, and a saved wrong one blocks login
+                if !text.chars().all(|c| c.is_ascii_digit()) {
+                    return self.toast(
+                        "The client ID is the number AniList shows, not the secret",
+                        true,
+                    );
+                }
                 if let Err(e) = write_private(&ani::config_dir().join("client_id"), &text) {
                     return self.toast(e.to_string(), true);
                 }
@@ -1533,14 +1543,14 @@ impl App {
         if self.fresh.contains(&m.id) {
             return;
         }
+        if want.is_some() {
+            self.toast(format!("Searching ani-cli for {}…", m.name()), false);
+        }
         if let Some(slot) = self.resolving.get_mut(&m.id) {
             if want.is_some() {
                 *slot = want;
             }
             return;
-        }
-        if want.is_some() {
-            self.toast(format!("Searching ani-cli for {}…", m.name()), false);
         }
         self.resolving.insert(m.id, want);
         let m = m.clone();
@@ -1587,7 +1597,8 @@ impl App {
         self.playing = Some(Playing {
             id: m.id,
             ep: ep.clone(),
-            title: format!("{} · Episode {ep}", m.name()),
+            // the number first: a long title loses its end, not the episode
+            title: format!("Episode {ep} · {}", m.name()),
             step: Some(step),
             since: Instant::now(),
             color: m.cover_image.color.clone(),
