@@ -1066,6 +1066,25 @@ fn discard_parts(dir: &Path, eps: &[String]) {
     }
 }
 
+/// The pieces yt-dlp was writing when episode `ep` stopped (by a pause, quitting, a crash).
+/// Going on from one that was complete but not renamed yet gets HTTP 416, and yt-dlp's retry
+/// without a range still sends one (its Request keeps the headers it was given, in 2026.10.21),
+/// forever. Deleted before it goes on, they're fetched again whole; the finished ones stay.
+fn half_pieces(dir: &Path, ep: &str) -> Vec<PathBuf> {
+    let piece = format!(" Episode {ep}.mp4.part-Frag");
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    (rd.flatten().map(|e| e.path()))
+        .filter(|p| {
+            // exactly yt-dlp's "….part-Frag<n>.part", nothing of anyone else's
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            let n = (name.rsplit_once(&piece)).and_then(|(_, n)| n.strip_suffix(".part"));
+            n.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .collect()
+}
+
 /// What downloads of `eps` that didn't finish left in `dir`.
 pub fn parts(dir: &Path, eps: &[String]) -> Vec<PathBuf> {
     let done: Vec<String> = local_episodes(dir).into_iter().map(|(e, _)| e).collect();
@@ -1119,6 +1138,9 @@ pub fn download(
         if local_episodes(&dir).iter().any(|(e, _)| e == ep) {
             return Ok(()); // yt-dlp wouldn't replace it, so it stays the audio it was
         }
+        for p in half_pieces(&dir, ep) {
+            let _ = fs::remove_file(p);
+        }
         let child = ani_cli()
             .args(["-d", "-S", &src.index.to_string(), "-e", ep, &src.query])
             .env("ANI_CLI_DOWNLOAD_DIR", &dir)
@@ -1131,21 +1153,22 @@ pub fn download(
         dl.1 = Some((child.id(), dir.clone(), ep.to_string()));
         child
     };
-    let mut length = None;
+    // the last percentage, for while it retries; ffmpeg's length (ffprobe) and speed
+    let (mut pct, mut length, mut speed) = (None, None, None);
     let (_, stderr) = follow(child, |l| {
-        // yt-dlp's percentages and errors, not where it writes to or, going on from where it
-        // was, a line for each piece it has already
-        let noise =
-            |r: &&str| r.starts_with("Destination:") || r.ends_with("has already been downloaded");
-        if let Some(rest) = (l.strip_prefix("[download]").map(str::trim)).filter(|r| !noise(r)) {
-            progress(rest, true);
+        if let Some(line) = l.strip_prefix("[download]") {
+            if let Some(text) = ytdlp_progress(line.trim(), &mut pct) {
+                progress(&text, true);
+            }
         } else if let Some(d) = l.strip_prefix("duration=") {
             length = d.parse().ok().filter(|d: &f64| *d >= 1.0);
+        } else if let Some(x) = l.strip_prefix("speed=") {
+            speed = times(x);
         } else if let Some(t) = l
             .strip_prefix("out_time=")
             .filter(|t| t.starts_with(|c: char| c.is_ascii_digit()))
         {
-            progress(&so_far(t, length), false);
+            progress(&so_far(t, length, speed), false);
         }
     });
     // gone already: a stop killed it
@@ -1259,20 +1282,68 @@ fn held(lock: &Path) -> bool {
     fs::File::open(lock).is_ok_and(|f| f.try_lock_shared().is_err())
 }
 
-/// How much of the episode ffmpeg has (through FAKE_FFMPEG), as a share of its `length` in
-/// seconds once ffprobe told it, without an hour of 00.
-fn so_far(out_time: &str, length: Option<f64>) -> String {
-    let short = |t: &str| t.strip_prefix("00:").unwrap_or(t).to_string();
+/// What a download line of yt-dlp's says that matters: how far along and how long it still
+/// takes ("18% · 2m left"), or that it's retrying. Its size estimate, speed and piece count
+/// are left out, and so are where it writes to and the pieces it has already.
+fn ytdlp_progress(line: &str, pct: &mut Option<u32>) -> Option<String> {
+    if line.starts_with("Got error") {
+        return Some(pct.map_or("retrying".into(), |p| format!("{p}% · retrying")));
+    }
+    let p: f64 = line
+        .split_whitespace()
+        .next()?
+        .strip_suffix('%')?
+        .parse()
+        .ok()?;
+    *pct = Some(p as u32);
+    let eta = line
+        .split_once("ETA ")
+        .and_then(|(_, e)| clock(e.split_whitespace().next()?));
+    Some(match eta {
+        Some(secs) if p < 100.0 => format!("{}% · {}", p as u32, left(secs)),
+        _ => format!("{}%", p as u32),
+    })
+}
+
+/// How far ffmpeg (through FAKE_FFMPEG) got, as a share of the episode's `length` in seconds,
+/// with how long the rest takes at its `speed` (times real time). Without a length, how much
+/// of the episode it has.
+fn so_far(out_time: &str, length: Option<f64>, speed: Option<f64>) -> String {
     let t = out_time.split('.').next().unwrap_or(out_time);
-    let secs = (t.split(':')).try_fold(0.0, |s, x| x.parse().map(|x: f64| s * 60.0 + x));
-    match (secs, length) {
-        (Ok(s), Some(l)) => {
-            let l = l as u64;
-            let of = short(&format!("{:02}:{:02}:{:02}", l / 3600, l / 60 % 60, l % 60));
-            let pct = (s / l as f64 * 100.0).min(100.0) as u32;
-            format!("{pct}% · {} of {of}", short(t))
+    match (clock(t), length) {
+        (Some(s), Some(l)) => {
+            let pct = (s / l * 100.0).min(100.0) as u32;
+            match speed {
+                Some(x) if s < l => format!("{pct}% · {}", left((l - s) / x)),
+                _ => format!("{pct}%"),
+            }
         }
-        _ => format!("{} so far", short(t)),
+        _ => format!("{} so far", t.strip_prefix("00:").unwrap_or(t)),
+    }
+}
+
+/// ffmpeg's speed in times real time, from "8.42x", "   8x" (padded) or "N/A"; None unless
+/// it's moving.
+fn times(speed: &str) -> Option<f64> {
+    let x: f64 = speed.trim().strip_suffix('x')?.trim().parse().ok()?;
+    (x > 0.0).then_some(x)
+}
+
+/// Seconds in "01:19" or "1:02:03"; None for "Unknown" and the like.
+fn clock(t: &str) -> Option<f64> {
+    (t.split(':'))
+        .try_fold(0.0, |s, x| x.parse().map(|x: f64| s * 60.0 + x))
+        .ok()
+}
+
+/// "40s left", "2m left", "1h 5m left": how long the rest of a download takes.
+fn left(secs: f64) -> String {
+    let s = secs.round() as u64;
+    let m = (s + 30) / 60;
+    match s {
+        0..60 => format!("{s}s left"),
+        60..3600 => format!("{m}m left"),
+        _ => format!("{}h {}m left", m / 60, m % 60),
     }
 }
 
@@ -1492,6 +1563,26 @@ mod tests {
     }
 
     #[test]
+    fn goes_on_without_the_pieces_yt_dlp_was_writing() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-pieces-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let files = [
+            "Show Episode 2.mp4.part-Frag321.part",
+            "Show Episode 2.mp4.part-Frag322",
+            "Show Episode 2.mp4.part",
+            "Show Episode 2.mp4.ytdl",
+            "Show Episode 12.mp4.part-Frag3.part",
+            "Show Episode 2.mp4.part-Frag3.saved.part",
+            "Show Episode 2.mp4.part-Frag.part",
+        ];
+        files
+            .iter()
+            .for_each(|f| fs::write(dir.join(f), "").unwrap());
+        assert_eq!(half_pieces(&dir, "2"), [dir.join(files[0])]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn discards_only_unfinished_leftovers() {
         let dir = std::env::temp_dir().join(format!("ani-hop-discard-{}", std::process::id()));
         let files = [
@@ -1616,16 +1707,51 @@ mod tests {
 
     #[test]
     fn download_progress_says_how_far_along() {
+        // yt-dlp, as ani-cli shows it
+        let mut pct = None;
+        let mut yt = |l: &str| ytdlp_progress(l, &mut pct);
+        assert_eq!(yt("Destination: /x/Show Episode 4.mp4"), None);
         assert_eq!(
-            so_far("00:26:16.123456", Some(1693.1)),
-            "93% · 26:16 of 28:13"
+            yt("  1.0% of ~  12.00MiB at  Unknown B/s ETA Unknown (frag 0/342)").as_deref(),
+            Some("1%")
+        );
+        let line = "18.0% of ~ 506.76MiB at    5.05MiB/s ETA 01:19 (frag 61/342)";
+        assert_eq!(yt(line).as_deref(), Some("18% · 1m left"));
+        assert_eq!(
+            yt("/x/Show Episode 4.mp4.part-Frag7 has already been downloaded"),
+            None
+        );
+        let error = "Got error: HTTP Error 403: Forbidden. Retrying fragment 62 (1/inf)...";
+        assert_eq!(yt(error).as_deref(), Some("18% · retrying"));
+        assert_eq!(
+            yt("99.8% of ~ 506.76MiB at 5.05MiB/s ETA 00:00:01 (frag 341/342)").as_deref(),
+            Some("99% · 1s left")
         );
         assert_eq!(
-            so_far("01:02:03.5", Some(4000.0)),
-            "93% · 01:02:03 of 01:06:40"
+            yt("100% of  506.76MiB in 00:01:40 at 5.05MiB/s").as_deref(),
+            Some("100%")
         );
-        assert_eq!(so_far("00:28:14.0", Some(1693.1)), "100% · 28:14 of 28:13");
-        assert_eq!(so_far("00:06:45.000000", None), "06:45 so far");
+        // ffmpeg, through FAKE_FFMPEG
+        assert_eq!(times("   8x"), Some(8.0));
+        assert_eq!(times(" 1.3x"), Some(1.3));
+        assert_eq!(times("8.42x"), Some(8.42));
+        assert_eq!(times("N/A"), None);
+        assert_eq!(times("   0x"), None);
+        assert_eq!(
+            so_far("00:26:16.123456", Some(1693.1), Some(8.0)),
+            "93% · 15s left"
+        );
+        assert_eq!(
+            so_far("00:06:45.0", Some(1693.1), Some(4.0)),
+            "23% · 5m left"
+        );
+        assert_eq!(
+            so_far("00:10:00.0", Some(20000.0), Some(1.0)),
+            "3% · 5h 23m left"
+        );
+        assert_eq!(so_far("00:26:16.0", Some(1693.1), None), "93%");
+        assert_eq!(so_far("00:28:14.0", Some(1693.1), Some(8.0)), "100%");
+        assert_eq!(so_far("00:06:45.000000", None, Some(8.0)), "06:45 so far");
     }
 
     #[test]

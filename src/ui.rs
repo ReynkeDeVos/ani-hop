@@ -835,6 +835,8 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
             .collect::<Vec<_>>(),
     );
     let toast = app.toast.as_ref().filter(|t| t.2.elapsed().as_secs() < 4);
+    // read once: the worker can take the last one off between two reads
+    let n = crate::dl_pending();
     let status = match (toast, &app.playing) {
         // shortcut: what's still underway is told apart by its "…"; give toasts a kind once a
         // finished one can end in "…"
@@ -850,27 +852,26 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         (_, Some(p)) if p.step.is_none() => {
             Line::from(vec![Span::styled(" ▶ ", ACCENT), p.title.as_str().into()])
         }
-        _ if crate::dl_pending() > 0 => {
-            let (n, paused) = (crate::dl_pending(), ani::paused());
-            let left = match paused {
-                true => format!(" ‖ paused · {n} left "),
-                false => format!(" {} ↓ {n} left ", spinner(app)),
+        _ if n > 0 => {
+            // how far the one downloading got first, so that's what 80 columns keep, then
+            // which one it is and what's after it
+            let head = match (&app.dl_now, ani::paused()) {
+                (Some(d), true) => paused(d),
+                (Some(d), false) => format!("{} ↓ {}", spinner(app), d.text),
+                (None, true) => format!("‖ paused · {n} queued"),
+                (None, false) => format!("{} ↓ {n} queued", spinner(app)),
             };
-            // paused, the speed in its last line is stale
-            let now = (app.dl_now.as_ref()).map_or(String::new(), |d| match paused {
-                true => [d.label.clone()]
-                    .into_iter()
-                    .chain(crate::got_so_far(&d.text).filter(|_| d.resumes))
-                    .collect::<Vec<_>>()
-                    .join(" · "),
-                false => format!("{} · {}", d.label, d.text),
+            let head = format!(" {head} ");
+            let tail = (app.dl_now.as_ref()).map_or(String::new(), |d| match n - 1 {
+                0 => format!("· {}", d.label),
+                more => format!("· {} · {more} more queued", d.label),
             });
             // cut before the key hints, with a column between
             let room =
-                (area.width as usize).saturating_sub(hints.width() + Span::raw(&left).width() + 1);
+                (area.width as usize).saturating_sub(hints.width() + Span::raw(&head).width() + 1);
             Line::from(vec![
-                Span::styled(left, ACCENT),
-                Span::styled(fit(now, room), DIM),
+                Span::styled(head, ACCENT),
+                Span::styled(fit(tail, room), DIM),
             ])
         }
         _ => Line::default(),
