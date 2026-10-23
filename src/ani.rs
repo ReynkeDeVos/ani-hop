@@ -1163,11 +1163,7 @@ pub fn download(
         } else if let Some(d) = l.strip_prefix("duration=") {
             length = d.parse().ok().filter(|d: &f64| *d >= 1.0);
         } else if let Some(x) = l.strip_prefix("speed=") {
-            speed = x
-                .trim_end_matches('x')
-                .parse()
-                .ok()
-                .filter(|x: &f64| *x > 0.0);
+            speed = times(x);
         } else if let Some(t) = l
             .strip_prefix("out_time=")
             .filter(|t| t.starts_with(|c: char| c.is_ascii_digit()))
@@ -1324,6 +1320,13 @@ fn so_far(out_time: &str, length: Option<f64>, speed: Option<f64>) -> String {
         }
         _ => format!("{} so far", t.strip_prefix("00:").unwrap_or(t)),
     }
+}
+
+/// ffmpeg's speed in times real time, from "8.42x", "   8x" (padded) or "N/A"; None unless
+/// it's moving.
+fn times(speed: &str) -> Option<f64> {
+    let x: f64 = speed.trim().strip_suffix('x')?.trim().parse().ok()?;
+    (x > 0.0).then_some(x)
 }
 
 /// Seconds in "01:19" or "1:02:03"; None for "Unknown" and the like.
@@ -1729,6 +1732,11 @@ mod tests {
             Some("100%")
         );
         // ffmpeg, through FAKE_FFMPEG
+        assert_eq!(times("   8x"), Some(8.0));
+        assert_eq!(times(" 1.3x"), Some(1.3));
+        assert_eq!(times("8.42x"), Some(8.42));
+        assert_eq!(times("N/A"), None);
+        assert_eq!(times("   0x"), None);
         assert_eq!(
             so_far("00:26:16.123456", Some(1693.1), Some(8.0)),
             "93% · 15s left"

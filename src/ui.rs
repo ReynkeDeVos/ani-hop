@@ -835,6 +835,8 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
             .collect::<Vec<_>>(),
     );
     let toast = app.toast.as_ref().filter(|t| t.2.elapsed().as_secs() < 4);
+    // read once: the worker can take the last one off between two reads
+    let n = crate::dl_pending();
     let status = match (toast, &app.playing) {
         // shortcut: what's still underway is told apart by its "…"; give toasts a kind once a
         // finished one can end in "…"
@@ -850,10 +852,9 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         (_, Some(p)) if p.step.is_none() => {
             Line::from(vec![Span::styled(" ▶ ", ACCENT), p.title.as_str().into()])
         }
-        _ if crate::dl_pending() > 0 => {
+        _ if n > 0 => {
             // how far the one downloading got first, so that's what 80 columns keep, then
             // which one it is and what's after it
-            let n = crate::dl_pending();
             let head = match (&app.dl_now, ani::paused()) {
                 (Some(d), true) => paused(d),
                 (Some(d), false) => format!("{} ↓ {}", spinner(app), d.text),
