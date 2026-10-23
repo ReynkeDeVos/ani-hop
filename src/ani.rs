@@ -1043,9 +1043,13 @@ fn drop_if_empty(dir: &Path) -> std::io::Result<()> {
 /// Deletes what unfinished downloads of `eps` left in a show folder (yt-dlp's .part
 /// files, subtitles), and the folder if that was all it held.
 pub fn discard(dir: &Path, eps: &[String]) {
-    if !ours(dir) {
-        return;
+    if ours(dir) {
+        discard_parts(dir, eps);
+        let _ = drop_if_empty(dir);
     }
+}
+
+fn discard_parts(dir: &Path, eps: &[String]) {
     let done: Vec<String> = local_episodes(dir).into_iter().map(|(e, _)| e).collect();
     let Ok(rd) = fs::read_dir(dir) else {
         return;
@@ -1060,7 +1064,6 @@ pub fn discard(dir: &Path, eps: &[String]) {
             let _ = fs::remove_file(&p);
         }
     }
-    let _ = drop_if_empty(dir);
 }
 
 /// Whether `m` may become the show saved for a download folder: one ani-cli found never
@@ -1080,14 +1083,6 @@ pub fn download(
     mut progress: impl FnMut(&str),
 ) -> Result<(), String> {
     let dir = folder(m);
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    edit_index(|all| {
-        let d = all.entry(dir.clone()).or_default();
-        if replaces(m, &d.media) {
-            d.media = m.clone();
-        }
-    })
-    .map_err(|e| e.to_string())?;
     if local_episodes(&dir).iter().any(|(e, _)| e == ep) {
         return Ok(()); // yt-dlp wouldn't replace it, so it stays the audio it was
     }
@@ -1096,6 +1091,15 @@ pub fn download(
         if dl.0 || !wanted() {
             return Err("stopped".into());
         }
+        // under the lock, so stopping another episode can't drop the folder in between
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        edit_index(|all| {
+            let d = all.entry(dir.clone()).or_default();
+            if replaces(m, &d.media) {
+                d.media = m.clone();
+            }
+        })
+        .map_err(|e| e.to_string())?;
         let child = ani_cli()
             .args(["-d", "-S", &src.index.to_string(), "-e", ep, &src.query])
             .env("ANI_CLI_DOWNLOAD_DIR", &dir)
@@ -1153,12 +1157,28 @@ pub fn stop_download() {
     }
 }
 
-/// Stops episode `ep` of the show in `dir` if it's the one downloading. The caller took it
-/// out of the queue first, so if it isn't downloading yet, `wanted` keeps it from starting.
-pub fn cancel(dir: &Path, ep: &str) {
+/// Stops episodes of the show in `dir`, which the caller took out of the queue first: the
+/// one downloading is killed (the worker deletes what it got once it's gone), the others lose
+/// what earlier tries left. Under the lock downloads start under, so `wanted` keeps the
+/// others from starting and no start finds its folder dropped.
+pub fn stop_episodes(dir: &Path, eps: &[String]) {
     let mut dl = DOWNLOAD.lock().unwrap();
-    if let Some((pid, ..)) = dl.1.take_if(|(_, d, e)| d == dir && e == ep) {
+    let running = (dl.1.as_ref()).and_then(|(_, d, e)| (d == dir).then(|| e.clone()));
+    if running.as_ref().is_some_and(|e| eps.contains(e))
+        && let Some((pid, ..)) = dl.1.take()
+    {
         kill(pid);
+    }
+    if ours(dir) {
+        let waiting: Vec<String> = eps
+            .iter()
+            .filter(|e| running.as_ref() != Some(e))
+            .cloned()
+            .collect();
+        discard_parts(dir, &waiting);
+        if running.is_none() {
+            let _ = drop_if_empty(dir);
+        }
     }
 }
 

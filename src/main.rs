@@ -655,16 +655,17 @@ fn work(job: Job, tx: &Sender<Msg>) -> bool {
             })
         };
         let _ = tx.send(now("starting"));
-        let wanted = || is_queued(m.id, &ep);
-        let res = ani::download(m, &src, &ep, dub, wanted, |p| _ = tx.send(now(p)));
+        // this job's, not just queued: stopped and queued again is another job, with its audio
+        let mine = |q: &[Job]| {
+            (q.iter()).any(|j| j.id == job.id && j.eps.as_ref().is_some_and(|e| e.contains(&ep)))
+        };
+        let res = ani::download(m, &src, &ep, dub, || queue(mine), |p| _ = tx.send(now(p)));
         if res.is_err() && ani::stopped() {
             return false;
         }
         // gone from the job already: stopped (and maybe queued again since, which stays)
         let stopped = !edit_queue(|q| {
-            let had = q
-                .iter()
-                .any(|j| j.id == job.id && j.eps.as_ref().is_some_and(|e| e.contains(&ep)));
+            let had = mine(q);
             // done with it, also where another job of the show has it
             for j in q.iter_mut().filter(|j| had && j.media.id == m.id) {
                 if let Some(e) = &mut j.eps {
@@ -822,10 +823,7 @@ impl App {
                 }
             }
         });
-        let dir = ani::folder(m);
-        for ep in eps {
-            ani::cancel(&dir, ep);
-        }
+        ani::stop_episodes(&ani::folder(m), eps);
         self.dl_now.take_if(|n| n.id == m.id && eps.contains(&n.ep));
     }
 
