@@ -153,6 +153,13 @@ fn panel() -> Block<'static> {
         .border_style(DIM)
 }
 
+/// A paused download's row: how far it got, without the stale speed of its last line, when
+/// that's kept (yt-dlp; ffmpeg starts over).
+fn paused(n: &crate::DlNow) -> String {
+    let at = crate::got_so_far(&n.text).filter(|_| n.resumes);
+    at.map_or("‖ paused".into(), |p| format!("‖ paused {p}"))
+}
+
 fn spinner(app: &App) -> &'static str {
     SPINNER[(app.started.elapsed().as_millis() / 80) as usize % SPINNER.len()]
 }
@@ -317,11 +324,15 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     // and the next page right on "More…"
     let fetching = matches!(screen.view, View::Shows(_, Feed::Pages(_, _, true)));
     let busy = busy.or_else(|| fetching.then(|| ("more".to_string(), format!("{spin} loading…"))));
-    // and the episode downloading right now on its row
+    // and the episode downloading right now on its row, or how far it got when paused
     let busy = busy.or_else(|| match (&screen.view, &app.dl_now) {
-        (View::Episodes(m, _), Some(n)) if m.id == n.id => {
-            Some((n.ep.clone(), format!("↓ {}", n.text)))
-        }
+        (View::Episodes(m, _), Some(n)) if m.id == n.id => Some((
+            n.ep.clone(),
+            match ani::paused() {
+                true => paused(n),
+                false => format!("↓ {}", n.text),
+            },
+        )),
         _ => None,
     });
     let width = list_area.width.saturating_sub(1) as usize; // minus the pointer column
@@ -456,7 +467,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         | View::Sources(m, ..)
         | View::Input(Input::SourceQuery(m))
         | View::Audio(Some(m))
-        | View::Confirm(Pending::Progress(m, _)) => Some(m.clone()),
+        | View::Confirm(Pending::Progress(m, _) | Pending::Stop(m, _)) => Some(m.clone()),
         _ => None,
     };
     // posters just below the cursor load ahead, so scrolling shows them instantly
@@ -838,9 +849,20 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
             Line::from(vec![Span::styled(" ▶ ", ACCENT), p.title.as_str().into()])
         }
         _ if crate::dl_pending() > 0 => {
-            let left = format!(" {} ↓ {} left ", spinner(app), crate::dl_pending());
-            let now = (app.dl_now.as_ref())
-                .map_or(String::new(), |n| format!("{} · {}", n.label, n.text));
+            let (n, paused) = (crate::dl_pending(), ani::paused());
+            let left = match paused {
+                true => format!(" ‖ paused · {n} left "),
+                false => format!(" {} ↓ {n} left ", spinner(app)),
+            };
+            // paused, the speed in its last line is stale
+            let now = (app.dl_now.as_ref()).map_or(String::new(), |d| match paused {
+                true => [d.label.clone()]
+                    .into_iter()
+                    .chain(crate::got_so_far(&d.text).filter(|_| d.resumes))
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                false => format!("{} · {}", d.label, d.text),
+            });
             // cut before the key hints, with a column between
             let room =
                 (area.width as usize).saturating_sub(hints.width() + Span::raw(&left).width() + 1);
