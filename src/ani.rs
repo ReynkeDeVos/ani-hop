@@ -1077,8 +1077,10 @@ fn half_pieces(dir: &Path, ep: &str) -> Vec<PathBuf> {
     };
     (rd.flatten().map(|e| e.path()))
         .filter(|p| {
+            // exactly yt-dlp's "….part-Frag<n>.part", nothing of anyone else's
             let name = p.file_name().unwrap_or_default().to_string_lossy();
-            name.contains(&piece) && name.ends_with(".part")
+            let n = (name.rsplit_once(&piece)).and_then(|(_, n)| n.strip_suffix(".part"));
+            n.is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
         })
         .collect()
 }
@@ -1521,6 +1523,8 @@ mod tests {
             "Show Episode 2.mp4.part",
             "Show Episode 2.mp4.ytdl",
             "Show Episode 12.mp4.part-Frag3.part",
+            "Show Episode 2.mp4.part-Frag3.saved.part",
+            "Show Episode 2.mp4.part-Frag.part",
         ];
         files
             .iter()

@@ -4,7 +4,7 @@
 
 ### Fixed
 
-- A download that went on after a pause, quitting or a crash could get stuck on "Got error: HTTP Error 416: Range Not Satisfiable. Retrying fragment …", forever. yt-dlp can't go on with a piece it had written whole but not renamed yet when it stopped, and its retry asks the same way again. ani-hop now deletes the pieces yt-dlp was writing before it goes on, so they're fetched again whole (a few MB); the finished ones stay. A download stuck like this gets going again with pause and resume.
+- A download that went on after a pause, quitting or a crash could get stuck on "Got error: HTTP Error 416: Range Not Satisfiable. Retrying fragment …", forever. yt-dlp can't go on with a piece it had written whole but not renamed yet when it stopped, and its retry asks the same way again. ani-hop now deletes the pieces yt-dlp was writing before it goes on, so they're fetched again whole (at most 16, a few MB each); the finished ones stay. A download stuck like this gets going again with pause and resume.
 
 ## 0.6.6 – 2026-10-23
 
