@@ -1066,6 +1066,23 @@ fn discard_parts(dir: &Path, eps: &[String]) {
     }
 }
 
+/// The pieces yt-dlp was writing when episode `ep` stopped (by a pause, quitting, a crash).
+/// Going on from one that was complete but not renamed yet gets HTTP 416, and yt-dlp's retry
+/// without a range still sends one (its Request keeps the headers it was given, in 2026.10.21),
+/// forever. Deleted before it goes on, they're fetched again whole; the finished ones stay.
+fn half_pieces(dir: &Path, ep: &str) -> Vec<PathBuf> {
+    let piece = format!(" Episode {ep}.mp4.part-Frag");
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    (rd.flatten().map(|e| e.path()))
+        .filter(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            name.contains(&piece) && name.ends_with(".part")
+        })
+        .collect()
+}
+
 /// What downloads of `eps` that didn't finish left in `dir`.
 pub fn parts(dir: &Path, eps: &[String]) -> Vec<PathBuf> {
     let done: Vec<String> = local_episodes(dir).into_iter().map(|(e, _)| e).collect();
@@ -1118,6 +1135,9 @@ pub fn download(
         .map_err(|e| e.to_string())?;
         if local_episodes(&dir).iter().any(|(e, _)| e == ep) {
             return Ok(()); // yt-dlp wouldn't replace it, so it stays the audio it was
+        }
+        for p in half_pieces(&dir, ep) {
+            let _ = fs::remove_file(p);
         }
         let child = ani_cli()
             .args(["-d", "-S", &src.index.to_string(), "-e", ep, &src.query])
@@ -1489,6 +1509,24 @@ mod tests {
         assert_eq!(videos_dir(disabled, home), Path::new("/home/a/Videos"));
         let unquoted = "XDG_VIDEOS_DIR=$HOME/Clips";
         assert_eq!(videos_dir(unquoted, home), Path::new("/home/a/Videos"));
+    }
+
+    #[test]
+    fn goes_on_without_the_pieces_yt_dlp_was_writing() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-pieces-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let files = [
+            "Show Episode 2.mp4.part-Frag321.part",
+            "Show Episode 2.mp4.part-Frag322",
+            "Show Episode 2.mp4.part",
+            "Show Episode 2.mp4.ytdl",
+            "Show Episode 12.mp4.part-Frag3.part",
+        ];
+        files
+            .iter()
+            .for_each(|f| fs::write(dir.join(f), "").unwrap());
+        assert_eq!(half_pieces(&dir, "2"), [dir.join(files[0])]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
