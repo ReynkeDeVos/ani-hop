@@ -955,7 +955,7 @@ impl App {
             self.toast(format!("Stopped downloading {}", which(&stop)), false);
             self.stop(&m, &stop);
         } else if action == "pause" && hold && !ani::paused() {
-            ani::pause();
+            ani::pause(None);
             self.toast(
                 "Paused downloads · enter on a queued episode resumes them",
                 false,
@@ -1782,9 +1782,9 @@ impl App {
                     }
                     Pending::Pause(m, ep) => {
                         // only the episode it warned about; one that started since would
-                        // start over unasked
-                        if self.downloading(m, ep) {
-                            ani::pause();
+                        // start over unasked. Checked where it runs: its messages may not be
+                        // here yet.
+                        if ani::pause(Some((&ani::folder(m), ep))) {
                             self.toast(
                                 "Paused downloads · enter on a queued episode resumes them",
                                 false,

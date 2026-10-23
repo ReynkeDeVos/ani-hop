@@ -1173,13 +1173,20 @@ pub fn download(
 }
 
 /// Holds downloads: the running one stops where it is, keeping what it got, and none starts
-/// until `resume`.
-pub fn pause() {
+/// until `resume`. With `only` (folder, episode), just while that's the one running, since a
+/// question about it may be answered after the next one started; false then.
+pub fn pause(only: Option<(&Path, &str)>) -> bool {
     let mut dl = DOWNLOAD.lock().unwrap();
+    let running =
+        |(dir, ep): (&Path, &str)| (dl.1.as_ref()).is_some_and(|(_, d, e)| d == dir && e == ep);
+    if only.is_some_and(|o| !running(o)) {
+        return false;
+    }
     PAUSED.store(true, Ordering::Relaxed);
     if let Some((pid, ..)) = dl.1.take() {
         kill(pid);
     }
+    true
 }
 
 /// Lets downloads go on after `pause`; the caller wakes the worker. No lock: queue edits call
@@ -1457,6 +1464,11 @@ mod tests {
         file.lock().unwrap();
         assert!(held(&path));
         drop(file);
+        // a process another test forks right then holds the file too, until its exec closes it
+        let start = std::time::Instant::now();
+        while held(&path) && start.elapsed().as_secs() < 2 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(!held(&path));
         fs::remove_file(&path).unwrap();
         assert!(!held(&path));
@@ -1752,6 +1764,20 @@ mod tests {
         assert!(ok && out.exists());
         assert_eq!(args, format!("-y\n-i\nv.mp4\n{}\n", out.display()));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pause_asked_about_one_episode_leaves_the_next_alone() {
+        let dir = Path::new("/tmp/ani-hop-pause-test/Show");
+        let mut sleep = Command::new("sleep").arg("30").spawn().unwrap();
+        DOWNLOAD.lock().unwrap().1 = Some((sleep.id(), dir.to_path_buf(), "2".into()));
+        // asked about 1, which finished; 2 runs now
+        assert!(!pause(Some((dir, "1"))) && !paused());
+        assert!(DOWNLOAD.lock().unwrap().1.is_some());
+        assert!(pause(Some((dir, "2"))) && paused());
+        assert!(DOWNLOAD.lock().unwrap().1.is_none());
+        assert!(!sleep.wait().unwrap().success(), "2 was stopped");
+        resume();
     }
 
     #[test]
