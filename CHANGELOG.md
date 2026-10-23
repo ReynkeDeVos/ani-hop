@@ -4,7 +4,7 @@
 
 ### Added
 
-- Downloads can be paused: enter on the episode downloading offers "Pause downloads" first, then "Stop downloading". Paused, it keeps what it got and nothing else starts; enter on any queued episode offers "Resume downloads". → twice pauses, → twice again resumes. Queuing an episode resumes too, and quitting while paused doesn't ask, since the next start offers to resume them. A download through yt-dlp goes on from where it was; one through ffmpeg (shows whose audio is a separate track, ani-cli's choice) starts that episode over, which the pause and resume entries say.
+- Downloads can be paused: enter on the episode downloading offers "Pause downloads" first, then "Stop downloading". Paused, it keeps what it got and nothing else starts; enter on any queued episode offers "Resume downloads". → twice pauses, → twice again resumes. A chooser whose choice went away meanwhile, because the episode finished, goes back to the list instead of offering something else under the cursor. Queuing an episode resumes too, and quitting while paused doesn't ask, since the next start offers to resume them. A download through yt-dlp goes on from where it was. One through ffmpeg (ani-cli's choice for shows whose audio is a separate track) starts that episode over, so pausing it asks first, like stopping.
 - A download through ffmpeg shows how far along it is, like "93% · 26:16 of 28:13", instead of only "26:16 so far".
 
 ### Changed

@@ -467,7 +467,9 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         | View::Sources(m, ..)
         | View::Input(Input::SourceQuery(m))
         | View::Audio(Some(m))
-        | View::Confirm(Pending::Progress(m, _) | Pending::Stop(m, _)) => Some(m.clone()),
+        | View::Confirm(Pending::Progress(m, _) | Pending::Stop(m, _) | Pending::Pause(m)) => {
+            Some(m.clone())
+        }
         _ => None,
     };
     // posters just below the cursor load ahead, so scrolling shows them instantly

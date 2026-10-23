@@ -91,6 +91,8 @@ pub enum Pending {
     Quit,
     /// queued or downloading episodes to take out of the queue
     Stop(Media, Vec<String>),
+    /// downloads, while ffmpeg has one (of this show, or shown from it), which then starts over
+    Pause(Media),
     /// unfinished downloads of ani-hops that are gone, and their queue files
     Resume(Vec<Job>, Vec<PathBuf>),
 }
@@ -832,16 +834,14 @@ impl App {
         let _ = self.dl_wake.send(());
     }
 
-    /// "E3 starts over": the episode downloading, or paused, when ffmpeg has it, which can't go
-    /// on from what it got. `m` is the show on screen, other shows' are named.
-    fn starts_over(&self, m: &Media) -> Option<String> {
+    /// The episode downloading, or paused, when ffmpeg has it, which can't go on from what it
+    /// got: "Episode 3", or "Show E3" when `m`, the show on screen, isn't its show.
+    fn restarts(&self, m: &Media) -> Option<String> {
         let n = self.dl_now.as_ref().filter(|n| !n.resumes)?;
-        let which = if n.id == m.id {
-            format!("E{}", n.ep)
-        } else {
-            n.label.clone()
-        };
-        Some(format!("{which} starts over"))
+        Some(match n.id == m.id {
+            true => format!("Episode {}", n.ep),
+            false => n.label.clone(),
+        })
     }
 
     /// Whether enter on `stop` (queued episodes of `m`) is about pausing or resuming them all:
@@ -907,6 +907,14 @@ impl App {
             self.push(title, View::Confirm(Pending::Delete(paths)));
             return;
         }
+        // ffmpeg can't go on from what it got, so pausing loses that, and asks like stopping
+        if action == "pause"
+            && let Some(which) = self.restarts(&m)
+        {
+            let title = format!("Pause downloads? {which} starts over when resumed");
+            self.push(title, View::Confirm(Pending::Pause(m)));
+            return;
+        }
         // asks when that deletes what they got, so no stray enter or → can
         if action == "stop" && !ani::parts(&ani::folder(&m), &stop).is_empty() {
             let title = format!("Stop downloading {}?", which(&stop));
@@ -922,7 +930,8 @@ impl App {
             let source = (self.fresh.contains(&m.id))
                 .then(|| self.sources.get(&m.id).cloned())
                 .flatten();
-            let going = if ani::paused() {
+            // paused with something held, not just a pause left over from an emptied queue
+            let going = if ani::paused() && dl_pending() > 0 {
                 " · resuming downloads"
             } else {
                 ""
@@ -941,10 +950,10 @@ impl App {
             self.stop(&m, &stop);
         } else if action == "pause" && hold && !ani::paused() {
             ani::pause();
-            match self.starts_over(&m) {
-                Some(over) => self.toast(format!("Paused downloads · {over} when resumed"), false),
-                None => self.toast("Paused downloads · enter again resumes them", false),
-            }
+            self.toast(
+                "Paused downloads · enter on a queued episode resumes them",
+                false,
+            );
         } else if action == "resume" && ani::paused() {
             ani::resume();
             let _ = self.dl_wake.send(());
@@ -1047,6 +1056,15 @@ impl App {
             *list = ani::local_shows().into_iter().map(|(m, _)| m).collect();
         }
         let items = self.items(&self.stack.last().unwrap().view);
+        // a chooser whose action under the cursor went (the episode finished, say) is stale:
+        // back to the list, which shows what changed, rather than another action there
+        let top = self.stack.last().unwrap();
+        if matches!(top.view, View::DlChoice(..))
+            && let Some(cur) = top.menu.current()
+            && !items.iter().any(|i| i.key == cur.key)
+        {
+            return self.pop(1);
+        }
         self.top().menu.set_items(items);
     }
 
@@ -1379,10 +1397,10 @@ impl App {
                 let mut v = Vec::new();
                 // under the cursor, so → twice only pauses, and → twice again resumes
                 if self.holds(m, &stop) {
-                    let over = self.starts_over(m).unwrap_or_default();
+                    let over = self.restarts(m).map_or("", |_| "from the start");
                     v.push(match ani::paused() {
                         true => Item::new("resume", "▶  Resume downloads", over),
-                        false => Item::new("pause", "‖  Pause downloads", over),
+                        false => Item::new("pause", "‖  Pause downloads", ""),
                     });
                 }
                 if !get.is_empty() {
@@ -1499,7 +1517,8 @@ impl App {
                 vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
             }
             View::Confirm(Pending::Quit) => {
-                let hint = if dl_pending() > 0 {
+                // when it asks about downloads, which it doesn't while they're paused
+                let hint = if dl_pending() > 0 && !ani::paused() {
                     "kept for next start"
                 } else {
                     ""
@@ -1749,6 +1768,17 @@ impl App {
                             self.pop(1);
                         }
                         self.top().menu.marked.clear();
+                    }
+                    Pending::Pause(_) => {
+                        ani::pause();
+                        self.toast(
+                            "Paused downloads · enter on a queued episode resumes them",
+                            false,
+                        );
+                        self.pop(1);
+                        if matches!(self.top().view, View::DlChoice(..)) {
+                            self.pop(1);
+                        }
                     }
                     Pending::Stop(m, eps) => {
                         // what finished or was stopped meanwhile stays as it is

@@ -51,15 +51,16 @@ for a; do
 	set -- "$@" "$a"
 done
 log=$out.part.log
-# ani-hop stops a download by signalling ani-cli's children, and this is one
-trap 'kill $pid $probe 2>/dev/null; rm -f "$log"; exit 1' INT HUP TERM
+# ani-hop stops a download by signalling ani-cli's children, and this is one. By parent, not
+# saved pids: ffprobe's is free again once it's done, maybe someone else's by then.
+trap 'pkill -P $$ 2>/dev/null; rm -f "$log"; exit 1' INT HUP TERM
 # the episode's length, from its playlist, alongside the download
 ffprobe -v error -extension_picky 0 -referer "$ref" -show_entries format=duration -of default=nw=1 "$src" 2>/dev/null &
-probe=$!
 ffmpeg "$@" 2>"$log" &
-pid=$!
-wait $pid
+wait $!
 ok=$?
+# still asking after all, it would hold ani-hop's end of stdout open
+pkill -P $$ 2>/dev/null
 cat "$log" >&2
 # ffmpeg exits 0 after skipping a segment it can't get, which only the input side warns about,
 # and after errors in what it got. shortcut: a segment that arrives short or empty with no
@@ -1132,10 +1133,11 @@ pub fn download(
     };
     let mut length = None;
     let (_, stderr) = follow(child, |l| {
-        // yt-dlp's percentages, not "Destination: …" or, going on from where it was, a line for
-        // each piece it has already
-        let percent = |r: &&str| r.starts_with(|c: char| c.is_ascii_digit());
-        if let Some(rest) = l.strip_prefix("[download]").map(str::trim).filter(percent) {
+        // yt-dlp's percentages and errors, not where it writes to or, going on from where it
+        // was, a line for each piece it has already
+        let noise =
+            |r: &&str| r.starts_with("Destination:") || r.ends_with("has already been downloaded");
+        if let Some(rest) = (l.strip_prefix("[download]").map(str::trim)).filter(|r| !noise(r)) {
             progress(rest, true);
         } else if let Some(d) = l.strip_prefix("duration=") {
             length = d.parse().ok().filter(|d: &f64| *d >= 1.0);
@@ -1620,9 +1622,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("ani-hop-ffmpeg-{}", std::process::id()));
         let (fake, real) = (dir.join("fake"), dir.join("real"));
         // stands in for the real one: logs its arguments, writes its last one, warns $WARN
-        let logger = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LOG\"\nfor a; do o=$a; done\n: > \"$o\"\n[ -z \"$WARN\" ] || echo \"$WARN\" >&2\nexit $CODE\n";
-        // and the real ffprobe: says what it was asked as the length
-        let probe = "#!/bin/sh\necho \"duration=$*\"\n";
+        // (with $SLOW it keeps going, its pid in $LOG.ffmpeg)
+        let logger = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LOG\"\nfor a; do o=$a; done\n: > \"$o\"\n[ -z \"$SLOW\" ] || { echo $$ > \"$LOG.ffmpeg\"; exec sleep 60; }\n[ -z \"$WARN\" ] || echo \"$WARN\" >&2\nexit $CODE\n";
+        // and the real ffprobe: says what it was asked as the length, or with $HANG never answers
+        let probe = "#!/bin/sh\n[ -z \"$HANG\" ] || { echo $$ > \"$LOG.probe\"; exec sleep 60; }\necho \"duration=$*\"\n";
         for (bin, name, script) in [
             (&fake, "ffmpeg", FAKE_FFMPEG),
             (&real, "ffmpeg", logger),
@@ -1683,6 +1686,64 @@ mod tests {
             !ok && !out.exists() && part.exists(),
             "errors in what it got"
         );
+        // a probe that never answers doesn't keep the download from ending
+        let start = std::time::Instant::now();
+        let o = Command::new(fake.join("ffmpeg"))
+            .args(ani_cli)
+            .arg(&out)
+            .env(
+                "PATH",
+                format!("{}:{}:/usr/bin:/bin", fake.display(), real.display()),
+            )
+            .env("LOG", &log)
+            .env("CODE", "0")
+            .env("HANG", "1")
+            .output()
+            .unwrap();
+        assert!(o.status.success() && start.elapsed().as_secs() < 30);
+        // stopped (pause, stop, quit): the .part stays for the next try to replace, ffmpeg and
+        // ffprobe go
+        let _ = fs::remove_file(&out);
+        let mut shim = Command::new(fake.join("ffmpeg"))
+            .args(ani_cli)
+            .arg(&out)
+            .env(
+                "PATH",
+                format!("{}:{}:/usr/bin:/bin", fake.display(), real.display()),
+            )
+            .env("LOG", &log)
+            .env("CODE", "0")
+            .env("SLOW", "1")
+            .env("HANG", "1")
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = |name: &str| fs::read_to_string(dir.join(format!("log.{name}"))).ok();
+        let gone = |p: &str| {
+            !Command::new("kill")
+                .args(["-0", p.trim()])
+                .status()
+                .unwrap()
+                .success()
+        };
+        let wait_for = |done: &dyn Fn() -> bool| {
+            let start = std::time::Instant::now();
+            while !done() && start.elapsed().as_secs() < 10 {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            done()
+        };
+        assert!(wait_for(
+            &|| pid("ffmpeg").is_some() && pid("probe").is_some()
+        ));
+        let id = shim.id().to_string();
+        Command::new("kill").args(["-TERM", &id]).status().unwrap();
+        assert!(!shim.wait().unwrap().success());
+        assert!(part.exists() && !out.exists() && !dir.join("A Episode 1.mp4.part.log").exists());
+        for name in ["ffmpeg", "probe"] {
+            let p = pid(name).unwrap();
+            assert!(wait_for(&|| gone(&p)), "{name} is gone");
+        }
         let (ok, _, _, _) = run("0", "[mp4 @ 0x1] [warning] Non-monotonic DTS", &ani_cli);
         assert!(ok && out.exists(), "the muxer's warnings lose nothing");
         assert!(!dir.join("A Episode 1.mp4.part.log").exists());
