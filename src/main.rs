@@ -881,11 +881,7 @@ impl App {
                     "Skip openings and endings",
                     if ani::skip_on() { "on" } else { "off" },
                 ),
-                Item::new(
-                    "audio",
-                    "Default audio…",
-                    ani::audio_label(ani::audio(None)),
-                ),
+                Item::new("audio", "Audio…", ani::audio_label(ani::audio(None))),
                 Item::new(
                     "folder",
                     "Download folder…",
@@ -910,11 +906,7 @@ impl App {
                     v.push(Item::new("update", "Update ani-cli", cmd));
                 }
                 if self.user.is_none() {
-                    v.push(Item::new(
-                        "login",
-                        "Log in to AniList…",
-                        "your lists + progress sync",
-                    ));
+                    v.push(Item::new("login", "Log in to AniList…", ""));
                 }
                 v.push(Item::new("continue", "Continue", ""));
                 v
@@ -991,7 +983,7 @@ impl App {
                 }
                 v.push(Item::new(
                     "audio",
-                    "♪  Audio for this show…",
+                    "♪  Audio…",
                     ani::audio_label(ani::audio(Some(m.id))),
                 ));
                 v.push(Item::new(
@@ -1454,7 +1446,7 @@ impl App {
         match input {
             Input::Search => {
                 let c = self.client.clone();
-                let title = format!("Search: {text}");
+                let title = text.clone();
                 self.push_loading(&title, Feed::Whole, None, move || {
                     let found = c.browse("SEARCH_MATCH", Some(&text), 1);
                     ani::or_ani_cli(found, &text, ani::search)
@@ -1543,7 +1535,7 @@ impl App {
         if self.fresh.contains(&m.id) {
             return;
         }
-        if want.is_some() {
+        if matches!(want, Some(Want::Episodes(_))) {
             self.toast(format!("Searching ani-cli for {}…", m.name()), false);
         }
         if let Some(slot) = self.resolving.get_mut(&m.id) {
@@ -1704,8 +1696,7 @@ impl App {
                     }
                 });
                 if fallback {
-                    let text = "AniList search failed, showing ani-cli's matches without posters or details";
-                    self.toast(text, true);
+                    self.toast("AniList search failed, showing ani-cli's matches", true);
                 }
             }
             Msg::More(id, res) => {

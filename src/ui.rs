@@ -139,7 +139,7 @@ fn logo() -> impl Iterator<Item = Line<'static>> {
         .map(|l| Line::styled(*l, Style::new().fg(ACCENT).bold()))
 }
 
-/// Short name for breadcrumbs and the panel border; questions are shown in full below.
+/// Short name for the breadcrumbs; questions are shown in full in the menu.
 fn crumb(s: &crate::Screen) -> &str {
     match s.view {
         View::Confirm(_) => "Confirm",
@@ -197,10 +197,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let spin = spinner(app);
     let shimmer = (app.started.elapsed().as_millis() / 30) as usize;
     let screen = app.stack.last_mut().unwrap();
-    let block = panel().title(Span::styled(
-        format!(" {} ", crumb(screen)),
-        Style::new().fg(Color::Reset).bold(),
-    ));
+    let block = panel();
     let inner = block.inner(area).inner(Margin::new(1, 0));
     f.render_widget(block, area);
     // a confirmation shows its question where the filter prompt would be, wrapped
@@ -603,13 +600,6 @@ fn banner(app: &App) -> Vec<Line<'static>> {
     };
     let mut v: Vec<Line> = logo().collect();
     v.push("".into());
-    v.push(match &app.user {
-        Some((_, n)) => Line::from(vec![
-            Span::styled("● ", Color::Green),
-            format!("AniList: {n}").into(),
-        ]),
-        None => Line::styled("○ AniList: not connected", DIM),
-    });
     v.push(Line::styled(
         format!("↓ {}", ani::tilde(&ani::download_root())),
         DIM,
@@ -619,6 +609,10 @@ fn banner(app: &App) -> Vec<Line<'static>> {
             format!("↑ ani-hop {new} is out: {cmd}"),
             ACCENT,
         ));
+    }
+    // on an input typing is the text itself, and there's nothing to mark
+    if matches!(app.stack.last().unwrap().view, View::Input(_)) {
+        return v;
     }
     v.push("".into());
     v.extend([
@@ -796,7 +790,7 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         "clear"
     };
     let mut keys = vec![("enter", enter), ("esc", esc)];
-    if screen.menu.multi {
+    if screen.menu.multi && !screen.menu.items.is_empty() {
         keys.splice(0..0, [("tab", "mark"), ("^a", "all")]);
     }
     keys.push(("^c", "quit"));
@@ -822,14 +816,10 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
                 _ => Color::Green,
             },
         ),
-        (_, Some(p)) => match p.step {
-            Some(step) => Line::from(vec![
-                Span::styled(format!(" {} ", spinner(app)), ACCENT),
-                p.title.as_str().into(),
-                Span::styled(format!(" · {step}…"), DIM),
-            ]),
-            None => Line::from(vec![Span::styled(" ▶ ", ACCENT), p.title.as_str().into()]),
-        },
+        // while it starts the pop-up says so, and downloads keep their line
+        (_, Some(p)) if p.step.is_none() => {
+            Line::from(vec![Span::styled(" ▶ ", ACCENT), p.title.as_str().into()])
+        }
         _ if app.dl_pending > 0 => Line::from(vec![
             Span::styled(
                 format!(" {} ↓ {} left ", spinner(app), app.dl_pending),
