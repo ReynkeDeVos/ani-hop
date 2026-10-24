@@ -509,14 +509,21 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             (up, area.y, "shift↑", " back up "),
             (down, area.bottom().saturating_sub(1), "shift↓", " read on "),
         ];
-        for (show, y, key, what) in hints {
-            let hint = Line::from(vec![
-                " ".into(),
-                Span::styled(key, ACCENT),
-                Span::styled(what, DIM),
-            ]);
+        for (_, y, key, what) in hints.into_iter().filter(|h| h.0) {
             let row = Rect::new(area.x, y, area.width, 1).inner(Margin::new(2, 0));
-            if show && row.width as usize >= hint.width() {
+            // a narrow border drops the words, then "shift"
+            let arrow = &key["shift".len()..];
+            let hint = [(key, what), (key, " "), (arrow, " ")]
+                .map(|(k, w)| {
+                    Line::from(vec![
+                        " ".into(),
+                        Span::styled(k, ACCENT),
+                        Span::styled(w, DIM),
+                    ])
+                })
+                .into_iter()
+                .find(|h| h.width() <= row.width as usize);
+            if let Some(hint) = hint {
                 f.render_widget(hint.right_aligned(), row);
             }
         }
@@ -830,7 +837,10 @@ fn media_preview(
     let text: Vec<_> = text.into_iter().filter(|t| !t.0.is_empty()).collect();
     let top = head_h + u16::from(about.is_empty());
     let narrow = (rows + 1).saturating_sub(top) as usize;
-    let text = flow(&text, narrow, info.width, area.width);
+    let mut text = flow(&text, narrow, info.width, area.width);
+    // shortcut: rows end at u16::MAX, which no AniList description gets near even one column
+    // wide; page the text in parts if one ever does
+    text.truncate(usize::from((u16::MAX - area.y).saturating_sub(top)));
     let end = match text.len() {
         0 => head_h,
         n => top + n as u16,
@@ -873,10 +883,11 @@ fn media_preview(
 
 /// Wraps paragraphs word by word like Paragraph does, the first `narrow` lines to `first`
 /// columns and the rest to `rest`, with a blank line between the parts of `text`. A word
-/// wider than its line is broken, so text without spaces (Japanese, a URL) is never cut.
+/// wider than its line is broken between characters (graphemes), so text without spaces
+/// (Japanese, a URL) is never cut.
 fn flow(text: &[(&str, Style)], narrow: usize, first: u16, rest: u16) -> Vec<Line<'static>> {
     let width = |s: &str| Span::raw(s).width();
-    let room = |n: usize| usize::from(if n < narrow { first } else { rest }).max(1);
+    let room = |n: usize| usize::from(if n < narrow { first } else { rest.max(1) });
     let mut out = Vec::new();
     for (i, &(s, style)) in text.iter().enumerate() {
         if i > 0 {
@@ -899,12 +910,16 @@ fn flow(text: &[(&str, Style)], narrow: usize, first: u16, rest: u16) -> Vec<Lin
                     }
                     out.push(Line::styled(std::mem::take(&mut line), style));
                 }
-                for c in word.chars() {
-                    let c_width = width(c.encode_utf8(&mut [0; 4]));
-                    if !line.is_empty() && width(&line) + c_width > room(out.len()) {
+                let word = Span::raw(word);
+                for g in word.styled_graphemes(style).map(|g| g.symbol) {
+                    if !line.is_empty() && width(&line) + width(g) > room(out.len()) {
                         out.push(Line::styled(std::mem::take(&mut line), style));
                     }
-                    line.push(c);
+                    // a narrow line too small for a wide character stays empty
+                    while line.is_empty() && out.len() < narrow && width(g) > room(out.len()) {
+                        out.push(Line::default());
+                    }
+                    line.push_str(g);
                 }
             }
             out.push(Line::styled(line, style));
@@ -1090,6 +1105,11 @@ mod tests {
             ["a\u{a0}b", "c"]
         );
         assert!(flow(&[], 3, 5, 8).is_empty());
+        // a narrow line too small for a wide character is skipped; joined emoji stay whole
+        assert_eq!(text(flow(&[("ビデ", SOFT)], 2, 1, 4)), ["", "", "ビデ"]);
+        assert_eq!(text(flow(&[("a ビ", SOFT)], 3, 0, 4)), ["", "", "", "a ビ"]);
+        let family = "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(text(flow(&[(family, SOFT)], 0, 9, 2)), [family]);
         // no paragraph starts on the last narrow line, under the poster
         assert_eq!(text(flow(&[("aa bb", SOFT)], 1, 2, 8)), ["", "aa bb"]);
         let out = flow(&[("aa", SOFT), ("bb", SOFT)], 3, 5, 8);
