@@ -264,6 +264,9 @@ pub struct App {
     pub started: Instant,
     /// media whose title glint plays, and since when
     pub glint: (u64, Instant),
+    /// the show and episode in the preview, and how many pages down it's read; another
+    /// starts at its top
+    pub scroll: (Option<(u64, Option<String>)>, u16),
     pub missing: Vec<(&'static str, &'static str, &'static str)>,
     /// the installed ani-cli's version, when it's older than ani::TESTED_ANI_CLI
     pub old_ani_cli: Option<String>,
@@ -746,6 +749,7 @@ impl App {
             toast: None,
             started: Instant::now(),
             glint: (0, Instant::now()),
+            scroll: (None, 0),
             missing: ani::missing_deps(),
             old_ani_cli: ani::old_ani_cli(),
             release: None,
@@ -1556,6 +1560,18 @@ impl App {
         // the next page of a ranking from anywhere in it, not just on "More…" at its end
         if ctrl && k.code == KeyCode::Char('f') {
             return self.more();
+        }
+        // fzf's preview keys page through a preview that doesn't fit; Menu::key would take
+        // them for plain ↑↓
+        if k.modifiers.contains(KeyModifiers::SHIFT)
+            && matches!(k.code, KeyCode::Up | KeyCode::Down)
+        {
+            let n = &mut self.scroll.1;
+            *n = match k.code {
+                KeyCode::Up => n.saturating_sub(1),
+                _ => n.saturating_add(1),
+            };
+            return;
         }
         match self.top().menu.key(k) {
             Some(Act::Accept) => self.accept(),

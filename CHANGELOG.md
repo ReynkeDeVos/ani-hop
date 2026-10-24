@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.8 – 2026-10-24
+
+### Fixed
+
+- A show's description was cut off at the bottom of the preview without a sign, which a zoomed-in terminal made easy to hit. It now starts beside the poster, in the rows under the facts that stayed empty, and goes on full width below it, so it fits whole far more often. When it still doesn't, the preview's border says "shift↓ read on": shift+↓ and shift+↑ page through the preview like fzf's, and the next show starts at its top. An episode's summary and a show's facts aren't cut off beside the poster anymore either.
+
 ## 0.6.7 – 2026-10-23
 
 ### Changed
