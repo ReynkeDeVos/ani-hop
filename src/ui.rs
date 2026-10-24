@@ -494,11 +494,39 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         _ => None,
     };
     let ep = ep.map(|it| it.key.clone());
+    // another show or episode, or none, starts at its top
+    let shown = media.as_ref().map(|m| (m.id, ep.clone()));
+    if app.scroll.0 != shown {
+        app.scroll = (shown, 0);
+    }
     if let Some(m) = media {
         if shows_eps {
             app.want_episodes(&m);
         }
-        media_preview(app, f, inner, &m, ep.as_deref());
+        let (up, down) = media_preview(app, f, inner, &m, ep.as_deref());
+        // a cut is never silent: the border says how to read on, and how to get back up
+        let hints = [
+            (up, area.y, "shift↑", " back up "),
+            (down, area.bottom().saturating_sub(1), "shift↓", " read on "),
+        ];
+        for (_, y, key, what) in hints.into_iter().filter(|h| h.0) {
+            let row = Rect::new(area.x, y, area.width, 1).inner(Margin::new(2, 0));
+            // a narrow border drops the words, then "shift"
+            let arrow = &key["shift".len()..];
+            let hint = [(key, what), (key, " "), (arrow, " ")]
+                .map(|(k, w)| {
+                    Line::from(vec![
+                        " ".into(),
+                        Span::styled(k, ACCENT),
+                        Span::styled(w, DIM),
+                    ])
+                })
+                .into_iter()
+                .find(|h| h.width() <= row.width as usize);
+            if let Some(hint) = hint {
+                f.render_widget(hint.right_aligned(), row);
+            }
+        }
         return ahead.iter().for_each(|m| app.want_cover(m, false));
     }
     let lines: Vec<Line> = match &screen.view {
@@ -658,25 +686,27 @@ fn banner(app: &App) -> Vec<Line<'static>> {
     v
 }
 
-fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option<&str>) {
+/// A show's poster with its facts beside it, and its description flowing around it. What
+/// doesn't fit pages with shift+↓↑; returns whether there's more (above, below).
+fn media_preview(
+    app: &mut App,
+    f: &mut Frame,
+    area: Rect,
+    m: &Media,
+    ep: Option<&str>,
+) -> (bool, bool) {
     let (fw, fh) = app.cell;
     let rows = (area.height * 3 / 5).clamp(6, 26).min(area.height);
     let cols = ((rows as f32 * fh as f32 * 0.7) / fw.max(1) as f32).round() as u16;
     app.poster = Size::new(cols.min(area.width / 2), rows);
     app.want_cover(m, true);
 
-    let [top, _, bottom] = Layout::vertical([
-        Constraint::Length(rows),
-        Constraint::Length(1),
-        Constraint::Fill(1),
-    ])
-    .areas(area);
     let [poster, _, info] = Layout::horizontal([
         Constraint::Length(app.poster.width),
         Constraint::Length(2),
         Constraint::Fill(1),
     ])
-    .areas(top);
+    .areas(Rect::new(area.x, area.y, area.width, rows));
     let accent = m
         .cover_image
         .color
@@ -685,11 +715,6 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
         .unwrap_or(ACCENT);
     if app.glint.0 != m.id {
         app.glint = (m.id, std::time::Instant::now());
-    }
-    match app.covers.get(&m.id) {
-        Some(Cover::Ready(_, p)) => kitty::render(p, poster, f.buffer_mut()),
-        // the cover's dominant color stands in while it loads
-        _ => f.render_widget(Block::new().bg(accent), poster),
     }
 
     let mut lines = vec![Line::styled(
@@ -778,6 +803,7 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
             DIM,
         ));
     }
+    let mut about = "";
     if let Some(ep) = ep
         && let Some(i) = app.ep_info.get(&m.id).and_then(|i| i.get(ep))
     {
@@ -789,7 +815,7 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
                 .filter(|t| !t.is_empty())
                 .collect::<Vec<_>>();
             lines.push(Line::styled(title.join(" · "), Style::new().bold()));
-            lines.extend(i.about.lines().map(|l| Line::styled(l.to_string(), SOFT)));
+            about = &i.about;
         } else {
             lines.push(Line::styled(
                 format!("Episode {ep} · not watched yet, so no summary"),
@@ -797,14 +823,109 @@ fn media_preview(app: &mut App, f: &mut Frame, area: Rect, m: &Media, ep: Option
             ));
         }
     }
-    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), info);
+    // the gap before the description is one row, also when nothing follows the genres
+    if lines.last().is_some_and(|l| l.width() == 0) {
+        lines.pop();
+    }
+    let head = Paragraph::new(lines).wrap(Wrap { trim: true });
+    let head_h = head.line_count(info.width) as u16;
+
+    // the episode's summary right under its title, then the description: beside the poster
+    // (and in the row under it) first, where the facts leave rows empty, then full width
+    let desc = m.description.as_deref().map(strip_html).unwrap_or_default();
+    let text = [(about, SOFT), (desc.as_str(), Style::new())];
+    let text: Vec<_> = text.into_iter().filter(|t| !t.0.is_empty()).collect();
+    let top = head_h + u16::from(about.is_empty());
+    let narrow = (rows + 1).saturating_sub(top) as usize;
+    let mut text = flow(&text, narrow, info.width, area.width);
+    // shortcut: rows end at u16::MAX, which no AniList description gets near even one column
+    // wide; page the text in parts if one ever does
+    text.truncate(usize::from((u16::MAX - area.y).saturating_sub(top)));
+    let end = match text.len() {
+        0 => head_h,
+        n => top + n as u16,
+    };
+
+    // drawn whole, then the rows that are read now go on screen: placeholder cells carry
+    // their own poster row, so a poster scrolled halfway shows its lower half
+    let page_h = end.max(rows);
+    let page_area = Rect::new(area.x, area.y, area.width, page_h.max(area.height));
+    let mut page = Buffer::empty(page_area);
+    match app.covers.get(&m.id) {
+        Some(Cover::Ready(_, p)) => kitty::render(p, poster, &mut page),
+        // the cover's dominant color stands in while it loads
+        _ => Block::new().bg(accent).render(poster, &mut page),
+    }
+    let head_area = Rect::new(info.x, info.y, info.width, head_h);
+    head.render(head_area, &mut page);
     // only true RGB titles: a named color has no RGB value to fade back into
     if let Color::Rgb(r, g, b) = accent {
-        glint(app, f.buffer_mut(), info, (r, g, b));
+        glint(app, &mut page, head_area, (r, g, b));
+    }
+    for (i, line) in text.into_iter().enumerate() {
+        let column = if i < narrow { info } else { area };
+        let y = area.y + top + i as u16;
+        line.render(Rect::new(column.x, y, column.width, 1), &mut page);
     }
 
-    let desc = m.description.as_deref().map(strip_html).unwrap_or_default();
-    f.render_widget(Paragraph::new(desc).wrap(Wrap { trim: true }), bottom);
+    // a page is the pane less one row, so the last line read stays on screen
+    let step = area.height.saturating_sub(1).max(1);
+    let max = page_h.saturating_sub(area.height);
+    let n = &mut app.scroll.1;
+    *n = (*n).min(max.div_ceil(step));
+    let off = (*n * step).min(max);
+    let buf = f.buffer_mut();
+    for pos in area.positions() {
+        buf[pos] = page[(pos.x, pos.y + off)].clone();
+    }
+    (off > 0, off < max)
+}
+
+/// Wraps paragraphs word by word like Paragraph does, the first `narrow` lines to `first`
+/// columns and the rest to `rest`, with a blank line between the parts of `text`. A word
+/// wider than its line is broken between characters (graphemes), so text without spaces
+/// (Japanese, a URL) is never cut.
+fn flow(text: &[(&str, Style)], narrow: usize, first: u16, rest: u16) -> Vec<Line<'static>> {
+    let width = |s: &str| Span::raw(s).width();
+    let room = |n: usize| usize::from(if n < narrow { first } else { rest.max(1) });
+    let mut out = Vec::new();
+    for (i, &(s, style)) in text.iter().enumerate() {
+        if i > 0 {
+            out.push(Line::default());
+        }
+        for para in s.lines() {
+            // the last narrow line is the row under the poster: a paragraph starting there
+            // would look indented, so it starts full width below it
+            if out.len() + 1 == narrow && !para.trim().is_empty() {
+                out.push(Line::default());
+            }
+            let mut line = String::new();
+            // no-break spaces stay inside a word, like in the facts
+            for word in para.split(' ').filter(|w| !w.is_empty()) {
+                if !line.is_empty() {
+                    if width(&line) + 1 + width(word) <= room(out.len()) {
+                        line.push(' ');
+                        line.push_str(word);
+                        continue;
+                    }
+                    out.push(Line::styled(std::mem::take(&mut line), style));
+                }
+                let word = Span::raw(word);
+                for g in word.styled_graphemes(style).map(|g| g.symbol) {
+                    if !line.is_empty() && width(&line) + width(g) > room(out.len()) {
+                        out.push(Line::styled(std::mem::take(&mut line), style));
+                    }
+                    // a narrow line too small for a wide character stays empty
+                    while line.is_empty() && out.len() < narrow && width(g) > room(out.len()) {
+                        out.push(Line::default());
+                    }
+                    line.push_str(g);
+                }
+            }
+            out.push(Line::styled(line, style));
+        }
+    }
+    out
 }
 
 fn footer(app: &App, f: &mut Frame, area: Rect) {
@@ -959,6 +1080,40 @@ mod tests {
         assert_eq!(pretty("NOT_YET_RELEASED"), "Upcoming");
         assert_eq!(pretty("SPECIAL"), "Special");
         assert_eq!(pretty("ONA"), "ONA");
+    }
+
+    #[test]
+    fn flows_around_the_poster() {
+        let text = |lines: Vec<Line>| lines.iter().map(Line::to_string).collect::<Vec<_>>();
+        // two lines beside the poster, then full width; paragraphs and parts keep a blank
+        let out = flow(
+            &[("aa bb cc dd ee\n\nff", SOFT), ("gg", DIM.into())],
+            2,
+            5,
+            8,
+        );
+        assert_eq!(
+            text(out.clone()),
+            ["aa bb", "cc dd", "ee", "", "ff", "", "gg"]
+        );
+        assert_eq!((out[0].style, out[6].style), (SOFT, DIM.into()));
+        // words wider than their line are broken, by width: ビデオ is 6 columns
+        let out = flow(&[("ビデオビデオ x", Style::new())], 2, 5, 4);
+        assert_eq!(text(out), ["ビデ", "オビ", "デオ", "x"]);
+        assert_eq!(
+            text(flow(&[("a\u{a0}b c", Style::new())], 0, 1, 3)),
+            ["a\u{a0}b", "c"]
+        );
+        assert!(flow(&[], 3, 5, 8).is_empty());
+        // a narrow line too small for a wide character is skipped; joined emoji stay whole
+        assert_eq!(text(flow(&[("ビデ", SOFT)], 2, 1, 4)), ["", "", "ビデ"]);
+        assert_eq!(text(flow(&[("a ビ", SOFT)], 3, 0, 4)), ["", "", "", "a ビ"]);
+        let family = "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        assert_eq!(text(flow(&[(family, SOFT)], 0, 9, 2)), [family]);
+        // no paragraph starts on the last narrow line, under the poster
+        assert_eq!(text(flow(&[("aa bb", SOFT)], 1, 2, 8)), ["", "aa bb"]);
+        let out = flow(&[("aa", SOFT), ("bb", SOFT)], 3, 5, 8);
+        assert_eq!(text(out), ["aa", "", "", "bb"]);
     }
 
     #[test]
