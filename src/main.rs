@@ -2204,16 +2204,19 @@ pub fn list_label(status: &str) -> &'static str {
 
 /// Runs test `name` again in a child process with `env` set (temp XDG dirs, a stub first on
 /// PATH), for a test that needs a process environment of its own; the child sees
-/// ANIHOP_CHILD and does the work. Whether it passed.
+/// ANIHOP_CHILD and does the work. Whether it passed, as that one test: a name that no
+/// longer matches would run none and pass.
 #[cfg(test)]
 pub fn in_child(name: &str, env: &[(&str, std::ffi::OsString)]) -> bool {
-    Command::new(std::env::current_exe().unwrap())
+    let out = Command::new(std::env::current_exe().unwrap())
         .args([name, "--exact", "--test-threads=1"])
         .env("ANIHOP_CHILD", "1")
         .envs(env.iter().map(|(k, v)| (k, v)))
-        .stdout(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .output();
+    out.is_ok_and(|o| {
+        o.status.success()
+            && String::from_utf8_lossy(&o.stdout).contains("test result: ok. 1 passed")
+    })
 }
 
 #[cfg(test)]
