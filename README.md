@@ -4,13 +4,13 @@
 
 A fast terminal UI for anime: find a show, then stream or download it through [ani-cli](https://github.com/pystardust/ani-cli).
 
-- **No scraper of its own.** Every source comes from ani-cli, which a large community keeps working. When a site changes, updating ani-cli is enough.
-- **One binary.** Written in Rust, starts instantly, needs no Python, fzf or rofi.
-- **Posters in the terminal.** In Ghostty and kitty, even inside tmux.
+- **No scraper of its own.** Every source comes from ani-cli, which a large community keeps working on. When a site changes, updating ani-cli is enough.
+- **Posters in the terminal.** In Ghostty and kitty, even inside tmux/herdr (with less performance).
 - **AniList built in.** Your lists, watched episodes marked, progress saved after every episode.
 - **Find an episode by what happens in it.** The filter searches the titles and summaries of watched episodes. Unwatched ones stay blank, so nothing spoils.
 - **Downloads in the background.** Pause them or quit; unfinished ones come back after a restart.
-- **Sub or dub.** For all shows or just one, with openings and endings skipped.
+- **Sub or dub.** Japanese or English audio, with or without subtitles, for all shows or just one.
+- **Skips openings and endings.** With ani-skip, in streams and downloads alike.
 
 ## Install
 
@@ -29,7 +29,7 @@ brew tap pystardust/ani-cli https://github.com/pystardust/ani-cli.git
 brew install pystardust/ani-cli/ani-cli reynkedevos/tap/ani-hop
 ```
 
-Update with `brew upgrade`. The same works with Homebrew on Linux.
+Update with `brew upgrade`.
 
 ### Windows
 
