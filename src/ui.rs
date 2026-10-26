@@ -680,10 +680,12 @@ fn setup(app: &App) -> Vec<Line<'static>> {
 }
 
 fn banner(app: &App) -> Vec<Line<'static>> {
-    let key = |k: &'static str, what: &'static str| {
+    // a key, what it does, and the other keys that do the same
+    let key = |k: &'static str, what: &'static str, also: &'static str| {
         Line::from(vec![
             Span::styled(format!("{k:>10}  "), ACCENT),
-            Span::styled(what, DIM),
+            Span::raw(format!("{what:<21}")),
+            Span::styled(format!("{also:>5}"), DIM),
         ])
     };
     let mut v: Vec<Line> = logo().collect();
@@ -703,16 +705,21 @@ fn banner(app: &App) -> Vec<Line<'static>> {
         return v;
     }
     v.push("".into());
+    // grouped by what they're for, the everyday ones first
     v.extend([
-        key("type", "filter, fzf syntax:"),
-        key("", "'exact ^start end$ !not"),
-        key("←↓↑→ ^hjkl", "back, down, up, select"),
-        key("tab", "mark for bulk actions"),
-        key("^a", "mark all"),
-        key("^f", "more of a ranking"),
-        key("enter", "select"),
-        key("esc", "clear filter / back"),
-        key("^c", "quit"),
+        key("↑ ↓", "move", "^k ^j"),
+        key("enter", "select", "→ ^l"),
+        key("esc", "back", "← ^h"),
+        "".into(),
+        key("type", "filter the list", ""),
+        Line::styled(format!("{:12}'exact ^start end$ !not", ""), DIM),
+        key("esc", "clear the filter", "^u"),
+        "".into(),
+        key("tab", "mark for bulk actions", ""),
+        key("^a", "mark all", ""),
+        key("^f", "load more shows", ""),
+        key("shift ↑↓", "scroll the preview", ""),
+        key("^c", "quit", ""),
     ]);
     v
 }

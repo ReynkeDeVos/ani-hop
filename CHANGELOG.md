@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.15 – 2026-10-26
+
+### Changed
+
+- The keys on the start screen are grouped by what they're for, one action per row: moving, selecting and going back come first, with ← and ^h shown for back next to esc, and → and ^l for select next to enter. Filtering, marking and the rest follow. The list now also has ^u to clear the filter and shift ↑↓ to scroll the preview, and ^f reads "load more shows".
+
 ## 0.6.14 – 2026-10-26
 
 ### Added
