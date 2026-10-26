@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.15 – 2026-10-26
+
+### Changed
+
+- The keys on the start screen are grouped by what they're for, one action per row: moving, selecting and going back come first (← or ^h goes back, enter, → or ^l selects), then filtering, where esc clears the filter before it goes back, then marking and the rest. The descriptions are easier to read, shift ↑↓ for scrolling the preview is listed, and ^f reads "load more shows". On a short terminal with an update notice, the logo makes room so no key is cut off.
+
 ## 0.6.14 – 2026-10-26
 
 ### Added
