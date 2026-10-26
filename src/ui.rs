@@ -586,7 +586,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             })
             .collect(),
         View::Setup => setup(app),
-        _ => banner(app),
+        _ => banner(app, inner),
     };
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
@@ -679,21 +679,26 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v
 }
 
-fn banner(app: &App) -> Vec<Line<'static>> {
+/// The start panel in `area`: the logo only where everything else fits under it, as a short
+/// screen keeps an update notice (two or three rows at 80 columns) and every key instead.
+fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
     // a key, what it does, and the other keys that do the same
     let key = |k: &'static str, what: &'static str, also: &'static str| {
+        // padded only beside other keys: trailing spaces would wrap at 80 columns
+        let (what, also) = match also {
+            "" => (what.to_string(), String::new()),
+            _ => (format!("{what:<21}"), format!("{also:>5}")),
+        };
         Line::from(vec![
             Span::styled(format!("{k:>10}  "), ACCENT),
-            Span::raw(format!("{what:<21}")),
-            Span::styled(format!("{also:>5}"), DIM),
+            Span::raw(what),
+            Span::styled(also, DIM),
         ])
     };
-    let mut v: Vec<Line> = logo().collect();
-    v.push("".into());
-    v.push(Line::styled(
+    let mut v = vec![Line::styled(
         format!("↓ {}", ani::tilde(&ani::download_root())),
         DIM,
-    ));
+    )];
     if let Some((new, cmd)) = &app.release {
         v.push(Line::styled(
             format!("↑ ani-hop {new} is out: {cmd}"),
@@ -701,26 +706,31 @@ fn banner(app: &App) -> Vec<Line<'static>> {
         ));
     }
     // on an input typing is the text itself, and there's nothing to mark
-    if matches!(app.stack.last().unwrap().view, View::Input(_)) {
-        return v;
+    if !matches!(app.stack.last().unwrap().view, View::Input(_)) {
+        // grouped by what they're for, the everyday ones first; esc clears a filter before
+        // it goes back, so ← is the back key
+        v.extend([
+            "".into(),
+            key("↑ ↓", "move", "^k ^j"),
+            key("enter", "select", "→ ^l"),
+            key("←", "back", "^h"),
+            "".into(),
+            key("type", "filter the list", ""),
+            Line::styled(format!("{:12}'exact ^start end$ !not", ""), DIM),
+            key("esc", "clear the filter, then back", ""),
+            "".into(),
+            key("tab", "mark for bulk actions", ""),
+            key("^a", "mark all", ""),
+            key("^f", "load more shows", ""),
+            key("shift ↑↓", "scroll the preview", ""),
+            key("^c", "quit", ""),
+        ]);
     }
-    v.push("".into());
-    // grouped by what they're for, the everyday ones first
-    v.extend([
-        key("↑ ↓", "move", "^k ^j"),
-        key("enter", "select", "→ ^l"),
-        key("esc", "back", "← ^h"),
-        "".into(),
-        key("type", "filter the list", ""),
-        Line::styled(format!("{:12}'exact ^start end$ !not", ""), DIM),
-        key("esc", "clear the filter", "^u"),
-        "".into(),
-        key("tab", "mark for bulk actions", ""),
-        key("^a", "mark all", ""),
-        key("^f", "load more shows", ""),
-        key("shift ↑↓", "scroll the preview", ""),
-        key("^c", "quit", ""),
-    ]);
+    let below = Paragraph::new(v.clone()).wrap(Wrap { trim: false });
+    let logo_h = LOGO.len() + 1; // and the blank line under it
+    if below.line_count(area.width) + logo_h <= area.height as usize {
+        v.splice(0..0, logo().chain(["".into()]));
+    }
     v
 }
 
