@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.16 – 2026-10-26
+
+### Added
+
+- An episode's preview says when it first aired, like "aired 15 Dec 1999". The date comes from ani.zip, like the episode's title and summary. Episode info cached before this is fetched again once, and still shows while ani.zip can't be reached.
+
+### Changed
+
+- On the start screen, → is the select key, with enter and ^l beside it, as ← is the back key.
+
 ## 0.6.15 – 2026-10-26
 
 ### Changed

@@ -679,6 +679,18 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v
 }
 
+/// "1999-12-15" as "15 Dec 1999", anything else as it is.
+fn day(iso: &str) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut p = iso.splitn(3, '-').map(|n| n.parse::<usize>().ok());
+    match (p.next().flatten(), p.next().flatten(), p.next().flatten()) {
+        (Some(y), Some(m @ 1..=12), Some(d)) => format!("{d} {} {y}", MONTHS[m - 1]),
+        _ => iso.to_string(),
+    }
+}
+
 /// The start panel in `area`: the logo only where everything else fits under it, as a short
 /// screen keeps an update notice (two or three rows at 80 columns) and every key instead.
 fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
@@ -687,7 +699,7 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
         // padded only beside other keys: trailing spaces would wrap at 80 columns
         let (what, also) = match also {
             "" => (what.to_string(), String::new()),
-            _ => (format!("{what:<21}"), format!("{also:>5}")),
+            _ => (format!("{what:<18}"), format!("{also:>8}")),
         };
         Line::from(vec![
             Span::styled(format!("{k:>10}  "), ACCENT),
@@ -707,12 +719,12 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
     }
     // on an input typing is the text itself, and there's nothing to mark
     if !matches!(app.stack.last().unwrap().view, View::Input(_)) {
-        // grouped by what they're for, the everyday ones first; esc clears a filter before
-        // it goes back, so ← is the back key
+        // grouped by what they're for, the everyday ones first; the arrows lead, as esc
+        // clears a filter before it goes back
         v.extend([
             "".into(),
             key("↑ ↓", "move", "^k ^j"),
-            key("enter", "select", "→ ^l"),
+            key("→", "select", "enter ^l"),
             key("←", "back", "^h"),
             "".into(),
             key("type", "filter the list", ""),
@@ -887,6 +899,9 @@ fn media_preview(
                 format!("Episode {ep} · not watched yet, so no summary"),
                 DIM,
             ));
+        }
+        if let Some(d) = i.aired.as_deref().filter(|d| !d.is_empty()) {
+            lines.push(Line::styled(format!("aired {}", day(d)), DIM));
         }
     }
     // the gap before the description is one row, also when nothing follows the genres
@@ -1136,6 +1151,14 @@ fn strip_html(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writes_air_dates_out() {
+        assert_eq!(day("1999-12-15"), "15 Dec 1999");
+        assert_eq!(day("2026-01-03"), "3 Jan 2026");
+        assert_eq!(day("2026-13-03"), "2026-13-03");
+        assert_eq!(day("soon"), "soon");
+    }
 
     #[test]
     fn cleans_anilist_descriptions() {

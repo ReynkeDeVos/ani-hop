@@ -183,6 +183,10 @@ pub struct EpInfo {
     /// counts a season split in two on AniList as one
     #[serde(default)]
     pub number: Option<u32>,
+    /// when it first aired, as ani.zip has it ("1999-12-15", empty if it doesn't); None in a
+    /// cache from before air dates, which is then fetched again
+    #[serde(default)]
+    pub aired: Option<String>,
 }
 
 /// Titles and summaries of every episode, from ani.zip (keyed by AniList id, one request a
@@ -208,6 +212,7 @@ fn episode_info(v: &Value) -> HashMap<String, EpInfo> {
             },
             about: tidy(about.and_then(|a| a.split("\nSource:").next())),
             number: e["episodeNumber"].as_u64().map(|n| n as u32),
+            aired: Some(tidy(e["airdate"].as_str())),
         };
         (ep.clone(), info)
     })
@@ -533,7 +538,7 @@ mod tests {
     fn reads_episode_titles_and_summaries() {
         let v = serde_json::json!({ "episodes": {
             "1": { "title": { "en": "The Journey`s End", "x-jat": "Bouken no Owari" },
-                   "summary": "It`s over.\nSource: Crunchyroll" },
+                   "summary": "It`s over.\nSource: Crunchyroll", "airdate": "2023-09-29" },
             "2": { "title": { "x-jat": "Betsu ni" }, "overview": "Magic lessons.", "episodeNumber": 14 },
             "S1": { "title": { "en": "Episode S1" } },
         }});
@@ -545,6 +550,9 @@ mod tests {
             ("Betsu ni", "Magic lessons.")
         );
         assert_eq!((eps["1"].number, eps["2"].number), (None, Some(14)));
+        // a cache from before air dates has None, a show without one an empty date
+        assert_eq!(eps["1"].aired.as_deref(), Some("2023-09-29"));
+        assert_eq!(eps["2"].aired.as_deref(), Some(""));
         assert_eq!(
             (eps["S1"].title.as_str(), eps["S1"].about.as_str()),
             ("", "")

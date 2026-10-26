@@ -520,7 +520,10 @@ fn load_episodes(m: &Media) -> HashMap<String, EpInfo> {
     let age = age.and_then(|t| t.elapsed().ok()).unwrap_or(Duration::MAX);
     let cached: Option<HashMap<String, EpInfo>> = ani::read_json(&path);
     match cached {
-        Some(eps) if age.as_secs() < days * 86_400 => eps,
+        // one from before air dates fetches again, but still stands in when that fails
+        Some(eps) if age.as_secs() < days * 86_400 && eps.values().all(|e| e.aired.is_some()) => {
+            eps
+        }
         cached => match anilist::episodes(m.id) {
             Ok(eps) => {
                 let _ = ani::write_json(&path, &eps);
