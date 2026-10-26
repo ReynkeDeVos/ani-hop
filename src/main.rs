@@ -903,11 +903,12 @@ impl App {
         Progress::of(m, self.parts(m))
     }
 
-    /// AniList says none of `m` is out, and ani-cli has no source for it, known or being
-    /// looked up: a search could only fail, or find another show. A pick lifts it.
+    /// AniList says none of `m` is out, and ani-cli has no source for it, known, picked by
+    /// hand or being looked up: a search could only fail, or find another show.
     pub fn upcoming(&self, m: &Media) -> bool {
         m.released() == Some(0)
             && self.sources.get(m.id).is_none()
+            && !self.sources.picked(m.id)
             && !self.resolving.contains_key(&m.id)
     }
 
@@ -2199,6 +2200,20 @@ pub fn list_label(status: &str) -> &'static str {
         .iter()
         .find(|l| l.0 == status)
         .map_or("on list", |l| l.1)
+}
+
+/// Runs test `name` again in a child process with `env` set (temp XDG dirs, a stub first on
+/// PATH), for a test that needs a process environment of its own; the child sees
+/// ANIHOP_CHILD and does the work. Whether it passed.
+#[cfg(test)]
+pub fn in_child(name: &str, env: &[(&str, std::ffi::OsString)]) -> bool {
+    Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--test-threads=1"])
+        .env("ANIHOP_CHILD", "1")
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .stdout(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
 }
 
 #[cfg(test)]

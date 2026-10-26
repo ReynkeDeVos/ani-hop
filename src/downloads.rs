@@ -1012,6 +1012,48 @@ mod tests {
     }
 
     #[test]
+    fn a_whole_show_job_with_a_cached_source_lists_the_episodes_out_now() {
+        if std::env::var_os("ANIHOP_CHILD").is_some() {
+            fs::create_dir_all(ani::cache_dir().join("probe")).unwrap();
+            let mut cached = source();
+            cached.episodes = vec!["1".into(), "2".into()];
+            let eps = |all| {
+                let lookup = Lookup::Check(cached.clone());
+                AniCli.resolve(&show(), lookup, all).unwrap().episodes
+            };
+            assert_eq!(
+                eps(true),
+                ["1", "2", "3"],
+                "every episode: the provider's now"
+            );
+            assert_eq!(eps(false), ["1", "2"], "the episodes picked: one search");
+            return;
+        }
+        let dir = temp("cached");
+        // answers ani-cli's menus straight into the file ani-hop's rofi stand-in writes
+        let stub = "#!/bin/sh\ncase \"$1\" in\n-S) printf 'Select episode: \\n1\\n2\\n3\\n' ;;\n*) printf 'Select anime: \\n1 Show\\n2 Other\\n' ;;\nesac > \"$ANIHOP_MENU_OUT\"\nexit 1\n";
+        fs::create_dir_all(dir.join("bin")).unwrap();
+        fs::write(dir.join("bin/ani-cli"), stub).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir.join("bin/ani-cli"), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            dir.join("bin").display(),
+            std::env::var("PATH").unwrap()
+        );
+        let env = [
+            ("PATH", path.into()),
+            ("HOME", dir.clone().into_os_string()),
+            ("XDG_CONFIG_HOME", dir.join("config").into_os_string()),
+            ("XDG_CACHE_HOME", dir.join("cache").into_os_string()),
+        ];
+        let name =
+            "downloads::tests::a_whole_show_job_with_a_cached_source_lists_the_episodes_out_now";
+        assert!(crate::in_child(name, &env));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn whole_show_jobs_skip_what_is_watched_in_parts_too() {
         let watching = |id, episodes, progress| Media {
             id,

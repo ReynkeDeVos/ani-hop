@@ -72,6 +72,8 @@ pub struct Sources {
     /// the lookup each show waits for: an older one's answer doesn't count anymore
     asked: HashMap<u64, u64>,
     tickets: u64,
+    /// shows whose source was picked by hand, so a lookup has something to go by
+    picked: HashSet<u64>,
 }
 
 impl Sources {
@@ -81,7 +83,16 @@ impl Sources {
             checked: HashSet::new(),
             asked: HashMap::new(),
             tickets: 0,
+            picked: (overrides().keys())
+                .filter_map(|id| id.parse().ok())
+                .collect(),
         }
+    }
+
+    /// Whether the show's source was picked by hand, maybe in an earlier session whose
+    /// lookup of it never finished.
+    pub fn picked(&self, id: u64) -> bool {
+        self.picked.contains(&id)
     }
 
     /// The show's source as last known, maybe from an earlier session.
@@ -134,6 +145,7 @@ impl Sources {
         i: usize,
     ) -> std::io::Result<()> {
         save_override(id, query, hits, i)?;
+        self.picked.insert(id);
         self.known.remove(&id);
         self.checked.remove(&id);
         self.asked.remove(&id);
@@ -674,6 +686,7 @@ mod tests {
             checked: HashSet::new(),
             asked: HashMap::new(),
             tickets: 0,
+            picked: HashSet::new(),
         };
         let old = all.ask(7).unwrap();
         assert_eq!(all.ask(7), None, "one runs already");
@@ -687,6 +700,29 @@ mod tests {
         assert!(all.answer(7, again, &Ok(src("New"))));
         assert!(matches!(all.lookup(7), Lookup::Ready(s) if s.title == "New"));
         assert_eq!(all.ask(7), None, "checked this session");
+    }
+
+    #[test]
+    fn a_pick_from_an_earlier_session_counts() {
+        if std::env::var_os("ANIHOP_CHILD").is_some() {
+            let all = Sources::load();
+            assert!(all.picked(7) && !all.picked(8));
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ani-hop-picks-{}", std::process::id()));
+        let picks = dir.join("config/ani-hop/sources.json");
+        fs::create_dir_all(picks.parent().unwrap()).unwrap();
+        fs::write(&picks, r#"{"7": ["show", "Show", 1]}"#).unwrap();
+        let env = [
+            ("HOME", dir.clone().into_os_string()),
+            ("XDG_CONFIG_HOME", dir.join("config").into_os_string()),
+            ("XDG_CACHE_HOME", dir.join("cache").into_os_string()),
+        ];
+        assert!(crate::in_child(
+            "source::tests::a_pick_from_an_earlier_session_counts",
+            &env
+        ));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
