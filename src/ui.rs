@@ -392,7 +392,9 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
             {
                 hint = head.to_string();
             }
-            if !hint.is_empty() && room > 3 {
+            // a hint cut to less than half says nothing ("not l…", "loses pr…"), so it goes
+            let w = Span::raw(hint.as_str()).width();
+            if !hint.is_empty() && (w <= room || room > 3 && room * 2 >= w) {
                 let hint = Span::styled(fit(hint, room), color);
                 spans.push(" ".repeat(width.saturating_sub(used + hint.width())).into());
                 spans.push(hint);
@@ -505,9 +507,12 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         | View::Sources(m, ..)
         | View::Input(Input::SourceQuery(m))
         | View::Audio(Some(m))
-        | View::Confirm(Pending::Progress(m, ..) | Pending::Stop(m, _) | Pending::Pause(m, _)) => {
-            Some(m.clone())
-        }
+        | View::Confirm(
+            Pending::Progress(m, ..)
+            | Pending::Remove(m)
+            | Pending::Stop(m, _)
+            | Pending::Pause(m, _),
+        ) => Some(m.clone()),
         _ => None,
     };
     // posters just below the cursor load ahead, so scrolling shows them instantly
@@ -677,7 +682,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v.push(row(
         kitty::supported(),
         "graphics",
-        "posters need Ghostty or kitty",
+        "posters in Ghostty or kitty",
     ));
     v.extend(["".into(), Line::styled("AniList", Style::new().bold())]);
     match &app.user {

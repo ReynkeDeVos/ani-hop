@@ -92,6 +92,8 @@ pub enum Pending {
     /// marking an episode watched: the AniList entry that saves it (a sequel's, when the
     /// provider runs on into it), the progress there, and what to call it if it's a sequel
     Progress(Media, u32, String),
+    /// taking a show off the list, which loses its progress and score
+    Remove(Media),
     Quit,
     /// queued or downloading episodes to take out of the queue
     Stop(Media, Vec<String>),
@@ -1352,7 +1354,8 @@ impl App {
             View::Settings => vec![
                 Item::new(
                     "skip",
-                    "Skip openings and endings",
+                    // short enough for its on/off at 80 columns
+                    "Skip openings/endings",
                     if ani::skip_on() { "on" } else { "off" },
                 ),
                 Item::new(
@@ -1785,20 +1788,18 @@ impl App {
             }
             View::Status(m) => {
                 let (m, c) = (m.clone(), self.client.clone());
-                self.toast(format!("Saving {}…", m.name()), false);
-                match (key.as_str(), m.media_list_entry.as_ref().map(|e| e.id)) {
-                    ("remove", Some(entry)) => {
-                        self.saves_pending += 1;
-                        self.spawn(move || Msg::Saved(m, c.remove(entry).map(|_| None)))
-                    }
-                    (status, _) => {
-                        let status = status.to_string();
-                        self.saves_pending += 1;
-                        self.spawn(move || {
-                            Msg::Saved(m.clone(), c.save(m.id, Some(&status), None).map(Some))
-                        })
-                    }
+                // AniList can't undo it, so a stray enter or → mustn't
+                if key == "remove" {
+                    let title = format!(
+                        "Remove {} from your list? Its progress and score go too.",
+                        m.name()
+                    );
+                    self.push(title, View::Confirm(Pending::Remove(m)));
+                    return self.top().menu.select_key("no");
                 }
+                self.toast(format!("Saving {}…", m.name()), false);
+                self.saves_pending += 1;
+                self.spawn(move || Msg::Saved(m.clone(), c.save(m.id, Some(&key), None).map(Some)));
             }
             View::Sources(m, q, hits) => {
                 let i: usize = key.parse().unwrap();
@@ -1936,6 +1937,16 @@ impl App {
                             self.pop(1);
                         }
                         self.top().menu.marked.clear();
+                    }
+                    Pending::Remove(m) => {
+                        let (m, c) = (m.clone(), self.client.clone());
+                        self.pop(1);
+                        let Some(entry) = m.media_list_entry.as_ref().map(|e| e.id) else {
+                            return;
+                        };
+                        self.toast(format!("Removing {}…", m.name()), false);
+                        self.saves_pending += 1;
+                        self.spawn(move || Msg::Saved(m, c.remove(entry).map(|_| None)));
                     }
                     Pending::Progress(m, ep, _) => {
                         let (m, ep, c) = (m.clone(), *ep, self.client.clone());
