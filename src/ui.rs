@@ -203,6 +203,11 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
 fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let spin = spinner(app);
     let shimmer = (app.started.elapsed().as_millis() / 30) as usize;
+    // what "Continue with" on a show's page plays
+    let next = match &app.stack.last().unwrap().view {
+        View::Show(m) => Some(app.next_ep(m).to_string()),
+        _ => None,
+    };
     let screen = app.stack.last_mut().unwrap();
     let block = panel();
     let inner = block.inner(area).inner(Margin::new(1, 0));
@@ -310,9 +315,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let busy = app.playing.as_ref().and_then(|p| {
         let key = match &screen.view {
             View::Episodes(m, EpMode::Play) if m.id == p.id => p.ep.clone(),
-            View::Show(m) if m.id == p.id && p.ep == (m.progress() + 1).to_string() => {
-                "next".into()
-            }
+            View::Show(m) if m.id == p.id && next.as_ref() == Some(&p.ep) => "next".into(),
             _ => return None,
         };
         Some((
@@ -467,7 +470,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         | View::Sources(m, ..)
         | View::Input(Input::SourceQuery(m))
         | View::Audio(Some(m))
-        | View::Confirm(Pending::Progress(m, _) | Pending::Stop(m, _) | Pending::Pause(m, _)) => {
+        | View::Confirm(Pending::Progress(m, ..) | Pending::Stop(m, _) | Pending::Pause(m, _)) => {
             Some(m.clone())
         }
         _ => None,
@@ -786,6 +789,19 @@ fn media_preview(
             Color::Green,
         ));
     }
+    // the provider's episodes past the show's own count toward a sequel on AniList
+    for (before, p) in app.parts(m) {
+        let eps = p.episodes.map_or(format!("{}+", before + 1), |n| {
+            format!("{}–{}", before + 1, before + n)
+        });
+        let mut line = format!("Episodes\u{a0}{eps} are {}", p.name());
+        if let Some(e) = &p.media_list_entry {
+            let total = p.episodes.map_or("?".into(), |t| t.to_string());
+            line += &format!(" · {} · {}/{total}", list_label(&e.status), e.progress);
+        }
+        let on_list = p.media_list_entry.is_some();
+        lines.push(Line::styled(line, if on_list { Color::Green } else { DIM }));
+    }
     if let Some(a) = &m.next_airing_episode {
         lines.push(Line::from(format!(
             "Episode {} airs in {}",
@@ -805,10 +821,10 @@ fn media_preview(
     }
     let mut about = "";
     if let Some(ep) = ep
-        && let Some(i) = app.ep_info.get(&m.id).and_then(|i| i.get(ep))
+        && let Some(i) = app.ep_about(m, ep)
     {
         lines.push("".into());
-        if m.watched(ep) {
+        if app.watched(m, ep) {
             let title = [format!("Episode {ep}"), i.title.clone()];
             let title = title
                 .into_iter()

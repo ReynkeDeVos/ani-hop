@@ -179,6 +179,10 @@ pub fn fetch(url: &str) -> Result<Vec<u8>, String> {
 pub struct EpInfo {
     pub title: String,
     pub about: String,
+    /// its number in its TheTVDB season, which goes on from the first part's when TheTVDB
+    /// counts a season split in two on AniList as one
+    #[serde(default)]
+    pub number: Option<u32>,
 }
 
 /// Titles and summaries of every episode, from ani.zip (keyed by AniList id, one request a
@@ -203,6 +207,7 @@ fn episode_info(v: &Value) -> HashMap<String, EpInfo> {
                 title
             },
             about: tidy(about.and_then(|a| a.split("\nSource:").next())),
+            number: e["episodeNumber"].as_u64().map(|n| n as u32),
         };
         (ep.clone(), info)
     })
@@ -333,6 +338,34 @@ impl Client {
             .collect()
     }
 
+    /// The show that goes on where `id` ends as more of the same series (not a movie or a
+    /// special), if AniList has one.
+    fn sequel(&self, id: u64) -> Result<Option<Media>, String> {
+        let q = format!(
+            "query($id: Int) {{ Media(id: $id) {{ relations {{ edges {{ relationType node {{ type {MEDIA} }} }} }} }} }}"
+        );
+        let d = self.gql(&q, json!({ "id": id }))?;
+        let mut edges = d["Media"]["relations"]["edges"]
+            .as_array()
+            .into_iter()
+            .flatten();
+        let next = edges.find(|e| {
+            let n = &e["node"];
+            e["relationType"] == "SEQUEL"
+                && n["type"] == "ANIME"
+                && matches!(n["format"].as_str(), Some("TV" | "TV_SHORT" | "ONA"))
+        });
+        next.map(|e| serde_json::from_value(e["node"].clone()).map_err(|e| e.to_string()))
+            .transpose()
+    }
+
+    /// The sequels a provider that lists `m`'s split cours as one show runs on into, up to
+    /// its episode `last`, each with the episodes before it.
+    pub fn parts(&self, m: &Media, last: u32) -> Result<Vec<(u32, Media)>, String> {
+        let first = |id| Ok(episodes(id)?.get("1").and_then(|e| e.number));
+        follow_sequels(m, last, |id| self.sequel(id), first)
+    }
+
     pub fn save(
         &self,
         media: u64,
@@ -361,14 +394,118 @@ impl Client {
     }
 }
 
+/// Sequels after `m` until they reach episode `last`. None unless they have all finished
+/// airing, add up to `last` exactly, and TheTVDB (through ani.zip, `first`) numbers each
+/// one's first episode as the provider does: a provider's extra episode (a recap, an OVA)
+/// mustn't count as the next season's first, which the first episodes of one still airing
+/// could pass for.
+fn follow_sequels(
+    m: &Media,
+    last: u32,
+    mut sequel: impl FnMut(u64) -> Result<Option<Media>, String>,
+    mut first: impl FnMut(u64) -> Result<Option<u32>, String>,
+) -> Result<Vec<(u32, Media)>, String> {
+    let mut parts: Vec<(u32, Media)> = Vec::new();
+    let mut end = m.episodes.unwrap_or(last);
+    // a few requests at most, even for a long run of seasons
+    while end < last && parts.len() < 8 {
+        let id = parts.last().map_or(m.id, |p| p.1.id);
+        let Some(next) = sequel(id)? else { break };
+        let (Some("FINISHED"), Some(n)) = (next.status.as_deref(), next.episodes) else {
+            break;
+        };
+        let before = end;
+        end = before + n;
+        parts.push((before, next));
+    }
+    if end != last {
+        return Ok(Vec::new());
+    }
+    for (before, p) in &parts {
+        if first(p.id)? != Some(before + 1) {
+            return Ok(Vec::new());
+        }
+    }
+    Ok(parts)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn episodes_past_a_split_season_are_its_sequels() {
+        use super::Media;
+        let show = |id: u64, episodes: Option<u32>| Media {
+            id,
+            episodes,
+            status: Some("FINISHED".into()),
+            ..Default::default()
+        };
+        // Attack on Titan Season 3, its Part 2 (maybe still airing, with the episode next),
+        // then The Final Season
+        let chain = |airing: Option<u32>| {
+            let mut p2 = show(104_578, Some(10));
+            if let Some(episode) = airing {
+                p2.status = Some("RELEASING".into());
+                p2.next_airing_episode = Some(super::Airing {
+                    episode,
+                    time_until_airing: 3600,
+                });
+            }
+            move |id: u64| {
+                Ok(match id {
+                    99_147 => Some(p2.clone()),
+                    104_578 => Some(show(110_277, Some(16))),
+                    _ => None,
+                })
+            }
+        };
+        let s3 = show(99_147, Some(12));
+        // TheTVDB counts Season 3 Part 2 on from 13, The Final Season from 1
+        let tvdb = |id| {
+            Ok(match id {
+                104_578 => Some(13),
+                _ => Some(1),
+            })
+        };
+        let ids = |last: u32, airing: Option<u32>| {
+            let parts = super::follow_sequels(&s3, last, chain(airing), tvdb).unwrap();
+            (parts.iter()).map(|(b, m)| (*b, m.id)).collect::<Vec<_>>()
+        };
+        assert_eq!(ids(22, None), [(12, 104_578)]);
+        assert_eq!(ids(38, None), [], "TheTVDB starts The Final Season over");
+        assert_eq!(ids(15, None), [], "13 to 15 aren't all of Part 2");
+        // a recap as 13 could pass for the first episode of one still airing
+        assert_eq!(ids(13, Some(2)), []);
+        assert_eq!(ids(15, Some(4)), [], "not until it has finished");
+        let s1 = show(16_498, Some(25));
+        let next_season = |_| Ok(Some(show(20_958, Some(12))));
+        let numbered = |_| Ok(Some(26));
+        let found = super::follow_sequels(&s1, 37, next_season, numbered).unwrap();
+        assert_eq!(found.len(), 1, "a season TheTVDB counts on from 26");
+        let restarts = |_| Ok(Some(1));
+        let found = super::follow_sequels(&s1, 37, next_season, restarts).unwrap();
+        assert!(found.is_empty(), "a season of its own");
+        assert_eq!(ids(40, None), [], "past the last sequel");
+        let unknown = |_| Ok(Some(show(104_578, None)));
+        assert!(
+            super::follow_sequels(&s3, 13, unknown, tvdb)
+                .unwrap()
+                .is_empty()
+        );
+        let no_more = |_| Ok(None);
+        assert!(
+            super::follow_sequels(&s3, 13, no_more, tvdb)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
     #[test]
     fn reads_episode_titles_and_summaries() {
         let v = serde_json::json!({ "episodes": {
             "1": { "title": { "en": "The Journey`s End", "x-jat": "Bouken no Owari" },
                    "summary": "It`s over.\nSource: Crunchyroll" },
-            "2": { "title": { "x-jat": "Betsu ni" }, "overview": "Magic lessons." },
+            "2": { "title": { "x-jat": "Betsu ni" }, "overview": "Magic lessons.", "episodeNumber": 14 },
             "S1": { "title": { "en": "Episode S1" } },
         }});
         let eps = super::episode_info(&v);
@@ -378,6 +515,7 @@ mod tests {
             (eps["2"].title.as_str(), eps["2"].about.as_str()),
             ("Betsu ni", "Magic lessons.")
         );
+        assert_eq!((eps["1"].number, eps["2"].number), (None, Some(14)));
         assert_eq!(
             (eps["S1"].title.as_str(), eps["S1"].about.as_str()),
             ("", "")
