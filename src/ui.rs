@@ -695,7 +695,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v.push(row(
         kitty::supported(),
         "graphics",
-        "posters in Ghostty or kitty",
+        "posters: Ghostty or kitty",
     ));
     v.extend(["".into(), Line::styled("AniList", Style::new().bold())]);
     match &app.user {
