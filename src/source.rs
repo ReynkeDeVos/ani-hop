@@ -722,6 +722,8 @@ mod tests {
             "source::tests::a_pick_from_an_earlier_session_counts",
             &env
         ));
+        let none = crate::in_child("source::tests::no_such_test", &env);
+        assert!(!none, "a name that matches no test fails");
         fs::remove_dir_all(&dir).unwrap();
     }
 
