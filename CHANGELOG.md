@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.10 – 2026-10-26
+
+### Changed
+
+- In a season AniList splits in two, like Attack on Titan Season 3, the preview's "Episodes 13–22 are … Part 2" stays a plain line, and the second part's list status gets its own line under it, shown on that part's episodes and on the show's page. The first part's status stays on every episode. In the episode lists, a faint line saying "Part 2" sits between episodes 12 and 13.
+- The question after an episode says what Yes saves, like "saves 3/12", "saves 12/12 · moves it to Completed" or "saves 1/10 to Part 2 · adds it to Watching".
+
+### Fixed
+
+- The second half of a special that ani-cli splits in two, like the Attack on Titan Final Chapters specials (one episode each on AniList, two at ani-cli), didn't ask to be marked watched, so answering No after the first half left no way to mark it in ani-hop. An episode past what AniList counts for a show now asks too, and saves the show's last episode (1/1 here), never more.
+
 ## 0.6.9 – 2026-10-26
 
 ### Fixed

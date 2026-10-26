@@ -13,6 +13,10 @@ const DIM: Color = Color::DarkGray;
 /// Text to read that steps back: faint main text is easier on the eyes than DIM in most
 /// themes (Omarchy's color 7 is the main text itself, so there's no ANSI shade between).
 const SOFT: Style = Style::new().add_modifier(Modifier::DIM);
+/// the row under the cursor
+const SELECTED: Style = Style::new()
+    .add_modifier(Modifier::BOLD)
+    .remove_modifier(Modifier::DIM);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const LOGO: [&str; 2] = ["▄▀█ █▄ █ █ ▄▄ █ █ █▀█ █▀█", "█▀█ █ ▀█ █    █▀█ █▄█ █▀▀"];
 const SHADES: [&str; 4] = ["░", "▒", "▓", "█"];
@@ -339,10 +343,9 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         _ => None,
     });
     let width = list_area.width.saturating_sub(1) as usize; // minus the pointer column
-    let rows: Vec<ListItem> = m
-        .matches
-        .iter()
-        .map(|(i, hits)| {
+    let selected = m.state.selected();
+    let rows: Vec<ListItem> = (m.matches.iter().enumerate())
+        .map(|(k, (i, hits))| {
             let item = &m.items[*i];
             let mark = match (m.marked.contains(i), item.done) {
                 (true, _) => "●",
@@ -385,14 +388,37 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 spans.push(" ".repeat(width.saturating_sub(used + hint.width())).into());
                 spans.push(hint);
             }
-            ListItem::new(Line::from(spans))
+            // its row only, not a rule under it
+            if selected == Some(k) {
+                for s in &mut spans {
+                    s.style = s.style.patch(SELECTED);
+                }
+            }
+            let mut lines = vec![Line::from(spans)];
+            // under the row, so the cursor stays on the episode
+            if let Some((next, _)) = m.matches.get(k + 1)
+                && m.items[*next].group != item.group
+            {
+                lines.push(rule(&m.items[*next].group, width));
+            }
+            ListItem::new(lines)
         })
         .collect();
     let list = List::new(rows)
         .highlight_symbol(Line::styled("▌", ACCENT))
-        .highlight_spacing(HighlightSpacing::Always)
-        .highlight_style(Style::new().bold().not_dim());
+        .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(list, list_area, &mut screen.menu.state);
+}
+
+/// A faint line where a list's next group starts, with its name if it has one.
+fn rule(name: &str, width: usize) -> Line<'static> {
+    // in line with the labels, past the check column
+    let head = match name {
+        "" => "  ".to_string(),
+        _ => format!("  ── {} ", fit(name.to_string(), width.saturating_sub(8))),
+    };
+    let rest = width.saturating_sub(Span::raw(head.as_str()).width());
+    Line::styled(head + &"─".repeat(rest), DIM)
 }
 
 /// Placeholder rows with a light band running over them while the first fetch is out.
@@ -782,25 +808,27 @@ fn media_preview(
         lines.push(Line::styled(m.genres.join(" · "), MATCH));
     }
     lines.push("".into());
-    if let Some(e) = &m.media_list_entry {
-        let total = m.episodes.map_or("?".into(), |t| t.to_string());
-        lines.push(Line::styled(
-            format!("● {} · {}/{total}", list_label(&e.status), e.progress),
-            Color::Green,
-        ));
-    }
-    // the provider's episodes past the show's own count toward a sequel on AniList
+    let status = |p: &Media| {
+        let e = p.media_list_entry.as_ref()?;
+        let total = p.episodes.map_or("?".into(), |t| t.to_string());
+        let line = format!("● {} · {}/{total}", list_label(&e.status), e.progress);
+        Some(Line::styled(line, Color::Green))
+    };
+    lines.extend(status(m));
+    // the provider's episodes past the show's own count toward a sequel on AniList; on an
+    // episode, only the sequel it counts toward shows its progress, under the line naming it
+    let at = ep.map(|ep| app.part(m, ep).0.id);
     for (before, p) in app.parts(m) {
         let eps = p.episodes.map_or(format!("{}+", before + 1), |n| {
             format!("{}–{}", before + 1, before + n)
         });
-        let mut line = format!("Episodes\u{a0}{eps} are {}", p.name());
-        if let Some(e) = &p.media_list_entry {
-            let total = p.episodes.map_or("?".into(), |t| t.to_string());
-            line += &format!(" · {} · {}/{total}", list_label(&e.status), e.progress);
+        lines.push(Line::styled(
+            format!("Episodes\u{a0}{eps} are {}", p.name()),
+            DIM,
+        ));
+        if at.is_none_or(|id| id == p.id) {
+            lines.extend(status(p));
         }
-        let on_list = p.media_list_entry.is_some();
-        lines.push(Line::styled(line, if on_list { Color::Green } else { DIM }));
     }
     if let Some(a) = &m.next_airing_episode {
         lines.push(Line::from(format!(
@@ -1130,6 +1158,23 @@ mod tests {
         assert_eq!(text(flow(&[("aa bb", SOFT)], 1, 2, 8)), ["", "aa bb"]);
         let out = flow(&[("aa", SOFT), ("bb", SOFT)], 3, 5, 8);
         assert_eq!(text(out), ["aa", "", "", "bb"]);
+    }
+
+    #[test]
+    fn a_rule_names_the_next_group_across_the_row() {
+        let text = |l: Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.to_string())
+                .collect::<String>()
+        };
+        let named = text(super::rule("Season 3 Part 2", 30));
+        assert_eq!(named, "  ── Season 3 Part 2 ─────────");
+        assert_eq!(named.chars().count(), 30);
+        assert_eq!(text(super::rule("", 6)), "  ────");
+        let cut = text(super::rule("Attack on Titan Season 3 Part 2", 20));
+        assert!(cut.starts_with("  ── Attack on") && cut.contains('…'));
+        assert_eq!(cut.chars().count(), 20);
     }
 
     #[test]
