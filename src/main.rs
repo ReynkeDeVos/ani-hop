@@ -87,7 +87,9 @@ pub enum Input {
 
 pub enum Pending {
     Delete(Vec<PathBuf>),
-    Progress(Media, String),
+    /// marking an episode watched: the AniList entry that saves it (a sequel's, when the
+    /// provider runs on into it), the progress there, and whether it's a sequel
+    Progress(Media, u32, bool),
     Quit,
     /// queued or downloading episodes to take out of the queue
     Stop(Media, Vec<String>),
@@ -145,6 +147,9 @@ enum Msg {
     /// prepared poster: pixel file, pixel size, size in cells
     Cover(u64, CoverKey, Result<(PathBuf, u32, u32, Size), String>),
     EpInfo(u64, HashMap<String, EpInfo>),
+    /// sequels of a show, looked up for its episode counts (App::parts_key), login and
+    /// LIST_CHANGES
+    Parts(u64, (u32, u32), Option<String>, u64, Result<Parts, String>),
     Resolved(Media, Result<Source, String>),
     Saved(Media, Result<Option<Entry>, String>),
     /// (media, episode, what it waits on now; None = the player is up)
@@ -155,6 +160,9 @@ enum Msg {
     /// (version, update command) of a newer ani-hop
     Release(Option<(String, String)>),
 }
+
+/// AniList sequels a provider entry runs on into, each with the episodes before it.
+type Parts = Vec<(u32, Media)>;
 
 /// The episode being started or watched.
 pub struct Playing {
@@ -246,6 +254,10 @@ pub struct App {
     pub covers: HashMap<u64, Cover>,
     /// episode titles and summaries per show (empty while loading or when there are none)
     pub ep_info: HashMap<u64, HashMap<String, EpInfo>>,
+    /// AniList sequels per show that its provider entry runs on into, each with the episodes
+    /// before it (empty while loading or when there are none), and the episode counts they
+    /// were looked up for
+    parts: HashMap<u64, ((u32, u32), Parts)>,
     /// poster size in cells, set by the last layout
     pub poster: Size,
     pub sources: HashMap<u64, Source>,
@@ -738,6 +750,7 @@ impl App {
             saves_pending: 0,
             covers: HashMap::new(),
             ep_info: HashMap::new(),
+            parts: HashMap::new(),
             poster: Size::new(0, 0),
             sources: ani::load_resolved(),
             fresh: HashSet::new(),
@@ -815,6 +828,7 @@ impl App {
         let _ = fs::remove_file(token_path());
         let _ = fs::remove_file(user_path());
         (self.client.token, self.user) = (None, None);
+        self.parts.clear(); // they carry this login's progress
     }
 
     /// Back to the main menu; an unanswered resume question stays.
@@ -1179,15 +1193,86 @@ impl App {
         }
     }
 
-    /// Episode titles and summaries, once a session per show.
+    /// Episode titles and summaries, once a session per show, and the sequels the provider
+    /// runs on into once it lists more episodes than AniList.
     pub fn want_episodes(&mut self, m: &Media) {
-        // ani.zip knows shows by AniList id only
-        if m.on_anilist()
-            && let Vacant(e) = self.ep_info.entry(m.id)
-        {
+        // ani.zip and AniList know shows by AniList id only
+        if !m.on_anilist() {
+            return;
+        }
+        if let Vacant(e) = self.ep_info.entry(m.id) {
             e.insert(HashMap::new());
             let m = m.clone();
             self.spawn(move || Msg::EpInfo(m.id, load_episodes(&m)));
+        }
+        self.want_parts(m);
+    }
+
+    /// Looks up the sequels the provider runs on into when it lists more episodes than
+    /// AniList, again once it has another, which may change what adds up.
+    fn want_parts(&mut self, m: &Media) {
+        let Some(key) = self.parts_key(m) else {
+            self.parts.remove(&m.id);
+            return;
+        };
+        if self.parts.get(&m.id).is_none_or(|p| p.0 != key) {
+            self.parts.insert(m.id, (key, Vec::new()));
+            let (m, c) = (m.clone(), self.client.clone());
+            let asked = (c.token.clone(), LIST_CHANGES.load(Ordering::Relaxed));
+            self.spawn(move || {
+                let parts = c.parts(&m, key.0);
+                Msg::Parts(m.id, key, asked.0, asked.1, parts)
+            });
+        }
+    }
+
+    /// The provider's last whole episode and AniList's count, when the provider has more.
+    fn parts_key(&self, m: &Media) -> Option<(u32, u32)> {
+        let src = self.sources.get(&m.id)?;
+        let last = src.episodes.iter().filter_map(|e| e.parse().ok()).max()?;
+        m.episodes.filter(|own| last > *own).map(|own| (last, own))
+    }
+
+    /// The show's sequels, while it has the episode counts they were looked up for.
+    pub fn parts(&self, m: &Media) -> &[(u32, Media)] {
+        match self.parts.get(&m.id) {
+            Some((key, parts)) if Some(*key) == self.parts_key(m) => parts,
+            _ => &[],
+        }
+    }
+
+    /// The AniList entry episode `ep` of `m` counts toward, and its number there.
+    fn part<'a>(&'a self, m: &'a Media, ep: &str) -> (&'a Media, String) {
+        part(m, self.parts(m), ep)
+    }
+
+    fn progress_target<'a>(&'a self, m: &'a Media, ep: &str) -> Option<(&'a Media, f64)> {
+        progress_target(m, self.parts(m), ep)
+    }
+
+    /// Up to its show's progress (which ran past its episodes before sequels counted) or
+    /// its part's.
+    pub fn watched(&self, m: &Media, ep: &str) -> bool {
+        let (p, n) = self.part(m, ep);
+        m.watched(ep) || p.watched(&n)
+    }
+
+    /// What episode `ep` of `m` is called and about.
+    pub fn ep_about(&self, m: &Media, ep: &str) -> Option<&EpInfo> {
+        let (p, n) = self.part(m, ep);
+        self.ep_info.get(&p.id)?.get(&n)
+    }
+
+    /// The episode after the last one watched, also in a sequel the provider runs on into.
+    pub fn next_ep(&self, m: &Media) -> u32 {
+        next_ep(m, self.parts(m))
+    }
+
+    /// Episodes out right now, with those of the sequels the provider runs on into.
+    fn released(&self, m: &Media) -> Option<u32> {
+        match self.parts(m).last() {
+            Some((before, p)) => p.released().map(|r| before + r),
+            None => m.released(),
         }
     }
 
@@ -1322,14 +1407,10 @@ impl App {
             View::Show(m) => {
                 let dl = self.downloads(m);
                 let src = self.sources.get(&m.id);
-                let next = m.progress() + 1;
+                let next = self.next_ep(m);
                 let mut v = Vec::new();
-                if m.released().is_none_or(|r| next <= r) {
-                    let verb = if m.progress() > 0 {
-                        "Continue with"
-                    } else {
-                        "Play"
-                    };
+                if self.released(m).is_none_or(|r| next <= r) {
+                    let verb = if next > 1 { "Continue with" } else { "Play" };
                     let on_disk = (dl.on_disk.iter()).any(|(e, _)| ani::ep_num(e) == next as f64);
                     v.push(Item::new(
                         "next",
@@ -1377,12 +1458,11 @@ impl App {
             }
             View::Episodes(m, mode) => {
                 let dl = self.downloads(m);
-                let info = self.ep_info.get(&m.id);
                 // what a watched episode is called and about; nothing that spoils the rest
                 let item = |key: &str, ep: &str, hint: String| {
                     let mut it = Item::new(key, format!("Episode {ep}"), hint);
-                    it.done = m.watched(ep);
-                    if let Some(i) = info.and_then(|i| i.get(ep)).filter(|_| it.done) {
+                    it.done = self.watched(m, ep);
+                    if let Some(i) = self.ep_about(m, ep).filter(|_| it.done) {
                         if !i.title.is_empty() {
                             it.label = format!("{} · {}", it.label, i.title);
                         }
@@ -1521,13 +1601,14 @@ impl App {
                 Item::new("no", "No", "deletes partial files"),
                 Item::new("yes", "Yes", ""),
             ],
-            View::Confirm(Pending::Progress(m, ep)) => {
-                // marking it watched can also put the show on another list
-                let to = progress_status(m, ani::ep_num(ep) as u32);
+            View::Confirm(Pending::Progress(m, ep, sequel)) => {
+                // marking it watched can also put the show (or the sequel it's in) on another list
+                let to = progress_status(m, *ep);
+                let it = if *sequel { m.name() } else { "it" };
                 let hint = match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
                     Some(s) if s == to => String::new(),
-                    Some(_) => format!("moves it to {}", list_label(to)),
-                    None => format!("adds it to {}", list_label(to)),
+                    Some(_) => format!("moves {it} to {}", list_label(to)),
+                    None => format!("adds {it} to {}", list_label(to)),
                 };
                 vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
             }
@@ -1699,6 +1780,7 @@ impl App {
                 }
                 let m = m.clone();
                 self.sources.remove(&m.id);
+                self.parts.remove(&m.id);
                 self.fresh.remove(&m.id);
                 self.toast(format!("Source set to {}", hits[i]), false);
                 self.pop(2);
@@ -1828,8 +1910,8 @@ impl App {
                         }
                         self.top().menu.marked.clear();
                     }
-                    Pending::Progress(m, ep) => {
-                        let (m, ep, c) = (m.clone(), ani::ep_num(ep) as u32, self.client.clone());
+                    Pending::Progress(m, ep, _) => {
+                        let (m, ep, c) = (m.clone(), *ep, self.client.clone());
                         let status = progress_status(&m, ep);
                         self.saves_pending += 1;
                         self.spawn(move || {
@@ -1967,6 +2049,7 @@ impl App {
                     return self.toast(e.to_string(), true);
                 }
                 self.client.token = Some(token);
+                self.parts.clear();
                 let c = self.client.clone();
                 self.spawn(move || Msg::Viewer(c.viewer()));
                 self.toast("Checking token…", false);
@@ -1994,7 +2077,7 @@ impl App {
 
     fn show_action(&mut self, m: Media, key: &str) {
         match key {
-            "next" => self.play(m.clone(), (m.progress() + 1).to_string()),
+            "next" => self.play(m.clone(), self.next_ep(&m).to_string()),
             "play" => self.resolve(&m, Some(Want::Episodes(EpMode::Play))),
             // what's on disk can be deleted before ani-cli answers, or without it
             "download"
@@ -2057,7 +2140,7 @@ impl App {
         match want {
             Want::Play(ep) => self.play(m, ep),
             Want::Episodes(mode) => {
-                let next = (m.progress() + 1).to_string();
+                let next = self.next_ep(&m).to_string();
                 let title = if mode == EpMode::Play {
                     "Episodes"
                 } else {
@@ -2196,6 +2279,11 @@ impl App {
                 }
             }
         }
+        for (_, p) in self.parts.values_mut().flat_map(|p| &mut p.1) {
+            if p.id == id {
+                p.media_list_entry = entry.clone();
+            }
+        }
     }
 
     fn on_msg(&mut self, msg: Msg) {
@@ -2302,9 +2390,29 @@ impl App {
             }
             Msg::EpInfo(id, eps) => {
                 self.ep_info.insert(id, eps);
-                if matches!(&self.top().view, View::Episodes(m, _) if m.id == id) {
+                // the show's or a sequel's it runs on into
+                if matches!(&self.top().view, View::Episodes(..)) {
                     self.refresh();
                 }
+            }
+            // without them, the provider's episodes stay the show's own
+            Msg::Parts(id, key, token, changes, parts) => {
+                // looked up for other episode counts or login: their progress is stale
+                let wanted = self.parts.get(&id).is_some_and(|p| p.0 == key);
+                if !wanted || token != self.client.token {
+                    return;
+                }
+                // and from before a save, which they may undo: asked again while it's shown
+                if LIST_CHANGES.load(Ordering::Relaxed) != changes {
+                    self.parts.remove(&id);
+                    return;
+                }
+                let parts = parts.unwrap_or_default();
+                for (_, p) in &parts {
+                    self.want_episodes(p);
+                }
+                self.parts.insert(id, (key, parts));
+                self.refresh();
             }
             Msg::Cover(id, key, res) => {
                 let wanted = matches!(self.covers.get(&id), Some(Cover::Loading(k)) if *k == key);
@@ -2335,6 +2443,8 @@ impl App {
                 match res {
                     Ok(src) => {
                         self.sources.insert(m.id, src);
+                        // before the menu is rebuilt, so it can't offer what went
+                        self.want_parts(&m);
                         self.fresh.insert(m.id);
                         ani::save_resolved(&self.sources);
                         let open = (self.stack.iter())
@@ -2399,16 +2509,19 @@ impl App {
                 {
                     self.playing = None;
                 }
+                // not watched yet, as far as the show or the sequel it's in goes; where it
+                // saves is settled now, as a lookup ending meanwhile could change it
+                let ask = (self.progress_target(&m, &ep))
+                    .filter(|(p, n)| !m.watched(&ep) && *n > p.progress() as f64)
+                    .map(|(p, n)| Pending::Progress(p.clone(), n as u32, p.id != m.id));
                 match res {
                     Err(e) => self.toast(format!("Couldn't play episode {ep} · {e}"), true),
-                    Ok(())
-                        if self.user.is_some()
-                            && m.on_anilist()
-                            && ani::ep_num(&ep) > m.progress() as f64 =>
-                    {
-                        let title = format!("Mark episode {ep} of {} as watched?", m.name());
-                        self.push(title, View::Confirm(Pending::Progress(m, ep)));
-                        self.top().menu.select_key("yes");
+                    Ok(()) if self.user.is_some() && m.on_anilist() => {
+                        if let Some(ask) = ask {
+                            let title = format!("Mark episode {ep} of {} as watched?", m.name());
+                            self.push(title, View::Confirm(ask));
+                            self.top().menu.select_key("yes");
+                        }
                     }
                     Ok(()) => {}
                 }
@@ -2470,6 +2583,46 @@ fn megabytes<'a>(files: impl IntoIterator<Item = &'a PathBuf>) -> String {
         .map(|p| fs::metadata(p).map_or(0, |m| m.len()))
         .sum();
     format!("{} MB", bytes >> 20)
+}
+
+/// The AniList entry episode `ep` of `m` counts toward, and its number there: past `m`'s
+/// own episodes it's in one of the sequels `parts` (each with the episodes before it).
+fn part<'a>(m: &'a Media, parts: &'a [(u32, Media)], ep: &str) -> (&'a Media, String) {
+    let n = ani::ep_num(ep);
+    // a recap 12.5 comes after 12, so it's the 12-episode part's
+    match parts
+        .iter()
+        .rev()
+        .find(|(before, _)| n.floor() > *before as f64)
+    {
+        Some((before, p)) => (p, (n - *before as f64).to_string()),
+        None => (m, ep.to_string()),
+    }
+}
+
+/// The AniList entry that marking episode `ep` of `m` watched saves to, and as which
+/// episode. None past that entry's episodes, which AniList would take as progress like
+/// 13/12: one the provider has extra, or in a sequel that isn't looked up (yet).
+fn progress_target<'a>(
+    m: &'a Media,
+    parts: &'a [(u32, Media)],
+    ep: &str,
+) -> Option<(&'a Media, f64)> {
+    let (p, n) = part(m, parts, ep);
+    let n = ani::ep_num(&n);
+    (p.episodes.is_none_or(|e| n.floor() <= e as f64)).then_some((p, n))
+}
+
+/// The episode after the last one watched. It goes on into a part once everything before
+/// it is, so rewatching the first part doesn't skip to the end of a finished second one.
+fn next_ep(m: &Media, parts: &[(u32, Media)]) -> u32 {
+    let mut next = m.progress() + 1;
+    for (before, p) in parts {
+        if next > *before {
+            next = next.max(before + p.progress() + 1);
+        }
+    }
+    next
 }
 
 /// The list a show is on once episode `ep` is marked watched.
@@ -2551,6 +2704,60 @@ mod tests {
         assert_eq!(super::progress_status(&m, 3), "REPEATING");
         m.media_list_entry = Some(entry("PAUSED"));
         assert_eq!(super::progress_status(&m, 3), "CURRENT");
+    }
+
+    #[test]
+    fn episodes_past_a_split_season_count_toward_its_sequel() {
+        let entry = |progress| {
+            Some(super::Entry {
+                id: 1,
+                status: "CURRENT".into(),
+                progress,
+            })
+        };
+        let show = |id, episodes, progress| super::Media {
+            id,
+            episodes: Some(episodes),
+            media_list_entry: entry(progress),
+            ..Default::default()
+        };
+        // Attack on Titan Season 3 at ani-cli: 22 episodes, 12 and 10 on AniList
+        let (s3, parts) = (show(1, 12, 12), [(12, show(2, 10, 3))]);
+        let at = |ep: &str| {
+            let (m, n) = super::part(&s3, &parts, ep);
+            (m.id, n)
+        };
+        assert_eq!(at("5"), (1, "5".into()));
+        assert_eq!(at("12.5"), (1, "12.5".into()), "a recap stays where it was");
+        assert_eq!(at("13"), (2, "1".into()));
+        assert_eq!(at("22"), (2, "10".into()));
+        assert_eq!(super::part(&s3, &[], "13").1, "13", "no sequels known");
+        let (m, n) = super::part(&s3, &parts, "15");
+        assert!(m.watched(&n) && !super::part(&s3, &parts, "16").0.watched("4"));
+        // nothing saves past an entry's episodes, as while its sequel is looked up
+        let save = |parts: &[(u32, super::Media)], ep| {
+            super::progress_target(&s3, parts, ep).map(|(m, n)| (m.id, n))
+        };
+        assert_eq!(save(&parts, "13"), Some((2, 1.0)));
+        assert_eq!(save(&parts, "12.5"), Some((1, 12.5)));
+        assert_eq!(save(&[], "13"), None);
+        assert_eq!(save(&parts, "23"), None, "past Part 2 too");
+        assert_eq!(save(&parts, "SP"), None);
+        let airing = super::Media::default();
+        assert!(
+            super::progress_target(&airing, &[], "13").is_some(),
+            "no count yet"
+        );
+        let next = |own, second| super::next_ep(&show(1, 12, own), &[(12, show(2, 10, second))]);
+        assert_eq!(next(12, 3), 16);
+        assert_eq!(next(12, 0), 13);
+        assert_eq!(next(3, 10), 4, "rewatching the first part");
+        assert_eq!(
+            next(22, 0),
+            23,
+            "progress saved past 12 before sequels counted"
+        );
+        assert_eq!(next(12, 10), 23);
     }
 
     #[test]

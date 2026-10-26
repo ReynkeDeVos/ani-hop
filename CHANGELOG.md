@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.9 – 2026-10-26
+
+### Fixed
+
+- A season that AniList splits in two but ani-cli lists as one show, like Attack on Titan Season 3 (22 episodes at ani-cli, 12 and 10 in two parts on AniList), had no titles or summaries past episode 12. Marking one of those episodes watched also saved a progress like 22/12 on the first part and took it off Completed, and moving it back to Completed made AniList cut that progress to 12, so episodes 13 to 22 showed as unwatched again. Those episodes now belong to the second part on AniList, once it has finished airing: they get its titles and summaries, count as watched as far as its progress goes, and marking one watched saves it there, so episode 13 is episode 1 of Season 3 Part 2. The preview says which episodes are the second part's, and "Continue with" goes on into it. An episode past a show's count that isn't in such a part, like a recap ani-cli has as episode 13 of 12, doesn't ask to be marked watched anymore.
+
 ## 0.6.8 – 2026-10-24
 
 ### Fixed
