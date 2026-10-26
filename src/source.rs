@@ -371,6 +371,13 @@ pub fn locate(m: &Media, src: &Source) -> Result<Source, String> {
     }
 }
 
+/// `src` with the episodes the provider lists now: a cached one's may be from before the
+/// latest aired. One search.
+pub fn with_episodes(src: Source) -> Result<Source, String> {
+    let episodes = episodes(&src.query, src.index)?;
+    Ok(Source { episodes, ..src })
+}
+
 /// Where `src` is in fresh `hits`: the nth entry with its title, as equal titles (a remake)
 /// keep their order when others move in. Saved before 0.6.1: only an unambiguous match.
 fn position(src: &Source, hits: &[String]) -> Option<usize> {

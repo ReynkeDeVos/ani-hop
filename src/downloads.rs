@@ -102,8 +102,9 @@ pub struct Snapshot {
 pub trait Fetch: Send + Sync + 'static {
     /// The show's download folder.
     fn folder(&self, m: &Media) -> PathBuf;
-    /// Where the provider has the show now.
-    fn resolve(&self, m: &Media, lookup: Lookup) -> Result<Source, String>;
+    /// Where the provider has the show now; with `all` (a job for every episode not
+    /// watched) also the episodes it lists now.
+    fn resolve(&self, m: &Media, lookup: Lookup, all: bool) -> Result<Source, String>;
     /// Starts downloading episode `ep` into `dir`, with its progress on stdout.
     fn start(&self, src: &Source, ep: &str, dub: bool, dir: &Path) -> Result<Child, String>;
 }
@@ -116,8 +117,14 @@ impl Fetch for AniCli {
         ani::folder(m)
     }
 
-    fn resolve(&self, m: &Media, lookup: Lookup) -> Result<Source, String> {
-        lookup.run(m)
+    fn resolve(&self, m: &Media, lookup: Lookup, all: bool) -> Result<Source, String> {
+        // a cached source's episodes may be from before the latest aired
+        let cached = matches!(lookup, Lookup::Check(_));
+        let src = lookup.run(m)?;
+        match all && cached {
+            true => crate::source::with_episodes(src),
+            false => Ok(src),
+        }
     }
 
     fn start(&self, src: &Source, ep: &str, dub: bool, dir: &Path) -> Result<Child, String> {
@@ -435,7 +442,11 @@ impl Queue {
     /// stopped ones are skipped. Returns at a pause, false once quitting stopped the downloads.
     fn work(&self, job: Job, done: &impl Fn(String, Result<(), String>)) -> bool {
         let m = &job.media;
-        let src = match self.0.fetch.resolve(m, job.lookup.clone()) {
+        let src = match self
+            .0
+            .fetch
+            .resolve(m, job.lookup.clone(), job.eps.is_none())
+        {
             Ok(s) => s,
             Err(e) => {
                 let mut st = self.lock();
@@ -630,7 +641,7 @@ mod tests {
         fn folder(&self, m: &Media) -> PathBuf {
             self.root.join(m.name())
         }
-        fn resolve(&self, _: &Media, lookup: Lookup) -> Result<Source, String> {
+        fn resolve(&self, _: &Media, lookup: Lookup, _: bool) -> Result<Source, String> {
             match lookup {
                 Lookup::Ready(s) | Lookup::Check(s) => Ok(s),
                 Lookup::Resolve => Ok(source()),
