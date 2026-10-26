@@ -16,6 +16,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const FAKE_ROFI: &str = r#"#!/bin/sh
 # ani-hop: captures ani-cli's menu instead of showing one
@@ -99,14 +100,25 @@ pub fn read_json<T: DeserializeOwned + Default>(path: &Path) -> T {
         .unwrap_or_default()
 }
 
-/// Written aside and renamed, so a full disk or quitting mid-write can't leave half a file.
 pub fn write_json(path: &Path, value: &impl Serialize) -> std::io::Result<()> {
+    write_bytes(path, &serde_json::to_vec_pretty(value)?)
+}
+
+/// Written aside and renamed, so a full disk or quitting mid-write can't leave half a file.
+/// The file aside is this writer's own: another ani-hop, or another thread, may be writing
+/// the same file right then.
+pub fn write_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static N: AtomicU64 = AtomicU64::new(0);
     fs::create_dir_all(path.parent().unwrap())?;
     // through a symlink (dotfiles), as a plain write would
     let path = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, serde_json::to_vec_pretty(value)?)?;
-    fs::rename(&tmp, &path)
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("{}-{n}.tmp", std::process::id()));
+    let res = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, &path));
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
 }
 
 fn root_path() -> PathBuf {

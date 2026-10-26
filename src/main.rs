@@ -20,7 +20,6 @@ use ratatui::crossterm::event::{
     KeyModifiers,
 };
 use ratatui::crossterm::execute;
-use ratatui::layout::Size;
 use source::{Lookup, Source, Sources};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry::Vacant;
@@ -104,15 +103,6 @@ pub struct Screen {
     pub loading: bool,
 }
 
-/// A poster is made for a size in cells and the pixels per cell (font zoom changes those).
-pub type CoverKey = (Size, (u16, u16));
-
-pub enum Cover {
-    Loading(CoverKey),
-    Ready(CoverKey, kitty::Poster),
-    Failed,
-}
-
 enum Want {
     Episodes(EpMode),
     Play(String),
@@ -125,8 +115,8 @@ enum Msg {
     More(u64, Result<Vec<Media>, String>),
     Hits(u64, Result<Vec<String>, String>),
     Viewer(Result<(u64, String), String>),
-    /// prepared poster: pixel file, pixel size, size in cells
-    Cover(u64, CoverKey, Result<(PathBuf, u32, u32, Size), String>),
+    /// a prepared poster
+    Cover(kitty::Loaded),
     EpInfo(u64, HashMap<String, EpInfo>),
     /// sequels of a show, looked up for its episode counts (App::parts_key), login and
     /// LIST_CHANGES
@@ -213,24 +203,15 @@ pub struct App {
     rx: Receiver<Msg>,
     client: Client,
     pub user: Option<(u64, String)>,
-    /// pixels per cell, read from the terminal every frame (font zoom changes it)
-    pub cell: (u16, u16),
-    next_image: u32,
-    /// posters handed over as files: (file, when, media id); still there later = unreadable
-    sent: Vec<(PathBuf, Instant, u64)>,
-    /// the terminal didn't read a poster file, so posters are off for this session
-    no_graphics: bool,
+    pub posters: kitty::Posters,
     /// AniList list changes not answered yet
     saves_pending: usize,
-    pub covers: HashMap<u64, Cover>,
     /// episode titles and summaries per show (empty while loading or when there are none)
     pub ep_info: HashMap<u64, HashMap<String, EpInfo>>,
     /// AniList sequels per show that its provider entry runs on into, each with the episodes
     /// before it (empty while loading or when there are none), and the episode counts they
     /// were looked up for
     parts: HashMap<u64, ((u32, u32), Parts)>,
-    /// poster size in cells, set by the last layout
-    pub poster: Size,
     pub sources: Sources,
     /// downloaded episodes per show, rescanned on refresh
     pub local: HashMap<u64, Vec<(String, PathBuf)>>,
@@ -318,7 +299,13 @@ fn main() -> std::io::Result<()> {
                 app.on_msg(msg);
                 dirty = true;
             }
-            dirty |= app.check_sent();
+            if app.posters.check(Instant::now()) {
+                app.toast(
+                    "This terminal didn't take the posters, showing colors instead",
+                    true,
+                );
+                dirty = true;
+            }
             if let Some(cmd) = app.external.take() {
                 execute!(std::io::stdout(), DisableBracketedPaste)?;
                 ratatui::restore();
@@ -331,7 +318,7 @@ fn main() -> std::io::Result<()> {
         }
         Ok(())
     })();
-    app.forget_posters();
+    app.posters.forget();
     kitty::shutdown();
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
@@ -418,22 +405,6 @@ fn open_url(url: &str) {
         .spawn();
 }
 
-/// Cover from the disk cache (or AniList), scaled and written out for the terminal.
-fn load_cover(
-    id: u64,
-    url: &str,
-    (size, cell): CoverKey,
-) -> Result<(PathBuf, u32, u32, Size), String> {
-    let path = ani::cache_dir().join("covers").join(format!("{id}.jpg"));
-    let bytes = fs::read(&path).or_else(|_| {
-        let bytes = anilist::fetch(url)?;
-        let _ = fs::create_dir_all(path.parent().unwrap());
-        let _ = fs::write(&path, &bytes);
-        Ok::<_, String>(bytes)
-    })?;
-    kitty::prepare(&bytes, size, cell)
-}
-
 /// Episode titles and summaries from the disk cache, or ani.zip once it is a day old (a
 /// month for shows that are out completely).
 fn load_episodes(m: &Media) -> HashMap<String, EpInfo> {
@@ -490,16 +461,10 @@ impl App {
             rx,
             client,
             user: user.map(|(id, name, _)| (id, name)),
-            cell: kitty::cell_px(),
-            // instances sharing one terminal (tmux panes) must not reuse each other's ids
-            next_image: std::process::id().wrapping_mul(2_654_435_761) & 0xFF_FFFF,
-            sent: Vec::new(),
-            no_graphics: false,
+            posters: kitty::Posters::new(kitty::Tty, kitty::supported()),
             saves_pending: 0,
-            covers: HashMap::new(),
             ep_info: HashMap::new(),
             parts: HashMap::new(),
-            poster: Size::new(0, 0),
             sources: Sources::load(),
             local: HashMap::new(),
             elsewhere: HashMap::new(),
@@ -864,43 +829,11 @@ impl App {
                 .is_some_and(|t| t.2.elapsed().as_secs() < 5)
     }
 
-    /// Starts loading a poster at the current size. `urgent` (the one on screen) skips the
-    /// queue; look-ahead ones wait while 4 are in flight and get asked for again next frame.
+    /// Starts loading a show's poster at the size of the last layout; `urgent` is the one on
+    /// screen.
     pub fn want_cover(&mut self, m: &Media, urgent: bool) {
-        let (size, key) = (self.poster, (self.poster, self.cell));
-        let fresh = match self.covers.get(&m.id) {
-            Some(Cover::Loading(k) | Cover::Ready(k, _)) => *k == key,
-            Some(Cover::Failed) => true,
-            None => false,
-        };
-        let busy = self
-            .covers
-            .values()
-            .filter(|c| matches!(c, Cover::Loading(_)))
-            .count();
-        if fresh || size.width == 0 || (busy >= 4 && !urgent) {
-            return;
-        }
-        // nobody would read (and delete) the pixel files; the cover color stands in
-        if !kitty::supported() || self.no_graphics {
-            self.covers.insert(m.id, Cover::Failed);
-            return;
-        }
-        // ponytail: the terminal keeps ~3 MB per poster; past 60 they all go and reload from
-        // the disk cache in ms
-        if self.covers.len() > 60 {
-            self.forget_posters();
-        }
-        if let Some(Cover::Ready(_, p)) = self.covers.get(&m.id) {
-            kitty::delete(p.id); // resized: the old one is never drawn again
-        }
-        match m.cover_image.extra_large.clone() {
-            Some(url) => {
-                self.covers.insert(m.id, Cover::Loading(key));
-                let id = m.id;
-                self.spawn(move || Msg::Cover(id, key, load_cover(id, &url, key)));
-            }
-            None => _ = self.covers.insert(m.id, Cover::Failed),
+        if let Some(load) = self.posters.want(m, urgent) {
+            self.spawn(move || Msg::Cover(load.run()));
         }
     }
 
@@ -961,35 +894,6 @@ impl App {
     pub fn ep_about(&self, m: &Media, ep: &str) -> Option<&EpInfo> {
         let (p, n) = self.progress(m).entry(ep);
         self.ep_info.get(&p.id)?.get(&n)
-    }
-
-    /// Frees every poster in the terminal.
-    fn forget_posters(&mut self) {
-        for c in self.covers.values() {
-            if let Cover::Ready(_, p) = c {
-                kitty::delete(p.id);
-            }
-        }
-        self.covers.clear();
-        self.sent.clear();
-        kitty::cleanup(); // files of the in-flight ones come back unwanted and go too
-    }
-
-    /// The terminal deletes a poster file once it read it. One still around after 2 s means
-    /// it never will (tmux without passthrough, ssh, ...): fall back to the cover colors.
-    fn check_sent(&mut self) -> bool {
-        let old = |s: &(PathBuf, Instant, u64)| s.1.elapsed() > Duration::from_secs(2);
-        if !self.sent.iter().any(|s| old(s) && s.0.exists()) {
-            self.sent.retain(|s| !old(s));
-            return false;
-        }
-        self.no_graphics = true;
-        self.forget_posters();
-        self.toast(
-            "This terminal didn't take the posters, showing colors instead",
-            true,
-        );
-        true
     }
 
     fn items(&self, view: &View) -> Vec<Item> {
@@ -2068,25 +1972,7 @@ impl App {
                 self.parts.insert(id, (key, parts));
                 self.refresh();
             }
-            Msg::Cover(id, key, res) => {
-                let wanted = matches!(self.covers.get(&id), Some(Cover::Loading(k)) if *k == key);
-                match res {
-                    // sent now, even for look-ahead posters: showing one later is free
-                    Ok((file, w, h, cells)) if wanted => {
-                        self.next_image = self.next_image % 0xFF_FFFF + 1; // 24-bit ids, never 0
-                        kitty::transmit(self.next_image, &file, (w, h), cells);
-                        self.sent.push((file, Instant::now(), id));
-                        let poster = kitty::Poster {
-                            id: self.next_image,
-                            size: cells,
-                        };
-                        self.covers.insert(id, Cover::Ready(key, poster));
-                    }
-                    Ok((file, ..)) => _ = fs::remove_file(file), // stale, never sent
-                    Err(_) if wanted => _ = self.covers.insert(id, Cover::Failed),
-                    Err(_) => {}
-                }
-            }
+            Msg::Cover(loaded) => self.posters.loaded(loaded),
             Msg::Resolved(m, ticket, res) => {
                 // a lookup from before the source was changed by hand
                 if !self.sources.answer(m.id, ticket, &res) {

@@ -1,6 +1,6 @@
 use crate::anilist::Media;
 use crate::kitty;
-use crate::{App, Cover, EpMode, Input, PIN_REDIRECT, Pending, View, ani, list_label};
+use crate::{App, EpMode, Input, PIN_REDIRECT, Pending, View, ani, list_label};
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, BorderType, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap,
@@ -25,7 +25,6 @@ const GLINT_MS: u128 = 450;
 const POP_MS: u128 = 160;
 
 pub fn render(app: &mut App, f: &mut Frame) {
-    app.cell = kitty::cell_px();
     let [head, body, foot] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -849,14 +848,13 @@ fn media_preview(
     let part = ep.map(|ep| app.progress(show).entry(ep).0.clone());
     let part = part.filter(|p| p.id != show.id);
     let m = part.as_ref().unwrap_or(show);
-    let (fw, fh) = app.cell;
     let rows = (area.height * 3 / 5).clamp(6, 26).min(area.height);
-    let cols = ((rows as f32 * fh as f32 * 0.7) / fw.max(1) as f32).round() as u16;
-    app.poster = Size::new(cols.min(area.width / 2), rows);
+    // font zoom changes the pixels per cell, so they're read every frame
+    let size = app.posters.fit(rows, area.width / 2, kitty::cell_px());
     app.want_cover(m, true);
 
     let [poster, _, info] = Layout::horizontal([
-        Constraint::Length(app.poster.width),
+        Constraint::Length(size.width),
         Constraint::Length(2),
         Constraint::Fill(1),
     ])
@@ -990,10 +988,9 @@ fn media_preview(
     let page_h = end.max(rows);
     let page_area = Rect::new(area.x, area.y, area.width, page_h.max(area.height));
     let mut page = Buffer::empty(page_area);
-    match app.covers.get(&m.id) {
-        Some(Cover::Ready(_, p)) => kitty::render(p, poster, &mut page),
-        // the cover's dominant color stands in while it loads
-        _ => Block::new().bg(accent).render(poster, &mut page),
+    // the cover's dominant color stands in while it loads
+    if !app.posters.draw(m.id, poster, &mut page) {
+        Block::new().bg(accent).render(poster, &mut page);
     }
     let head_area = Rect::new(info.x, info.y, info.width, head_h);
     head.render(head_area, &mut page);
