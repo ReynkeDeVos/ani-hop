@@ -984,7 +984,8 @@ mod tests {
         assert_eq!(q.drop_leftovers(std::slice::from_ref(&left)), 1);
         release.join().unwrap();
         assert!(!part.exists(), "dropped leftovers lose their pieces");
-        // and a queued episode, stopped: its folder went with the leftovers, so it's made again
+        // and stopped (nothing queued or running here): its folder went with the leftovers, so
+        // it is made again
         drop(ani::prepare_in(&dir.join("dl"), &show()).unwrap());
         let release = briefly();
         q.stop(&show(), &["1".into()], None, &[]).unwrap();
