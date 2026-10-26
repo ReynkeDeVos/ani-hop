@@ -839,7 +839,7 @@ pub fn show_files(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Drops a show folder of ours once nothing is left in it.
-fn drop_if_empty(dir: &Path) -> std::io::Result<()> {
+pub fn drop_if_empty(dir: &Path) -> std::io::Result<()> {
     if ours(dir) && fs::read_dir(dir)?.next().is_none() {
         fs::remove_dir(dir)?;
         edit_index(|all| {
@@ -906,17 +906,30 @@ fn replaces(m: &Media, saved: &Media) -> bool {
     m.on_anilist() || saved.id == 0 // 0: a new entry
 }
 
-/// Makes `dir` the download folder of `m` in the index, which then knows the show: one
-/// found through ani-cli never replaces one AniList knows.
-pub fn prepare(m: &Media, dir: &Path) -> Result<(), String> {
-    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+/// Makes `m`'s download folder, as `folder` picks it, and puts it in the index, which then
+/// knows the show (one found through ani-cli never replaces one AniList knows). All under
+/// the index's lock: two ani-hops starting on two shows with one name at once take a
+/// folder each.
+pub fn prepare(m: &Media) -> Result<PathBuf, String> {
+    prepare_in(&download_root(), m)
+}
+
+pub fn prepare_in(root: &Path, m: &Media) -> Result<PathBuf, String> {
+    let mut made = Err("no download folder".to_string());
     edit_index(|all| {
-        let d = all.entry(dir.to_path_buf()).or_default();
-        if replaces(m, &d.media) {
-            d.media = m.clone();
-        }
+        let dir = folder_in(root, all.clone(), m);
+        made = fs::create_dir_all(&dir)
+            .map_err(|e| e.to_string())
+            .map(|()| {
+                let d = all.entry(dir.clone()).or_default();
+                if replaces(m, &d.media) {
+                    d.media = m.clone();
+                }
+                dir
+            });
     })
-    .map_err(|e| e.to_string())
+    .map_err(|e| e.to_string())?;
+    made
 }
 
 /// Deletes the pieces yt-dlp was writing when episode `ep` stopped, see `half_pieces`.

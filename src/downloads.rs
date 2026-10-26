@@ -102,6 +102,8 @@ pub struct Snapshot {
 pub trait Fetch: Send + Sync + 'static {
     /// The show's download folder.
     fn folder(&self, m: &Media) -> PathBuf;
+    /// Makes it, and puts it in the index, as `ani::prepare` does.
+    fn prepare(&self, m: &Media) -> Result<PathBuf, String>;
     /// Where the provider has the show now; with `all` (a job for every episode not
     /// watched) also the episodes it lists now.
     fn resolve(&self, m: &Media, lookup: Lookup, all: bool) -> Result<Source, String>;
@@ -115,6 +117,10 @@ pub struct AniCli;
 impl Fetch for AniCli {
     fn folder(&self, m: &Media) -> PathBuf {
         ani::folder(m)
+    }
+
+    fn prepare(&self, m: &Media) -> Result<PathBuf, String> {
+        ani::prepare(m)
     }
 
     fn resolve(&self, m: &Media, lookup: Lookup, all: bool) -> Result<Source, String> {
@@ -292,16 +298,12 @@ impl Queue {
             kill(r.pid);
         }
         st.now.take_if(|n| n.id == m.id && eps.contains(&n.ep));
-        if ani::ours(&dir) {
-            let waiting: Vec<String> = (eps.iter())
-                .filter(|e| running.as_ref() != Some(e))
-                .cloned()
-                .collect();
-            match running {
-                Some(_) => ani::discard_parts(&dir, &waiting),
-                None => ani::discard(&dir, &waiting),
-            }
-        }
+        let waiting: Vec<String> = (eps.iter())
+            .filter(|e| running.as_ref() != Some(e))
+            .cloned()
+            .collect();
+        // the running one's folder stays: the worker deletes what it got once it's gone
+        self.discard(&dir, &waiting, running.is_some());
         saved
     }
 
@@ -406,7 +408,8 @@ impl Queue {
             }
             st.paused = false;
         }
-        for f in files {
+        // one by our name (an earlier ani-hop's, with our pid) holds what was just saved
+        for f in files.into_iter().filter(|f| **f != self.file()) {
             let _ = fs::remove_file(f);
         }
         let _ = self.0.wake.send(());
@@ -420,14 +423,17 @@ impl Queue {
         let jobs: Vec<Job> = (files.iter())
             .flat_map(|f| {
                 let jobs = read_queue(f);
-                fs::remove_file(f).map_or(Vec::new(), |()| jobs)
+                // one by our name (an earlier ani-hop's, with our pid) gets this one's queue
+                let gone = match *f == self.file() {
+                    true => self.save(&mut self.lock()).is_ok(),
+                    false => fs::remove_file(f).is_ok(),
+                };
+                if gone { jobs } else { Vec::new() }
             })
             .collect();
-        let mut busy = self.elsewhere();
-        busy.extend(self.lock().jobs.iter().map(|j| (j.media.id, Vec::new())));
-        for j in jobs.iter().filter(|j| !busy.contains_key(&j.media.id)) {
+        for j in &jobs {
             let eps = j.eps.as_deref().unwrap_or_default();
-            ani::discard(&self.0.fetch.folder(&j.media), eps);
+            self.discard(&self.0.fetch.folder(&j.media), eps, false);
         }
         jobs.len()
     }
@@ -484,7 +490,8 @@ impl Queue {
                 return true;
             };
             let label = format!("{} E{ep}", m.name());
-            let res = self.fetch_one(&job, &src, &ep, dub, &label);
+            // held until what a stopped one got is deleted: another ani-hop may start it then
+            let (res, _claim) = self.fetch_one(&job, &src, &ep, dub, &label);
             let mut st = self.lock();
             if res.is_err() && st.quit {
                 return false;
@@ -510,15 +517,18 @@ impl Queue {
             }
             let _ = self.save(&mut st);
             drop(st);
-            match had {
-                true => done(label, res),
-                false => ani::discard(&self.0.fetch.folder(m), std::slice::from_ref(&ep)),
+            match (had, &_claim) {
+                (true, _) => done(label, res),
+                (false, Some(c)) => ani::discard(&c.dir, std::slice::from_ref(&ep)),
+                // it never started: nothing of it here is this ani-hop's
+                (false, None) => {}
             }
         }
     }
 
     /// Downloads one episode. It starts under the lock stopping and pausing take, after
-    /// checking it's still wanted, so neither is ever missed.
+    /// checking it's still wanted, so neither is ever missed. Also the episode's claim, if it
+    /// got that far.
     fn fetch_one(
         &self,
         job: &Job,
@@ -526,9 +536,22 @@ impl Queue {
         ep: &str,
         dub: bool,
         label: &str,
+    ) -> (Result<(), String>, Option<EpisodeLock>) {
+        let mut claim = None;
+        let res = self.fetch(job, src, ep, dub, label, &mut claim);
+        (res, claim)
+    }
+
+    fn fetch(
+        &self,
+        job: &Job,
+        src: &Source,
+        ep: &str,
+        dub: bool,
+        label: &str,
+        claim: &mut Option<EpisodeLock>,
     ) -> Result<(), String> {
         let m = &job.media;
-        let dir = self.0.fetch.folder(m);
         let now = |text: &str, resumes| Now {
             id: m.id,
             ep: ep.to_string(),
@@ -536,7 +559,7 @@ impl Queue {
             text: text.into(),
             resumes,
         };
-        let (child, _claim) = {
+        let (child, dir) = {
             let mut st = self.lock();
             let wanted = (st.jobs.iter()).any(|j| j.id == job.id && j.has(ep));
             if st.quit || st.paused || !wanted {
@@ -546,9 +569,12 @@ impl Queue {
             // under the lock, so stopping another episode can't drop the folder in between;
             // also for an episode already there, so a folder found through ani-cli gets the
             // AniList show
-            ani::prepare(m, &dir)?;
+            let dir = self.0.fetch.prepare(m)?;
             // another ani-hop may have queued it too before either saw the other's queue
-            let claim = self.claim_episode(&dir, ep)?;
+            *claim = Some(
+                self.claim(&dir, ep)?
+                    .ok_or("another ani-hop is downloading it")?,
+            );
             if ani::local_episodes(&dir).iter().any(|(e, _)| e == ep) {
                 return Ok(()); // yt-dlp wouldn't replace it, so it stays the audio it was
             }
@@ -560,7 +586,7 @@ impl Queue {
                 dir: dir.clone(),
                 ep: ep.to_string(),
             });
-            (child, claim)
+            (child, dir)
         };
         let mut lines = ani::Lines::default();
         let stderr = ani::follow(child, |l| {
@@ -582,32 +608,65 @@ impl Queue {
         }
     }
 
-    /// Holds episode `ep` of the show in `dir` for this ani-hop while it downloads it: two
-    /// writing the same files would spoil both.
-    fn claim_episode(&self, dir: &Path, ep: &str) -> Result<EpisodeLock, String> {
+    /// Holds episode `ep` of the show in `dir` for this ani-hop: while it downloads it, and
+    /// while what's left of a stopped one is deleted, as two writing (or one deleting) the
+    /// same files would spoil them. None while another holds it, this one's worker included.
+    fn claim(&self, dir: &Path, ep: &str) -> Result<Option<EpisodeLock>, String> {
         let key = format!("{}\n{ep}", dir.display());
         let hash = (key.bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
             (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
         });
-        let path = self.0.dir.join(format!("{hash:016x}.lock"));
+        let locks = self.0.dir.join("locks");
+        fs::create_dir_all(&locks).map_err(|e| e.to_string())?;
+        let path = locks.join(format!("{hash:016x}.lock"));
         let file = fs::File::create(&path).map_err(|e| e.to_string())?;
-        match file.try_lock() {
-            Ok(()) => Ok(EpisodeLock { path, _held: file }),
-            Err(_) => Err("another ani-hop is downloading it".into()),
+        Ok(file.try_lock().ok().map(|()| EpisodeLock {
+            path,
+            _held: file,
+            dir: dir.to_path_buf(),
+            ep: ep.to_string(),
+        }))
+    }
+
+    /// Deletes what unfinished downloads of `eps` left in `dir`, of each one no ani-hop is
+    /// downloading right now (this one's worker included), and the folder if that was all.
+    fn discard(&self, dir: &Path, eps: &[String], keep_folder: bool) {
+        if !ani::ours(dir) {
+            return;
+        }
+        for ep in eps {
+            let ep = std::slice::from_ref(ep);
+            if !ani::parts(dir, ep).is_empty()
+                && let Ok(Some(_held)) = self.claim(dir, &ep[0])
+            {
+                ani::discard_parts(dir, ep);
+            }
+        }
+        if !keep_folder {
+            let _ = ani::drop_if_empty(dir);
         }
     }
 }
 
-/// An episode lock; its file goes with it. One that opened the file just before it went
-/// and locks it after finds the episode on disk, so nothing downloads twice.
+/// An episode's claim. Its file goes only once the episode is on disk: one that opened the
+/// file just before it went and locks it after finds the episode there and downloads
+/// nothing. Gone while the episode isn't there, a third ani-hop's new file would let two
+/// download it at once.
 struct EpisodeLock {
     path: PathBuf,
     _held: fs::File,
+    dir: PathBuf,
+    ep: String,
 }
 
 impl Drop for EpisodeLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        if ani::local_episodes(&self.dir)
+            .iter()
+            .any(|(e, _)| *e == self.ep)
+        {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -641,6 +700,9 @@ mod tests {
         fn folder(&self, m: &Media) -> PathBuf {
             self.root.join(m.name())
         }
+        fn prepare(&self, m: &Media) -> Result<PathBuf, String> {
+            ani::prepare_in(&self.root, m)
+        }
         fn resolve(&self, _: &Media, lookup: Lookup, _: bool) -> Result<Source, String> {
             match lookup {
                 Lookup::Ready(s) | Lookup::Check(s) => Ok(s),
@@ -666,7 +728,18 @@ mod tests {
     /// writes a piece and waits to be stopped, unless it was stopped before: then it finishes
     const SLOW: &str = "if [ -e \"$OUT.again\" ]; then printf x > \"$OUT\"; exit; fi; : > \"$OUT.again\"; printf '[download]  10.0%% of ~ 1.00MiB at 1.00MiB/s ETA 00:09\\n'; : > \"$OUT.part\"; exec sleep 30";
 
+    thread_local! {
+        /// the show of this test: tests share one index, and a show's folder is found there
+        static ID: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    }
+
     fn temp(name: &str) -> PathBuf {
+        // and of this run: a folder an earlier one left would be found too
+        let run = std::process::id() as u64;
+        let id = name
+            .bytes()
+            .fold(run << 20, |h, b| h.wrapping_mul(31) ^ b as u64);
+        ID.set(id & 0xFFFF_FFFF_FFFF); // an AniList-like id
         let dir = std::env::temp_dir().join(format!("ani-hop-q-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -675,7 +748,7 @@ mod tests {
 
     fn show() -> Media {
         let mut m = Media {
-            id: 7,
+            id: ID.get(),
             ..Default::default()
         };
         m.title.romaji = Some("Show".into());
@@ -738,6 +811,8 @@ mod tests {
         wait("queue file gone", || !dir.join("queue/a.json").exists());
         let s = q.snapshot();
         assert!(s.pending == 0 && s.now.is_none() && !s.paused);
+        let locks = fs::read_dir(dir.join("queue/locks")).unwrap().count();
+        assert_eq!(locks, 0, "a finished episode's claim goes with it");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -757,6 +832,9 @@ mod tests {
             "no toast"
         );
         assert!(!dir.join("queue/a.json").exists());
+        // the claim of an episode not on disk stays: deleting it could let two own it
+        let locks = fs::read_dir(dir.join("queue/locks")).unwrap().count();
+        assert_eq!(locks, 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -768,8 +846,8 @@ mod tests {
         let part = dir.join("dl/Show/Show Episode 1.mp4.part");
         wait("a piece", || running(&q, "1") && part.exists());
         // asked about 2, but 1 runs: nothing changes
-        assert!(!q.pause(7, "2") && !q.snapshot().paused);
-        assert!(q.pause(7, "1"));
+        assert!(!q.pause(ID.get(), "2") && !q.snapshot().paused);
+        assert!(q.pause(ID.get(), "1"));
         let s = q.snapshot();
         assert!(s.paused && s.pending == 2 && s.now.is_some_and(|n| n.ep == "1"));
         assert!(done.recv_timeout(Duration::from_millis(300)).is_err());
@@ -802,6 +880,50 @@ mod tests {
         let t = Duration::from_secs(10);
         assert_eq!(done.recv_timeout(t).unwrap(), ("Show E1".into(), Ok(())));
         assert_eq!(next.adopt(&files), Ok(0), "taken already");
+        next.quit();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_another_ani_hop_downloads_is_never_deleted() {
+        let dir = temp("theirs");
+        let (a, _) = queue(&dir, "a", SLOW);
+        let (b, _) = queue(&dir, "b", QUICK);
+        a.enqueue(job(&["1"])).unwrap();
+        let part = dir.join("dl/Show/Show Episode 1.mp4.part");
+        wait("a downloads", || running(&a, "1") && part.exists());
+        // b had it queued too and drops it (stopped, or its leftovers dropped)
+        b.discard(&dir.join("dl/Show"), &["1".into()], false);
+        assert!(part.exists(), "a's piece stays while a holds the episode");
+        a.quit();
+        wait("a's claim released, then b deletes it", || {
+            b.discard(&dir.join("dl/Show"), &["1".into()], false);
+            !part.exists()
+        });
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_leftover_by_our_own_name_keeps_what_was_taken_over() {
+        let dir = temp("ownname");
+        let (q, _) = queue(&dir, "me", SLOW);
+        // an ani-hop that had our pid before left this
+        let mine = dir.join("queue/me.json");
+        ani::write_json(&mine, &vec![job(&["1", "2"])]).unwrap();
+        let (jobs, files) = q.leftovers();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(files, std::slice::from_ref(&mine));
+        assert_eq!(q.adopt(&files), Ok(1));
+        assert!(mine.exists(), "it holds the queue now");
+        assert_eq!(read_queue(&mine).len(), 1);
+        q.quit();
+        wait("stopped", || q.lock().running.is_none());
+        // dropped, it holds this one's own queue, which is empty here: it goes
+        let (q, _) = queue(&dir.join("other"), "me", SLOW);
+        let mine = dir.join("other/queue/me.json");
+        ani::write_json(&mine, &vec![job(&["1"])]).unwrap();
+        assert_eq!(q.drop_leftovers(std::slice::from_ref(&mine)), 1);
+        assert!(!mine.exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
