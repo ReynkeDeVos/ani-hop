@@ -489,9 +489,12 @@ fn probe(args: &[&str]) -> Result<Option<(String, Vec<String>)>, String> {
     }
 }
 
+/// What a search found: provider titles, and the episodes if there was just one hit.
+type Hits = (Vec<String>, Option<Vec<String>>);
+
 /// Provider titles in ani-cli's order (index = position + 1). If there is just one hit,
 /// ani-cli skips the menu, so we get its episodes instead and not its title.
-pub fn search(query: &str) -> Result<(Vec<String>, Option<Vec<String>>), String> {
+pub fn search(query: &str) -> Result<Hits, String> {
     match probe(&[query])? {
         Some((p, lines)) if p.starts_with("Select anime") => Ok((
             lines
@@ -510,7 +513,7 @@ pub fn search(query: &str) -> Result<(Vec<String>, Option<Vec<String>>), String>
 pub fn or_ani_cli(
     anilist: Result<Vec<Media>, String>,
     query: &str,
-    search: impl FnOnce(&str) -> Result<(Vec<String>, Option<Vec<String>>), String>,
+    search: impl FnOnce(&str) -> Result<Hits, String>,
 ) -> Result<Vec<Media>, String> {
     let e = match anilist {
         Err(e) => e,
@@ -560,7 +563,7 @@ fn title_key(s: &str) -> String {
 }
 
 /// Best hits, equally good: same canonical title as on AniList, else the closest title
-/// that contains one of AniList's (or is contained), else the provider's top hit.
+/// that contains one of AniList's (or is contained), else none.
 fn best_matches(m: &Media, hits: &[String]) -> Vec<usize> {
     let titles: Vec<String> = [&m.title.english, &m.title.romaji]
         .into_iter()
@@ -581,8 +584,32 @@ fn best_matches(m: &Media, hits: &[String]) -> Vec<usize> {
         Some(best) => (0..hits.len())
             .filter(|&i| scores[i] == Some(*best))
             .collect(),
-        None => vec![0],
+        None => Vec::new(),
     }
+}
+
+/// Searches `queries` in turn up to the first whose hits have one of `m`'s titles, as one can
+/// find only other shows ("Hagane no Renkinjutsushi": just Arpeggio). If none does, the first
+/// that found anything. `search` is `search`, passed in for tests.
+fn first_fit(
+    m: &Media,
+    queries: &[String],
+    mut search: impl FnMut(&str) -> Result<Hits, String>,
+) -> Result<(String, Hits), String> {
+    let mut found = Err("no title to search for".to_string());
+    for q in queries {
+        let res = search(q).map(|r| (q.clone(), r));
+        // a single hit shows no title to check, and it's the only show there is
+        let fits = (res.as_ref())
+            .is_ok_and(|(_, (hits, eps))| eps.is_some() || !best_matches(m, hits).is_empty());
+        if fits || found.is_err() {
+            found = res;
+        }
+        if fits {
+            break;
+        }
+    }
+    found
 }
 
 /// The show `best_matches` compares titles with: one ani-cli found by its provider title, as
@@ -661,7 +688,7 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
     let saved = overrides().remove(&m.id.to_string());
     // picked from ani-cli's own results: that very entry, unless "Change source…" chose another
     let picked = m.ani_cli.as_ref().filter(|_| saved.is_none());
-    let mut found = Err("no title to search for".to_string());
+    let mut found = None;
     if let Some(at) = picked {
         let (hits, eps) = search(&at.query)?;
         if let Some(eps) = eps {
@@ -677,7 +704,7 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
             ));
         }
         // gone, or picked as a single hit whose title ani-cli never showed: match titles below
-        found = Ok((at.query.clone(), (hits, None)));
+        found = Some((at.query.clone(), (hits, None)));
     }
     // provider search chokes on some symbols (HUNTER×HUNTER), so fall back to plainer queries
     let plain = |t: &String| {
@@ -698,22 +725,23 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
         .flatten()
         .collect(),
     };
-    queries.dedup();
-    for q in queries {
-        found = search(&q).map(|r| (q, r));
-        if found.is_ok() {
-            break;
-        }
-    }
-    let (query, (hits, eps)) = found?;
+    let mut seen = HashSet::new();
+    queries.retain(|q| seen.insert(q.clone()));
+    let (query, (hits, eps)) = match found {
+        Some(found) => found,
+        None => first_fit(&matched(m), &queries, search)?,
+    };
     if let Some(eps) = eps {
         return Ok(Source::at(&query, &hits, 1, eps));
     }
     let exact = saved.map(|(_, t)| t).or(picked.map(|at| at.title.clone()));
-    let candidates = match exact.and_then(|t| hits.iter().position(|h| *h == t)) {
+    let mut candidates = match exact.and_then(|t| hits.iter().position(|h| *h == t)) {
         Some(pos) => vec![pos],
         None => best_matches(&matched(m), &hits),
     };
+    if candidates.is_empty() {
+        candidates.push(0); // nothing close: trust the provider's ranking
+    }
     // same title twice (HUNTER×HUNTER 1999/2011): a finished show's episode count decides
     let want = m
         .episodes
@@ -1438,20 +1466,55 @@ mod tests {
         ]
         .map(String::from);
         assert_eq!(best_matches(&hxh, &hits), [0, 1]); // tie, resolved by episode count
-        // nothing close: trust the provider's ranking
+        let mut kimi = Media::default();
+        kimi.title.english = Some("Your Name.".into());
+        let hits = ["Weathering With You", "Suzume"].map(String::from);
+        assert!(best_matches(&kimi, &hits).is_empty()); // nothing close
+    }
+
+    #[test]
+    fn searches_on_when_no_hit_is_the_show() {
+        let mut fma = Media::default();
+        fma.title.romaji = Some("Hagane no Renkinjutsushi".into());
+        fma.title.english = Some("Fullmetal Alchemist".into());
+        let queries = ["Hagane no Renkinjutsushi", "Fullmetal Alchemist", "FMA"].map(String::from);
+        let provider = |q: &str| match q {
+            "Fullmetal Alchemist" => ["Fullmetal Alchemist: Brotherhood", "Fullmetal Alchemist"],
+            _ => [
+                "Aoki Hagane no Arpeggio: Ars Nova DC",
+                "Arpeggio of Blue Steel",
+            ],
+        };
+        let mut searched = Vec::new();
+        let search = |q: &str| {
+            searched.push(q.to_string());
+            Ok((provider(q).map(String::from).into(), None))
+        };
+        let (query, _) = first_fit(&fma, &queries, search).unwrap();
+        assert_eq!(query, "Fullmetal Alchemist");
+        assert_eq!(searched, queries[..2]); // and no further
+
+        // found by none: the first search that found anything, the provider's top hit stands
+        let failing = |q: &str| match q {
+            "Hagane no Renkinjutsushi" => Err("No results found!".into()),
+            _ => Ok((vec!["Arpeggio of Blue Steel".into()], None)),
+        };
+        let (query, _) = first_fit(&fma, &queries, failing).unwrap();
+        assert_eq!(query, "Fullmetal Alchemist");
+        // a single hit shows no title to check, so it stands
+        let single = |_: &str| Ok((vec!["?".into()], Some(vec!["1".into()])));
+        assert_eq!(first_fit(&fma, &queries, single).unwrap().0, queries[0]);
+        let none = |_: &str| Err("No results found!".to_string());
         assert_eq!(
-            pick(
-                "Kimi no Na wa.",
-                "Your Name.",
-                &["Weathering With You", "Suzume"]
-            ),
-            0
+            first_fit(&fma, &queries, none).unwrap_err(),
+            "No results found!"
         );
+        assert!(first_fit(&fma, &[], none).is_err());
     }
 
     #[test]
     fn falls_back_to_ani_cli_only_when_anilist_fails() {
-        let unused = |_: &str| -> Result<(Vec<String>, Option<Vec<String>>), String> {
+        let unused = |_: &str| -> Result<Hits, String> {
             panic!("ani-cli searched although AniList answered")
         };
         let list = vec![Media::default()];

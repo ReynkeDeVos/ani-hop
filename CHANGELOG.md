@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.13 – 2026-10-26
+
+### Fixed
+
+- A show whose Japanese title finds only other shows at ani-cli got one of those: Fullmetal Alchemist and Fullmetal Alchemist: Brotherhood (Hagane no Renkinjutsushi) got Arpeggio of Blue Steel and its single episode, Neon Genesis Evangelion got Sonic Soldier Borgman 2. When none of a search's results has the show's title, ani-hop now searches its English title too and takes the result that has it. A show picked this way before gets its source again the next time it's opened.
+
 ## 0.6.12 – 2026-10-26
 
 ### Added
