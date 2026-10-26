@@ -651,6 +651,36 @@ fn index_path() -> PathBuf {
     std::env::temp_dir().join("ani-hop-test-index.json")
 }
 
+/// One lock file per download folder ever downloaded into; they stay, as one deleted
+/// could let a download and a removal both think they hold it.
+#[cfg(not(test))]
+fn holds_dir() -> PathBuf {
+    cache_dir().join("folders")
+}
+
+#[cfg(test)]
+fn holds_dir() -> PathBuf {
+    std::env::temp_dir().join("ani-hop-test-folders")
+}
+
+/// A download folder held by a download into it, from making the folder until the download
+/// is done: it isn't dropped meanwhile, also while still empty. Several may hold one.
+pub struct Hold(#[allow(dead_code)] fs::File);
+
+fn hold_file(dir: &Path) -> std::io::Result<fs::File> {
+    let hash = (dir.as_os_str().as_encoded_bytes().iter())
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ *b as u64).wrapping_mul(0x100_0000_01b3)
+        });
+    fs::create_dir_all(holds_dir())?;
+    fs::File::create(holds_dir().join(format!("{hash:016x}.lock")))
+}
+
+/// Whether nothing holds `dir`, while the result is kept: removing it is safe then.
+fn unheld(dir: &Path) -> Option<fs::File> {
+    hold_file(dir).ok().filter(|f| f.try_lock().is_ok())
+}
+
 fn index() -> Index {
     read_json(&index_path())
 }
@@ -813,11 +843,13 @@ pub fn delete_show(dir: &Path) -> std::io::Result<()> {
     for p in show_files(dir) {
         fs::remove_file(&p)?;
     }
+    // a download into it keeps it, and its place in the index
     edit_index(|all| {
-        all.remove(dir);
-    })?;
-    let _ = fs::remove_dir(dir); // fails while something of the user's is left in it
-    Ok(())
+        if let Some(_alone) = unheld(dir) {
+            all.remove(dir);
+            let _ = fs::remove_dir(dir); // fails while something of the user's is left in it
+        }
+    })
 }
 
 /// What deleting a show folder deletes: its episodes, subtitles and unfinished parts, by
@@ -838,24 +870,19 @@ pub fn show_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
-/// Drops a show folder of ours once nothing is left in it.
+/// Drops a show folder of ours once nothing is left in it and no download holds it (one
+/// starting may not have written anything yet).
 pub fn drop_if_empty(dir: &Path) -> std::io::Result<()> {
-    if ours(dir) && fs::read_dir(dir)?.next().is_none() {
-        fs::remove_dir(dir)?;
-        edit_index(|all| {
+    edit_index(|all| {
+        let empty = fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none());
+        if all.contains_key(dir)
+            && empty
+            && let Some(_alone) = unheld(dir)
+            && fs::remove_dir(dir).is_ok()
+        {
             all.remove(dir);
-        })?;
-    }
-    Ok(())
-}
-
-/// Deletes what unfinished downloads of `eps` left in a show folder (yt-dlp's .part
-/// files, subtitles), and the folder if that was all it held.
-pub fn discard(dir: &Path, eps: &[String]) {
-    if ours(dir) {
-        discard_parts(dir, eps);
-        let _ = drop_if_empty(dir);
-    }
+        }
+    })
 }
 
 pub fn discard_parts(dir: &Path, eps: &[String]) {
@@ -910,23 +937,28 @@ fn replaces(m: &Media, saved: &Media) -> bool {
 /// knows the show (one found through ani-cli never replaces one AniList knows). All under
 /// the index's lock: two ani-hops starting on two shows with one name at once take a
 /// folder each.
-pub fn prepare(m: &Media) -> Result<PathBuf, String> {
+/// The folder comes held, see `Hold`.
+pub fn prepare(m: &Media) -> Result<(PathBuf, Hold), String> {
     prepare_in(&download_root(), m)
 }
 
-pub fn prepare_in(root: &Path, m: &Media) -> Result<PathBuf, String> {
+pub fn prepare_in(root: &Path, m: &Media) -> Result<(PathBuf, Hold), String> {
     let mut made = Err("no download folder".to_string());
     edit_index(|all| {
         let dir = folder_in(root, all.clone(), m);
-        made = fs::create_dir_all(&dir)
-            .map_err(|e| e.to_string())
-            .map(|()| {
-                let d = all.entry(dir.clone()).or_default();
-                if replaces(m, &d.media) {
-                    d.media = m.clone();
-                }
-                dir
-            });
+        // held before the index lock goes, so no removal finds it empty and unheld
+        let held = fs::create_dir_all(&dir).and_then(|()| {
+            let f = hold_file(&dir)?;
+            f.lock_shared()?;
+            Ok(Hold(f))
+        });
+        made = held.map_err(|e| e.to_string()).map(|hold| {
+            let d = all.entry(dir.clone()).or_default();
+            if replaces(m, &d.media) {
+                d.media = m.clone();
+            }
+            (dir, hold)
+        });
     })
     .map_err(|e| e.to_string())?;
     made
@@ -1161,6 +1193,51 @@ mod tests {
     }
 
     #[test]
+    fn a_held_folder_stays_while_empty() {
+        let root = std::env::temp_dir().join(format!("ani-hop-held-{}", std::process::id()));
+        let mut m = Media {
+            id: 31_337,
+            ..Default::default()
+        };
+        m.title.romaji = Some("Held".into());
+        let (dir, hold) = prepare_in(&root, &m).unwrap();
+        // a download that hasn't written anything yet
+        drop_if_empty(&dir).unwrap();
+        assert!(dir.is_dir() && ours(&dir), "kept while held");
+        delete_show(&dir).unwrap();
+        assert!(dir.is_dir() && ours(&dir));
+        drop(hold);
+        drop_if_empty(&dir).unwrap();
+        assert!(!dir.exists() && !ours(&dir), "dropped once let go");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn remakes_started_at_once_take_a_folder_each() {
+        let root = std::env::temp_dir().join(format!("ani-hop-remakes-{}", std::process::id()));
+        let starts: Vec<_> = (0..8u64)
+            .map(|i| {
+                let root = root.clone();
+                std::thread::spawn(move || {
+                    let mut m = Media {
+                        id: 40_000 + i,
+                        ..Default::default()
+                    };
+                    m.title.romaji = Some("Remade".into());
+                    prepare_in(&root, &m).unwrap().0
+                })
+            })
+            .collect();
+        let dirs: std::collections::HashSet<PathBuf> =
+            starts.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(dirs.len(), 8);
+        for d in &dirs {
+            edit_index(|all| drop(all.remove(d))).unwrap();
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn ani_cli_shows_never_replace_anilist_downloads() {
         let at = Source::at("q", &["Show".into()], 1, Vec::new());
         let found = Media::from_ani_cli("Show", at);
@@ -1253,6 +1330,14 @@ mod tests {
             .for_each(|f| fs::write(dir.join(f), "").unwrap());
         assert_eq!(half_pieces(&dir, "2"), [dir.join(files[0])]);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// What a stopped download's cleanup does: nothing in a folder that isn't ani-hop's.
+    fn discard(dir: &Path, eps: &[String]) {
+        if ours(dir) {
+            discard_parts(dir, eps);
+            drop_if_empty(dir).unwrap();
+        }
     }
 
     #[test]
