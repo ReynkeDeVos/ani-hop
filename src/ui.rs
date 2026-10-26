@@ -934,7 +934,7 @@ fn media_preview(
     if local > 0 && ep.is_none() {
         lines.push(Line::from(format!("↓ {local} on disk")));
     }
-    if let Some(s) = app.sources.get(&show.id) {
+    if let Some(s) = app.sources.get(show.id) {
         let n = episodes(s.episodes.len());
         // a wrong match keeps its title, so it stands out
         let line = match same_title(&s.title, m) {

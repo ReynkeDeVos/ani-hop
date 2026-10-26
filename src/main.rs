@@ -6,9 +6,9 @@ mod downloads;
 mod kitty;
 mod menu;
 mod progress;
+mod source;
 mod ui;
 
-use ani::Source;
 use anilist::{Client, Entry, EpInfo, Media, PER_PAGE};
 use downloads::{AniCli, Job, Queue};
 use menu::{Act, Item, Menu};
@@ -19,8 +19,9 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::Size;
+use source::{Lookup, Source, Sources};
+use std::collections::HashMap;
 use std::collections::hash_map::Entry::Vacant;
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -139,7 +140,8 @@ enum Msg {
     /// sequels of a show, looked up for its episode counts (App::parts_key), login and
     /// LIST_CHANGES
     Parts(u64, (u32, u32), Option<String>, u64, Result<Parts, String>),
-    Resolved(Media, Result<Source, String>),
+    /// a lookup's answer, with its ticket (Sources::ask)
+    Resolved(Media, u64, Result<Source, String>),
     Saved(Media, Result<Option<Entry>, String>),
     /// progress not saved, as AniList's entry moved since the question was asked: (the
     /// entry's media, the entry now)
@@ -238,9 +240,7 @@ pub struct App {
     parts: HashMap<u64, ((u32, u32), Parts)>,
     /// poster size in cells, set by the last layout
     pub poster: Size,
-    pub sources: HashMap<u64, Source>,
-    /// sources re-resolved this session (the rest come from the disk cache)
-    fresh: HashSet<u64>,
+    pub sources: Sources,
     /// downloaded episodes per show, rescanned on refresh
     pub local: HashMap<u64, Vec<(String, PathBuf)>>,
     /// episodes per show other running ani-hops have queued, rescanned on refresh
@@ -542,8 +542,7 @@ impl App {
             ep_info: HashMap::new(),
             parts: HashMap::new(),
             poster: Size::new(0, 0),
-            sources: ani::load_resolved(),
-            fresh: HashSet::new(),
+            sources: Sources::load(),
             local: HashMap::new(),
             elsewhere: HashMap::new(),
             resolving: HashMap::new(),
@@ -670,7 +669,7 @@ impl App {
     /// deletes what it got of it.
     fn stop(&mut self, m: &Media, eps: &[String]) {
         let on_disk = self.local.get(&m.id).cloned().unwrap_or_default();
-        let src = self.sources.get(&m.id);
+        let src = self.sources.get(m.id);
         if let Err(e) = self.downloads.stop(m, eps, src, &on_disk) {
             self.toast(e, true);
         }
@@ -730,10 +729,7 @@ impl App {
         }
         // the question may be older than the states it was about
         if action == "download" && !get.is_empty() {
-            // a cached source gets re-checked by the worker anyway, a fresh one is ready
-            let source = (self.fresh.contains(&m.id))
-                .then(|| self.sources.get(&m.id).cloned())
-                .flatten();
+            let lookup = self.sources.lookup(m.id);
             // paused with something held, not just a pause left over from an emptied queue
             let s = self.downloads.snapshot();
             let going = match s.paused && s.pending > 0 {
@@ -742,7 +738,7 @@ impl App {
             };
             let queued = format!("Queued {}{going}", which(&get));
             let mut job = Job::new(m, Some(get));
-            job.source = source;
+            job.lookup = lookup;
             if self.download(job) {
                 self.toast(queued, false);
             }
@@ -893,7 +889,7 @@ impl App {
     /// Where `m`'s episodes stand, as of the last rescan and the queue now.
     fn downloads(&self, m: &Media) -> Downloads {
         let on_disk = self.local.get(&m.id).cloned().unwrap_or_default();
-        let queued = (self.downloads).queued(m, self.sources.get(&m.id), &on_disk);
+        let queued = (self.downloads).queued(m, self.sources.get(m.id), &on_disk);
         let elsewhere = self.elsewhere.get(&m.id).cloned().unwrap_or_default();
         Downloads {
             on_disk,
@@ -988,7 +984,7 @@ impl App {
 
     /// The provider's last whole episode and AniList's count, when the provider has more.
     fn parts_key(&self, m: &Media) -> Option<(u32, u32)> {
-        let src = self.sources.get(&m.id)?;
+        let src = self.sources.get(m.id)?;
         let last = src.episodes.iter().filter_map(|e| e.parse().ok()).max()?;
         m.episodes.filter(|own| last > *own).map(|own| (last, own))
     }
@@ -1151,7 +1147,7 @@ impl App {
             }
             View::Show(m) => {
                 let dl = self.downloads(m);
-                let src = self.sources.get(&m.id);
+                let src = self.sources.get(m.id);
                 let (next, released) = (self.progress(m).next(), self.progress(m).released());
                 let mut v = Vec::new();
                 if released.is_none_or(|r| next <= r) {
@@ -1226,7 +1222,7 @@ impl App {
                 // also what the provider no longer lists, so it can still be played or deleted
                 let mut eps: Vec<String> = self
                     .sources
-                    .get(&m.id)
+                    .get(m.id)
                     .map(|s| s.episodes.clone())
                     .unwrap_or_default();
                 let more = (dl.on_disk.iter().map(|(e, _)| e)).chain(&dl.queued);
@@ -1529,13 +1525,11 @@ impl App {
             }
             View::Sources(m, q, hits) => {
                 let i: usize = key.parse().unwrap();
-                if let Err(e) = ani::save_override(m.id, q, &hits[i]) {
+                let (m, q, hits) = (m.clone(), q.clone(), hits.clone());
+                if let Err(e) = self.sources.choose(m.id, &q, &hits, i) {
                     return self.toast(e.to_string(), true);
                 }
-                let m = m.clone();
-                self.sources.remove(&m.id);
                 self.parts.remove(&m.id);
-                self.fresh.remove(&m.id);
                 self.toast(format!("Source set to {}", hits[i]), false);
                 self.pop(2);
                 self.resolve(&m, None);
@@ -1547,6 +1541,7 @@ impl App {
                     for m in list {
                         let mut job = Job::new(m, None);
                         job.parts = self.parts(&job.media).to_vec();
+                        job.lookup = self.sources.lookup(job.media.id);
                         if !self.download(job) {
                             return;
                         }
@@ -1778,7 +1773,7 @@ impl App {
                 let title = text.clone();
                 self.push_loading(&title, Feed::Whole, None, move || {
                     let found = c.browse("SEARCH_MATCH", Some(&text), 1);
-                    ani::or_ani_cli(found, &text, ani::search)
+                    source::or_ani_cli(found, &text, source::search)
                 });
             }
             Input::ClientId => {
@@ -1817,7 +1812,7 @@ impl App {
             Input::SourceQuery(m) => {
                 let id = self.push("Pick source", View::Sources(m, text.clone(), Vec::new()));
                 self.top().loading = true;
-                self.spawn(move || Msg::Hits(id, ani::search(&text).map(|r| r.0)));
+                self.spawn(move || Msg::Hits(id, source::search(&text).map(|r| r.0)));
             }
         }
     }
@@ -1833,7 +1828,7 @@ impl App {
             "play" => self.resolve(&m, Some(Want::Episodes(EpMode::Play))),
             // what's on disk can be deleted before ani-cli answers, or without it
             "download"
-                if !self.sources.contains_key(&m.id) && !self.downloads(&m).on_disk.is_empty() =>
+                if self.sources.get(m.id).is_none() && !self.downloads(&m).on_disk.is_empty() =>
             {
                 self.resolve(&m, None);
                 self.fulfill(m, Want::Episodes(EpMode::Download));
@@ -1844,8 +1839,8 @@ impl App {
             "source" => {
                 let q = self
                     .sources
-                    .get(&m.id)
-                    .map_or_else(|| ani::default_query(&m), |s| s.query.clone());
+                    .get(m.id)
+                    .map_or_else(|| source::default_query(&m), |s| s.query.clone());
                 self.push("Change source", View::Input(Input::SourceQuery(m)));
                 self.top().menu.paste(&q);
             }
@@ -1863,29 +1858,30 @@ impl App {
     /// background once per session; without one, `want` waits for ani-cli.
     fn resolve(&mut self, m: &Media, want: Option<Want>) {
         let want = match want {
-            Some(w) if self.sources.contains_key(&m.id) => {
+            Some(w) if self.sources.get(m.id).is_some() => {
                 self.fulfill(m.clone(), w);
                 None
             }
             w => w,
         };
-        if self.fresh.contains(&m.id) {
+        if matches!(self.sources.lookup(m.id), Lookup::Ready(_)) {
             return;
         }
         if matches!(want, Some(Want::Episodes(_))) {
             self.toast(format!("Searching ani-cli for {}…", m.name()), false);
         }
-        if let Some(slot) = self.resolving.get_mut(&m.id) {
-            if want.is_some() {
-                *slot = want;
-            }
-            return;
+        let slot = self.resolving.entry(m.id).or_default();
+        if want.is_some() {
+            *slot = want;
         }
-        self.resolving.insert(m.id, want);
+        // none while one runs already
+        let Some(ticket) = self.sources.ask(m.id) else {
+            return;
+        };
         let m = m.clone();
         self.spawn(move || {
-            let res = ani::resolve(&m);
-            Msg::Resolved(m, res)
+            let res = source::resolve(&m);
+            Msg::Resolved(m, ticket, res)
         });
     }
 
@@ -1931,12 +1927,11 @@ impl App {
         let local = ani::local_episodes(&ani::folder(&m))
             .into_iter()
             .find(|(e, _)| *e == ep);
-        let src = self.sources.get(&m.id).cloned();
-        let cached = !self.fresh.contains(&m.id);
-        let step = match (&local, &src) {
+        let lookup = self.sources.lookup(m.id);
+        let step = match (&local, &lookup) {
             (Some(_), _) => "opening the player",
-            (None, None) => SEARCHING,
-            (_, Some(_)) if cached => "checking the source",
+            (None, Lookup::Resolve) => SEARCHING,
+            (_, Lookup::Check(_)) => "checking the source",
             _ => "fetching the stream",
         };
         self.playing = Some(Playing {
@@ -1948,7 +1943,7 @@ impl App {
             since: Instant::now(),
             color: m.cover_image.color.clone(),
         });
-        if local.is_none() && src.is_none() {
+        if local.is_none() && matches!(lookup, Lookup::Resolve) {
             return self.resolve(&m, Some(Want::Play(ep)));
         }
         let (tx, id, e) = (self.tx.clone(), m.id, ep.clone());
@@ -1963,14 +1958,13 @@ impl App {
                 }
                 res => res,
             };
-            let res = match (&local, src) {
+            let res = match (&local, lookup) {
                 (Some((_, file)), _) => ani::play_file(&m, &ep, file, || step(None)),
-                (_, Some(src)) if cached => ani::locate(&m, &src).and_then(|s| {
+                (_, Lookup::Ready(src)) => stream(&src),
+                (_, lookup) => lookup.run(&m).and_then(|s| {
                     step(Some("fetching the stream"));
                     stream(&s)
                 }),
-                (_, Some(src)) => stream(&src),
-                _ => unreachable!(),
             };
             Msg::Played(m, ep, res)
         });
@@ -2202,7 +2196,11 @@ impl App {
                     Err(_) => {}
                 }
             }
-            Msg::Resolved(m, res) => {
+            Msg::Resolved(m, ticket, res) => {
+                // a lookup from before the source was changed by hand
+                if !self.sources.answer(m.id, ticket, &res) {
+                    return;
+                }
                 let want = self.resolving.remove(&m.id).flatten();
                 // the wait is over either way; playing it starts anew below
                 let waited = self
@@ -2210,12 +2208,9 @@ impl App {
                     .take_if(|p| p.id == m.id && p.step == Some(SEARCHING));
                 let here = matches!(&self.top().view, View::Show(s) | View::Episodes(s, _) if s.id == m.id);
                 match res {
-                    Ok(src) => {
-                        self.sources.insert(m.id, src);
+                    Ok(_) => {
                         // before the menu is rebuilt, so it can't offer what went
                         self.want_parts(&m);
-                        self.fresh.insert(m.id);
-                        ani::save_resolved(&self.sources);
                         let open = (self.stack.iter())
                             .any(|s| matches!(&s.view, View::Show(x) if x.id == m.id));
                         match (want, here) {

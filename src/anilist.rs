@@ -39,7 +39,7 @@ pub struct Media {
     pub media_list_entry: Option<Entry>,
     /// where ani-cli listed a show AniList didn't provide (its episodes stay empty)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ani_cli: Option<crate::ani::Source>,
+    pub ani_cli: Option<crate::source::Source>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -106,7 +106,7 @@ impl Media {
     /// A show found through ani-cli alone. The id hashes the search and the entry, not the
     /// shown name, so the same pick has it again next time and a provider's own "X (2)" can't
     /// take a numbered one's (FNV-1a: std's hasher may change between releases).
-    pub fn from_ani_cli(name: &str, at: crate::ani::Source) -> Media {
+    pub fn from_ani_cli(name: &str, at: crate::source::Source) -> Media {
         let key = format!("{}\n{}\n{}", at.query, at.title, at.nth);
         let hash = (key.bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
             (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
@@ -579,7 +579,7 @@ mod tests {
 
     #[test]
     fn ani_cli_shows_keep_their_id_and_stay_off_anilist() {
-        let at = |query: &str| crate::ani::Source {
+        let at = |query: &str| crate::source::Source {
             query: query.into(),
             index: 2,
             title: "Hunter x Hunter".into(),

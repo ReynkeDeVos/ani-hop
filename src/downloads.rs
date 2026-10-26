@@ -6,9 +6,10 @@
 //! Everything shares one lock, so a stop or a pause can't slip between the worker checking
 //! an episode is still wanted and starting it.
 
-use crate::ani::{self, Source};
+use crate::ani;
 use crate::anilist::Media;
 use crate::progress::{Parts, Progress};
+use crate::source::{Lookup, Source};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -28,9 +29,9 @@ pub struct Job {
     #[serde(skip)]
     id: u64,
     pub media: Media,
-    /// where the provider has it; looked up by the worker when None
+    /// how the worker gets a source that works now
     #[serde(skip)]
-    pub source: Option<Source>,
+    pub lookup: Lookup,
     /// None = every episode that isn't watched
     pub eps: Option<Vec<String>>,
     /// audio when queued: yt-dlp resumes a half-done episode in whatever audio it gets
@@ -47,7 +48,7 @@ impl Job {
         Job {
             id: 0,
             media,
-            source: None,
+            lookup: Lookup::Resolve,
             eps,
             dub: None,
             parts: Vec::new(),
@@ -101,8 +102,8 @@ pub struct Snapshot {
 pub trait Fetch: Send + Sync + 'static {
     /// The show's download folder.
     fn folder(&self, m: &Media) -> PathBuf;
-    /// Where the provider has the show; `cached` is what was known when it was queued.
-    fn resolve(&self, m: &Media, cached: Option<Source>) -> Result<Source, String>;
+    /// Where the provider has the show now.
+    fn resolve(&self, m: &Media, lookup: Lookup) -> Result<Source, String>;
     /// Starts downloading episode `ep` into `dir`, with its progress on stdout.
     fn start(&self, src: &Source, ep: &str, dub: bool, dir: &Path) -> Result<Child, String>;
 }
@@ -115,8 +116,8 @@ impl Fetch for AniCli {
         ani::folder(m)
     }
 
-    fn resolve(&self, m: &Media, cached: Option<Source>) -> Result<Source, String> {
-        cached.map_or_else(|| ani::resolve(m), Ok)
+    fn resolve(&self, m: &Media, lookup: Lookup) -> Result<Source, String> {
+        lookup.run(m)
     }
 
     fn start(&self, src: &Source, ep: &str, dub: bool, dir: &Path) -> Result<Child, String> {
@@ -434,7 +435,7 @@ impl Queue {
     /// stopped ones are skipped. Returns at a pause, false once quitting stopped the downloads.
     fn work(&self, job: Job, done: &impl Fn(String, Result<(), String>)) -> bool {
         let m = &job.media;
-        let src = match self.0.fetch.resolve(m, job.source.clone()) {
+        let src = match self.0.fetch.resolve(m, job.lookup.clone()) {
             Ok(s) => s,
             Err(e) => {
                 let mut st = self.lock();
@@ -453,7 +454,7 @@ impl Queue {
             let mut st = self.lock();
             if let Some(j) = st.jobs.iter_mut().find(|j| j.id == job.id) {
                 // after a pause it goes on from here, without looking the show up again
-                j.source.get_or_insert_with(|| src.clone());
+                j.lookup = Lookup::Ready(src.clone());
                 // stopping one of them may have listed them already
                 if let Some(all) = all {
                     j.eps.get_or_insert(all);
@@ -629,8 +630,11 @@ mod tests {
         fn folder(&self, m: &Media) -> PathBuf {
             self.root.join(m.name())
         }
-        fn resolve(&self, _: &Media, cached: Option<Source>) -> Result<Source, String> {
-            Ok(cached.unwrap_or_else(source))
+        fn resolve(&self, _: &Media, lookup: Lookup) -> Result<Source, String> {
+            match lookup {
+                Lookup::Ready(s) | Lookup::Check(s) => Ok(s),
+                Lookup::Resolve => Ok(source()),
+            }
         }
         fn start(&self, _: &Source, ep: &str, _: bool, dir: &Path) -> Result<Child, String> {
             let out = dir.join(format!("Show Episode {ep}.mp4"));
@@ -680,7 +684,7 @@ mod tests {
     fn job(eps: &[&str]) -> Job {
         let mut j = Job::new(show(), Some(eps.iter().map(|e| e.to_string()).collect()));
         j.dub = Some(false);
-        j.source = Some(source());
+        j.lookup = Lookup::Ready(source());
         j
     }
 
