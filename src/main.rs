@@ -88,8 +88,8 @@ pub enum Input {
 pub enum Pending {
     Delete(Vec<PathBuf>),
     /// marking an episode watched: the AniList entry that saves it (a sequel's, when the
-    /// provider runs on into it), the progress there, and whether it's a sequel
-    Progress(Media, u32, bool),
+    /// provider runs on into it), the progress there, and what to call it if it's a sequel
+    Progress(Media, u32, String),
     Quit,
     /// queued or downloading episodes to take out of the queue
     Stop(Media, Vec<String>),
@@ -1604,15 +1604,20 @@ impl App {
                 Item::new("no", "No", "deletes partial files"),
                 Item::new("yes", "Yes", ""),
             ],
-            View::Confirm(Pending::Progress(m, ep, sequel)) => {
-                // marking it watched can also put the show (or the sequel it's in) on another list
+            View::Confirm(Pending::Progress(m, ep, part)) => {
+                // what it saves, as that can be the entry's last (the second half of a
+                // special) or a sequel's, and the list it puts the entry on
+                let total = m.episodes.map_or("?".into(), |t| t.to_string());
+                let mut hint = format!("saves {ep}/{total}");
+                if !part.is_empty() {
+                    hint += &format!(" to {part}");
+                }
                 let to = progress_status(m, *ep);
-                let it = if *sequel { m.name() } else { "it" };
-                let hint = match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
-                    Some(s) if s == to => String::new(),
-                    Some(_) => format!("moves {it} to {}", list_label(to)),
-                    None => format!("adds {it} to {}", list_label(to)),
-                };
+                match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
+                    Some(s) if s == to => {}
+                    Some(_) => hint += &format!(" · moves it to {}", list_label(to)),
+                    None => hint += &format!(" · adds it to {}", list_label(to)),
+                }
                 vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
             }
             View::Confirm(Pending::Stop(m, eps)) => {
@@ -2516,7 +2521,13 @@ impl App {
                 // saves is settled now, as a lookup ending meanwhile could change it
                 let ask = (self.progress_target(&m, &ep))
                     .filter(|(p, n)| !m.watched(&ep) && *n > p.progress() as f64)
-                    .map(|(p, n)| Pending::Progress(p.clone(), n as u32, p.id != m.id));
+                    .map(|(p, n)| {
+                        let part = match p.id == m.id {
+                            true => String::new(),
+                            false => part_name(m.name(), p.name()).to_string(),
+                        };
+                        Pending::Progress(p.clone(), n as u32, part)
+                    });
                 match res {
                     Err(e) => self.toast(format!("Couldn't play episode {ep} · {e}"), true),
                     Ok(()) if self.user.is_some() && m.on_anilist() => {

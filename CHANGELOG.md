@@ -5,6 +5,7 @@
 ### Changed
 
 - In a season AniList splits in two, like Attack on Titan Season 3, the preview's "Episodes 13–22 are … Part 2" stays a plain line, and the second part's list status gets its own line under it, shown on that part's episodes and on the show's page. The first part's status stays on every episode. In the episode lists, a faint line saying "Part 2" sits between episodes 12 and 13.
+- The question after an episode says what Yes saves, like "saves 3/12", "saves 12/12 · moves it to Completed" or "saves 1/10 to Part 2 · adds it to Watching".
 
 ### Fixed
 
