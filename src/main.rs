@@ -154,10 +154,12 @@ enum Msg {
     Parts(u64, (u32, u32), Option<String>, u64, Result<Parts, String>),
     Resolved(Media, Result<Source, String>),
     Saved(Media, Result<Option<Entry>, String>),
+    /// progress not saved, as AniList's entry moved since the question was asked: (the
+    /// entry's media, the entry now)
+    Moved(Media, Option<Entry>),
     /// (media, episode, what it waits on now; None = the player is up)
     PlayStep(u64, String, Option<&'static str>),
-    /// (media, episode, result, LIST_CHANGES when it started)
-    Played(Media, String, Result<(), String>, u64),
+    Played(Media, String, Result<(), String>),
     DlProgress(DlNow),
     DlDone(String, Result<(), String>),
     /// (version, update command) of a newer ani-hop
@@ -1935,9 +1937,15 @@ impl App {
                         let (m, ep, c) = (m.clone(), *ep, self.client.clone());
                         let status = progress_status(&m, ep);
                         self.saves_pending += 1;
-                        self.spawn(move || {
-                            Msg::Saved(m.clone(), c.save(m.id, Some(status), Some(ep)).map(Some))
-                        });
+                        // the question showed `m`'s progress; Yes mustn't undo a save it didn't
+                        // know of (an old copy: a cached list, the episode's start, a late lookup)
+                        self.spawn(
+                            move || match c.save_progress(m.id, status, m.progress(), ep) {
+                                Ok(Ok(entry)) => Msg::Saved(m, Ok(Some(entry))),
+                                Ok(Err(now)) => Msg::Moved(m, now),
+                                Err(e) => Msg::Saved(m, Err(e)),
+                            },
+                        );
                         self.pop(1);
                     }
                 }
@@ -2161,17 +2169,6 @@ impl App {
     /// Asks before saving the AniList progress up to `ep`. AniList keeps a count, not single
     /// episodes, so Yes is preselected only when that changes no other episode.
     fn ask_progress(&mut self, m: &Media, ep: &str, title: String) {
-        // one question at a time and none while a save runs: a save landing under an open one
-        // would leave its hint and Yes stale, and only a question's Yes or List status save
-        let open =
-            (self.stack.iter()).any(|s| matches!(s.view, View::Confirm(Pending::Progress(..))));
-        if self.saves_pending > 0 || open {
-            let why = match open {
-                true => "another one is open",
-                false => "still saving to AniList",
-            };
-            return self.toast(format!("Episode {ep} not asked: {why}"), false);
-        }
         let Some((p, n)) = self.progress_target(m, ep) else {
             return self.toast(
                 format!("Episode {ep} isn't a number AniList can count"),
@@ -2239,7 +2236,6 @@ impl App {
         let (tx, id, e) = (self.tx.clone(), m.id, ep.clone());
         let step = move |s| _ = tx.send(Msg::PlayStep(id, e.clone(), s));
         let audio = ani::audio(Some(m.id));
-        let changes = LIST_CHANGES.load(Ordering::Relaxed);
         self.spawn(move || {
             let stream = |s: &Source| match ani::stream(s, &ep, audio, || step(None)) {
                 // dubs come later or not at all, the subtitled one is the next best
@@ -2258,7 +2254,7 @@ impl App {
                 (_, Some(src)) => stream(&src),
                 _ => unreachable!(),
             };
-            Msg::Played(m, ep, res, changes)
+            Msg::Played(m, ep, res)
         });
     }
 
@@ -2548,6 +2544,17 @@ impl App {
                     Err(e) => self.toast(format!("{} not saved · {e}", m.name()), true),
                 }
             }
+            Msg::Moved(m, entry) => {
+                self.saves_pending -= 1;
+                let total = m.episodes.map_or("?".into(), |t| t.to_string());
+                let now = entry.as_ref().map_or(0, |e| e.progress);
+                let why = format!("AniList has {now}/{total} now, ask again");
+                self.toast(format!("{} not saved · {why}", m.name()), true);
+                // what's on screen was old: AniList's entry, and lists that refresh
+                self.update_media(m.id, entry);
+                self.outdate_lists();
+                self.refresh();
+            }
             Msg::PlayStep(id, ep, step) => {
                 if let Some(p) = &mut self.playing
                     && p.id == id
@@ -2556,7 +2563,7 @@ impl App {
                     p.step = step;
                 }
             }
-            Msg::Played(m, ep, res, changes) => {
+            Msg::Played(m, ep, res) => {
                 if self
                     .playing
                     .as_ref()
@@ -2570,11 +2577,6 @@ impl App {
                 match res {
                     Err(e) => self.toast(format!("Couldn't play episode {ep} · {e}"), true),
                     Ok(()) if ask && self.user.is_some() && m.on_anilist() => {
-                        // a save while it played ("Watched up to…") leaves `m`'s progress behind
-                        if LIST_CHANGES.load(Ordering::Relaxed) != changes {
-                            let why = "your list changed while it played";
-                            return self.toast(format!("Episode {ep} not asked: {why}"), false);
-                        }
                         let title = format!("Mark episode {ep} of {} as watched?", m.name());
                         self.ask_progress(&m, &ep, title);
                     }

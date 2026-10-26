@@ -372,9 +372,38 @@ impl Client {
         status: Option<&str>,
         progress: Option<u32>,
     ) -> Result<Entry, String> {
+        let _turn = SAVES.lock().unwrap_or_else(|e| e.into_inner());
+        self.write(media, status, progress)
+    }
+
+    /// Saves progress `to` unless AniList's progress isn't `was` anymore, what the question
+    /// showed; then nothing, and the entry as it is now. Other saves wait, so none slips between.
+    pub fn save_progress(
+        &self,
+        media: u64,
+        status: &str,
+        was: u32,
+        to: u32,
+    ) -> Result<Result<Entry, Option<Entry>>, String> {
+        let _turn = SAVES.lock().unwrap_or_else(|e| e.into_inner());
+        let q = "query($id: Int) { Media(id: $id) { mediaListEntry { id status progress } } }";
+        let mut d = self.gql(q, json!({ "id": media }))?;
+        let now: Option<Entry> = serde_json::from_value(d["Media"]["mediaListEntry"].take())
+            .map_err(|e| e.to_string())?;
+        match now.as_ref().map_or(0, |e| e.progress) == was {
+            true => self.write(media, Some(status), Some(to)).map(Ok),
+            false => Ok(Err(now)),
+        }
+    }
+
+    fn write(
+        &self,
+        media: u64,
+        status: Option<&str>,
+        progress: Option<u32>,
+    ) -> Result<Entry, String> {
         let q = "mutation($id: Int, $status: MediaListStatus, $progress: Int) {
                    SaveMediaListEntry(mediaId: $id, status: $status, progress: $progress) { id status progress } }";
-        let _turn = SAVES.lock().unwrap_or_else(|e| e.into_inner());
         // AniList rejects explicit nulls here, so only send what is set
         let mut vars = json!({ "id": media });
         if let Some(s) = status {
