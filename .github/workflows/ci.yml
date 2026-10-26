@@ -34,3 +34,17 @@ jobs:
       - run: cargo about generate --frozen --fail about.hbs -o THIRD-PARTY-LICENSES.md
       - name: Check it's up to date
         run: git diff --exit-code THIRD-PARTY-LICENSES.md || { echo "Run the command from about.toml and commit THIRD-PARTY-LICENSES.md"; exit 1; }
+
+  # The flake builds ani-hop and runs its tests in Nix's sandbox, against nixpkgs' tools.
+  nix:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@v31
+      - run: nix build -L
+      - run: ./result/bin/ani-hop --version

@@ -9,6 +9,7 @@ Researched on 2026-10-21 and updated the same day with the maintainer's decision
 | **Debian/Ubuntu, Fedora, Arch** | **Install script** (section 4) | It installs mpv, ffmpeg, curl, patch and xdg-utils from the distro, plus yt-dlp where the distro's is current. ani-cli and ani-skip come from the distro where it has an ani-cli of at least 5.1 (today only the AUR, through yay or paru), else from upstream into `~/.local/bin`, where `ani-cli -U` keeps it fresh without sudo. The ani-hop binary goes there too. Running the script again updates them. |
 | **Arch** | **AUR `ani-hop-bin`** | The AUR has a current ani-cli ([5.1-1](https://aur.archlinux.org/packages/ani-cli)), yay/paru [resolve AUR dependencies](https://wiki.archlinux.org/title/AUR_helpers), and `yay -Syu` updates everything. The install script hands over to it when yay or paru is installed and the package exists. |
 | **macOS, and Linux with Homebrew** | **Formula in your own tap** | It pulls in mpv, yt-dlp and ffmpeg, and `brew upgrade` keeps them current. ani-cli comes from the upstream tap, whose formula has no macOS-only parts ([formula](https://github.com/pystardust/ani-cli/blob/master/Formula/ani-cli.rb)). mpv, ffmpeg and yt-dlp have x86_64 and arm64 Linux bottles ([mpv](https://formulae.brew.sh/api/formula/mpv.json), [ffmpeg](https://formulae.brew.sh/api/formula/ffmpeg.json), [yt-dlp](https://formulae.brew.sh/api/formula/yt-dlp.json)). No DMG: it installs nothing else and needs a [$99/year Developer ID](https://developer.apple.com/programs/). |
+| **NixOS, and Nix on Linux and macOS** | **Flake in this repo** (since 0.6.12) | It brings nixpkgs' ani-cli, ani-skip, mpv, yt-dlp and ffmpeg, follows nixos-unstable (the only branch with ani-cli 5.1), and needs nothing per release: the version comes from Cargo.toml and the crates from Cargo.lock. |
 | **Windows** | **WSL guide only** | No native build, no MSI, EXE, winget or Scoop. WSL needs no code, gets the Linux channels and their updates, and is the only way to get posters on Windows (section 4). |
 | **Own auto-updater** | **No** | ani-cli is the only dependency that has to stay fresh. Every channel above either updates it with the rest (AUR, Homebrew) or puts the upstream script where `ani-cli -U` works (install script, WSL). ani-hop should only show the right update command (section 5). |
 | **Licence** | **GPL-3.0-or-later** (added on this branch) | ani-cli is GPL-3.0 too ([formula](https://github.com/pystardust/ani-cli/blob/master/Formula/ani-cli.rb)). Homebrew core accepts any licence compatible with the Debian Free Software Guidelines ([Licence Guidelines](https://docs.brew.sh/Licence-Guidelines)), and your own tap has no rule. It has to be v3, not v2, because `ring` (used by rustls) is Apache-2.0, which [works with GPLv3 but not GPLv2](https://www.gnu.org/licenses/license-list.html#apache2). The other dependencies are MIT, Apache, BSD, ISC, Zlib, Unicode-3.0, MPL-2.0 (nucleo-matcher, not marked "Incompatible With Secondary Licenses") and CDLA-Permissive-2.0 (webpki-roots). |
@@ -66,7 +67,7 @@ Takeaway:
 | **Install script** | yes: distro packages, upstream ani-cli | distro update + `ani-cli -U`, or rerun | rerun | M once (about 150 lines of sh), then none | yes |
 | **AUR `ani-hop-bin`** | yes, ani-cli included | `yay -Syu` | same | low: CI pushes it | yes |
 | **Homebrew on Linux** (same tap) | yes, ani-cli from the upstream tap | `brew upgrade` | same | none beyond the formula | yes; [glibc 2.39 for Tier 1](https://docs.brew.sh/Support-Tiers) |
-| Nix flake | yes, if it follows nixos-unstable | channel update | same | low | yes, later |
+| **Nix flake** (since 0.6.12) | yes, from nixos-unstable | `nix profile upgrade` or `nix flake update` | same | none per release | yes |
 | deb / rpm / PPA / COPR | ani-cli **stale or missing** | distro pace | yes | medium | yes, but the script covers these distros |
 | Flatpak | — | — | — | — | no: [console apps and host-dependent apps are rejected](https://docs.flathub.org/docs/for-app-authors/requirements) |
 | Snap | would bundle mpv and ani-cli | you | yes | high | no: [classic confinement is not granted for host-only deps](https://snapcraft.io/docs/reference/administration/reviewing-classic-confinement-snaps/) |
@@ -104,6 +105,14 @@ Details:
 - **Updating:** run the same line again. It fetches the newest ani-hop and fresh copies of whatever came from upstream: ani-cli, ani-skip and yt-dlp. System packages update with the distro.
 - **Needs:** curl, tar, sha256sum and uname, which is everything that `curl | sh` already implies on these distros.
 - **Testing:** a CI job runs it in `debian:13`, `ubuntu:24.04`, `fedora:44` and `archlinux` containers, as a normal user with sudo, and checks `ani-hop --version` and `ani-cli -V`. Ubuntu 24.04 is in the list because it is still supported and its mpv is 0.37 ([Launchpad](https://launchpad.net/ubuntu/noble/+source/mpv)), which ani-hop hasn't been tried with.
+
+#### The Nix flake
+
+- **Package:** `flake.nix` builds ani-hop with `rustPlatform.buildRustPackage` from `Cargo.lock`, runs the tests in the build sandbox, and wraps the binary so its PATH has ani-cli, ani-skip, yt-dlp, ffmpeg, curl, curl-impersonate, grep, sed and pkill first, and mpv and xdg-open last. Last, so the user's own mpv (one with scripts, say) wins, as in nixpkgs' ani-cli. Only the user's ani-hop sees these; nothing else lands on their PATH.
+- **ani-cli without nixpkgs' wrapper:** nixpkgs' ani-cli [prefixes its ffmpeg and yt-dlp to PATH](https://github.com/NixOS/nixpkgs/blob/master/pkgs/by-name/an/ani-cli/package.nix), ahead of the `ffmpeg` ani-hop puts first on ani-cli's PATH for shows whose audio is a separate track (`FAKE_FFMPEG` in [`src/ani.rs`](../src/ani.rs)). The flake takes the same ani-cli script without that wrapper and puts ani-cli's tools on ani-hop's PATH instead.
+- **ani-cli's version** is nixpkgs': 5.1 on nixos-unstable, 5.0 on nixos-26.05 ([26.05](https://github.com/NixOS/nixpkgs/blob/nixos-26.05/pkgs/by-name/an/ani-cli/package.nix)). `nix profile` and `nix run` use the nixpkgs in `flake.lock`, so refresh it with `nix flake update` when ani-cli has a release that matters. A system flake that sets `inputs.nixpkgs.follows` uses its own nixpkgs, which is why the README says to leave that out on 26.05.
+- **Platforms:** x86_64 and aarch64 Linux and Apple-silicon macOS, as the release archives. CI builds it on Linux and macOS.
+- **nixpkgs:** a package there would need the same unwrapped ani-cli, and would follow nixos-unstable's updates by itself. Not submitted.
 
 #### Homebrew on Linux
 
@@ -207,6 +216,7 @@ Both are built (`ani::old_ani_cli`, `ani::ani_cli_update`, `ani::update_command`
 2. **New ani-hop release.** At most once a day, request `https://github.com/ReynkeDeVos/ani-hop/releases/latest` without following the redirect. The `Location` header names the newest tag, and this needs no API call or rate limit ([GitHub](https://docs.github.com/en/repositories/releasing-projects-on-github/linking-to-releases)). If the tag is newer than `CARGO_PKG_VERSION`, show one line with the command for the install channel, judged by where the running binary lives:
    - `~/.local/bin`: the `install.sh` line
    - under `brew --prefix`: `brew upgrade`
+   - under `/nix/store`: `nix profile upgrade ani-hop` when a `nix profile` holds it (the name comes from the profile's `manifest.json`), else `nix flake update ani-hop, then rebuild` when the system or Home Manager has it on PATH, else (`nix run`) `nix run --refresh github:ReynkeDeVos/ani-hop`
    - `/usr/bin`: `yay -Syu`, or `omarchy update` on Omarchy
    - otherwise: `cargo install --locked --force --git …`
 3. Not worth doing: running updates for the user, and checking yt-dlp, which [warns by itself after 90 days](https://github.com/yt-dlp/yt-dlp#update).

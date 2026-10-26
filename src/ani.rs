@@ -347,11 +347,47 @@ pub fn update_command() -> String {
         INSTALL_SH.into()
     } else if from_brew(&exe) {
         "brew upgrade ani-hop".into()
+    } else if exe.starts_with("/nix/store") {
+        nix_update(&exe)
     } else if exe.starts_with("/usr") {
         system_update()
     } else {
         "cargo install --locked --force --git https://github.com/ReynkeDeVos/ani-hop".into()
     }
+}
+
+/// From the flake: `nix profile upgrade` when it was added to a profile, the flake input the
+/// README's NixOS lines name when the system or Home Manager has it, else `nix run`.
+fn nix_update(exe: &Path) -> String {
+    // /nix/store/<hash>-ani-hop-<version>, as the profile's manifest lists it
+    let pkg: PathBuf = exe.components().take(4).collect();
+    // nix run starts it without putting it on PATH
+    if !located("ani-hop").is_some_and(|p| p.starts_with(&pkg)) {
+        return "nix run --refresh github:ReynkeDeVos/ani-hop".into();
+    }
+    let profiles = [
+        home().join(".nix-profile"),
+        xdg("XDG_STATE_HOME", ".local/state").join("nix/profile"),
+    ];
+    profiles
+        .iter()
+        .find_map(|p| profile_element(&fs::read_to_string(p.join("manifest.json")).ok()?, &pkg))
+        .map_or_else(
+            || "nix flake update ani-hop, then rebuild".into(),
+            |name| format!("nix profile upgrade {name}"),
+        )
+}
+
+/// The name of the element that holds `pkg` in a `nix profile` manifest.
+fn profile_element(manifest: &str, pkg: &Path) -> Option<String> {
+    let m: serde_json::Value = serde_json::from_str(manifest).ok()?;
+    m["elements"].as_object()?.iter().find_map(|(name, e)| {
+        let paths = e["storePaths"].as_array()?;
+        paths
+            .iter()
+            .any(|p| p.as_str() == pkg.to_str())
+            .then(|| name.clone())
+    })
 }
 
 /// Our lock in run/, held until we exit (or die): other ani-hops see we're alive by failing
@@ -1527,6 +1563,18 @@ mod tests {
     }
 
     #[test]
+    fn finds_ani_hop_in_a_nix_profile() {
+        // what `nix profile add path:/tmp/somedir` wrote (Nix 2.35)
+        let manifest = r#"{"elements":{"somedir":{"active":true,"attrPath":"packages.x86_64-linux.default","originalUrl":"path:/tmp/somedir","outputs":null,"priority":5,"storePaths":["/nix/store/4q23alnfw6d88bcdcikb60bvjb0plv4j-ani-hop-0.6.12"],"url":"path:/tmp/somedir"}},"version":3}"#;
+        let pkg = Path::new("/nix/store/4q23alnfw6d88bcdcikb60bvjb0plv4j-ani-hop-0.6.12");
+        assert_eq!(profile_element(manifest, pkg).as_deref(), Some("somedir"));
+        let other = Path::new("/nix/store/0000000000000000000000000000000-ani-hop-0.6.11");
+        assert_eq!(profile_element(manifest, other), None);
+        // before Nix 2.20 elements were a list without names
+        assert_eq!(profile_element(r#"{"elements":[],"version":2}"#, pkg), None);
+    }
+
+    #[test]
     fn a_lock_is_held_until_its_file_closes() {
         let path = std::env::temp_dir().join(format!("ani-hop-lock-{}", std::process::id()));
         let file = fs::File::create(&path).unwrap();
@@ -1758,6 +1806,8 @@ mod tests {
     fn fake_ffmpeg_renames_only_finished_downloads() {
         let dir = std::env::temp_dir().join(format!("ani-hop-ffmpeg-{}", std::process::id()));
         let (fake, real) = (dir.join("fake"), dir.join("real"));
+        // what the shim runs besides ffmpeg (pkill, grep, mv); no /usr/bin on NixOS or in Nix builds
+        let sys = std::env::var("PATH").unwrap_or_default();
         // stands in for the real one: logs its arguments, writes its last one, warns $WARN
         // (with $SLOW it keeps going, its pid in $LOG.ffmpeg)
         let logger = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LOG\"\nfor a; do o=$a; done\n: > \"$o\"\n[ -z \"$SLOW\" ] || { echo $$ > \"$LOG.ffmpeg\"; exec sleep 60; }\n[ -z \"$WARN\" ] || echo \"$WARN\" >&2\nexit $CODE\n";
@@ -1776,7 +1826,7 @@ mod tests {
         let part = dir.join("A Episode 1.mp4.part");
         let run = |code: &str, warn: &str, args: &[&str]| {
             let _ = fs::remove_file(&out);
-            let path = format!("{}:{}:/usr/bin:/bin", fake.display(), real.display());
+            let path = format!("{}:{}:{sys}", fake.display(), real.display());
             let o = Command::new(fake.join("ffmpeg"))
                 .args(args)
                 .arg(&out)
@@ -1830,7 +1880,7 @@ mod tests {
             .arg(&out)
             .env(
                 "PATH",
-                format!("{}:{}:/usr/bin:/bin", fake.display(), real.display()),
+                format!("{}:{}:{sys}", fake.display(), real.display()),
             )
             .env("LOG", &log)
             .env("CODE", "0")
@@ -1846,7 +1896,7 @@ mod tests {
             .arg(&out)
             .env(
                 "PATH",
-                format!("{}:{}:/usr/bin:/bin", fake.display(), real.display()),
+                format!("{}:{}:{sys}", fake.display(), real.display()),
             )
             .env("LOG", &log)
             .env("CODE", "0")

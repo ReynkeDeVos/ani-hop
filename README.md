@@ -22,6 +22,24 @@ curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh
 
 Installs ani-hop, ani-cli, mpv and the rest. Run it again to update; ani-hop tells you when there's a new version.
 
+### NixOS, or Nix on Linux and macOS (Apple silicon)
+
+```sh
+nix profile add github:ReynkeDeVos/ani-hop
+```
+
+Brings its own ani-cli, mpv and the rest. Update with `nix profile upgrade ani-hop`; `nix run github:ReynkeDeVos/ani-hop` tries it without installing. Both need flakes switched on.
+
+On NixOS or with Home Manager, add it to your flake instead:
+
+```nix
+inputs.ani-hop.url = "github:ReynkeDeVos/ani-hop";
+# in a module (Home Manager: home.packages)
+environment.systemPackages = [ inputs.ani-hop.packages.${pkgs.stdenv.hostPlatform.system}.default ];
+```
+
+Update with `nix flake update ani-hop` and a rebuild. Leave out `inputs.nixpkgs.follows` unless your nixpkgs is unstable: ani-hop needs ani-cli 5.1, and NixOS 26.05 has 5.0.
+
 ### macOS (Apple silicon)
 
 ```sh
