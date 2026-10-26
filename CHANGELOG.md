@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.0 – 2026-10-26
+
+### Changed
+
+- "Remove from list" asks first, starting on No: it takes the show's progress and score off AniList, and a stray enter or → did that at once.
+- Downloads shows each show's progress as AniList has it now, not as it was when the show was downloaded, and it lists the shows downloaded before the download folder changed. A show keeps its folder, also for new episodes, and the download folder setting says so.
+- Deleting the downloads of several shows lists the files that go, under each show's folder.
+- A queued download whose source ani-hop knows checks it with one ani-cli search, as playing does, instead of up to five.
+- At 80 columns the settings show whether skipping openings and endings is on, and a hint too long for its row is left out instead of ending mid-word ("not l…", "loses pr…").
+- The code behind episode progress, downloads, sources, lists and posters is reorganized into one part each, with tests through it. Nothing else changes on screen.
+
+### Fixed
+
+- "Download unwatched episodes" of a season AniList splits in two, like Attack on Titan Season 3, downloaded the episodes watched in its second part again.
+- Two shows with one name, like a remake, shared a download folder, so one's episodes counted as the other's. The second one's folder gets its AniList id now.
+- Two ani-hops could download the same episode into the same files at once and spoil both. The second one says "another ani-hop is downloading it".
+- A download the queue couldn't save (a full disk, a folder without write access) still started and was gone after quitting. It says why and isn't queued. Resuming the downloads of an ani-hop that's gone saves them in this one's queue before the old queue goes, so a crash in between loses nothing.
+- A source picked with "Change source…" while ani-hop was still looking the show up was replaced by what that lookup found, and picking the second of two equal titles (Hunter x Hunter, 1999 and 2011) picked the first.
+- Searching for something like "-D" ran one of ani-cli's options, which clears its history, instead of searching.
+- "Episode 5 airs in" from a list cached a while ago could be in the past ("0h -30m"), and "Continue with" left out an episode that aired since. Air times are kept as a date now; a list cached before shows them once it's refreshed.
+- Logging out while the login was still being checked logged back in, and a check of an old login could log out a new one.
+- A cover cut short on disk (a crash while it was saved) never showed. It's fetched again.
+- Two ani-hops saving the same file at once could lose one of the saves, and a crash while saving the login lost it. Each save now writes a file of its own and swaps it in.
+- A removal from the list that failed said "not saved", and its answer closed another show's List status screen when that was open.
+
 ## 0.6.16 – 2026-10-26
 
 ### Added

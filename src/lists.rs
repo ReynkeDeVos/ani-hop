@@ -176,6 +176,11 @@ impl List {
         }
     }
 
+    /// A search's results, which have no cache.
+    pub fn is_search(&self) -> bool {
+        matches!(self.feed, Feed::Whole) && self.cache.is_none()
+    }
+
     pub fn is_local(&self) -> bool {
         matches!(self.feed, Feed::Local)
     }

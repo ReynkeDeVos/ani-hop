@@ -308,7 +308,8 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let empty = match &screen.view {
         _ if !m.items.is_empty() || screen.loading => None,
         View::Shows(list) if list.is_local() => Some("Nothing downloaded yet"),
-        View::Shows(..) => Some("No shows found"),
+        View::Shows(list) if list.is_search() => Some("No shows found"),
+        View::Shows(..) => Some("Nothing on this list"),
         View::Episodes(..) => Some("No episodes found"),
         _ => None,
     };
