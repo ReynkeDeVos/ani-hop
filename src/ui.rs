@@ -521,7 +521,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
     // episode titles load while the show is open, so its episode list has them right away
     let shows_eps = matches!(screen.view, View::Show(_) | View::Episodes(..));
     let ep = match &screen.view {
-        View::Episodes(_, EpMode::Play | EpMode::Download) => screen.menu.current(),
+        View::Episodes(..) => screen.menu.current(),
         _ => None,
     };
     let ep = ep.map(|it| it.key.clone());

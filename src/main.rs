@@ -43,6 +43,8 @@ pub enum EpMode {
     Play,
     /// every episode with its download state; enter does what that state allows
     Download,
+    /// enter saves the AniList progress up to an episode, up or down
+    Watched,
 }
 
 pub enum View {
@@ -1437,6 +1439,9 @@ impl App {
                         .map(|e| list_label(&e.status))
                         .unwrap_or("not on list");
                     v.push(Item::new("status", "●  List status…", status));
+                    let total = m.episodes.map_or("?".into(), |t| t.to_string());
+                    let progress = format!("{}/{total}", m.progress());
+                    v.push(Item::new("watched", "✓  Watched up to…", progress));
                 }
                 v.push(Item::new(
                     "audio",
@@ -1487,7 +1492,7 @@ impl App {
                 // the one downloading shows its progress in place of "queued" (ui.rs)
                 let hint = |ep: &str| match (dl.state(ep), mode) {
                     (Dl::OnDisk(p), EpMode::Download) => format!("on disk · {}", megabytes([&p])),
-                    (Dl::OnDisk(_), EpMode::Play) => "on disk".into(),
+                    (Dl::OnDisk(_), _) => "on disk".into(),
                     (Dl::Queued, _) => "queued".into(),
                     (Dl::Elsewhere, _) => "queued in another ani-hop".into(),
                     (Dl::Missing, _) => String::new(),
@@ -1611,6 +1616,9 @@ impl App {
                 let mut hint = format!("saves {ep}/{total}");
                 if !part.is_empty() {
                     hint += &format!(" to {part}");
+                }
+                if let Some(also) = recounts(m.progress(), *ep) {
+                    hint += &format!(" · {also}");
                 }
                 let to = progress_status(m, *ep);
                 match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
@@ -1747,6 +1755,10 @@ impl App {
                 match mode {
                     EpMode::Play => self.play(m, key),
                     EpMode::Download => self.dl_act(m, keys, None),
+                    EpMode::Watched => {
+                        let title = format!("Watched up to episode {key} of {}?", m.name());
+                        self.ask_progress(&m, &key, title);
+                    }
                 }
             }
             View::DlChoice(m, eps) => {
@@ -2096,6 +2108,7 @@ impl App {
             }
             "download" => self.resolve(&m, Some(Want::Episodes(EpMode::Download))),
             "status" => _ = self.push("List status", View::Status(m)),
+            "watched" => self.resolve(&m, Some(Want::Episodes(EpMode::Watched))),
             "source" => {
                 let q = self
                     .sources
@@ -2144,15 +2157,36 @@ impl App {
         });
     }
 
+    /// Asks before saving the AniList progress up to `ep`. AniList keeps a count, not single
+    /// episodes, so Yes is preselected only when that changes no other episode.
+    fn ask_progress(&mut self, m: &Media, ep: &str, title: String) {
+        let Some((p, n)) = self.progress_target(m, ep) else {
+            return self.toast(
+                format!("Episode {ep} isn't a number AniList can count"),
+                true,
+            );
+        };
+        let part = match p.id == m.id {
+            true => String::new(),
+            false => part_name(m.name(), p.name()).to_string(),
+        };
+        let only_this = recounts(p.progress(), n as u32).is_none();
+        let ask = Pending::Progress(p.clone(), n as u32, part);
+        self.push(title, View::Confirm(ask));
+        self.top()
+            .menu
+            .select_key(if only_this { "yes" } else { "no" });
+    }
+
     fn fulfill(&mut self, m: Media, want: Want) {
         match want {
             Want::Play(ep) => self.play(m, ep),
             Want::Episodes(mode) => {
                 let next = self.next_ep(&m).to_string();
-                let title = if mode == EpMode::Play {
-                    "Episodes"
-                } else {
-                    "Downloads"
+                let title = match mode {
+                    EpMode::Play => "Episodes",
+                    EpMode::Download => "Downloads",
+                    EpMode::Watched => "Watched up to",
                 };
                 self.push(title, View::Episodes(m, mode));
                 self.top().menu.select_key(&next);
@@ -2517,25 +2551,14 @@ impl App {
                 {
                     self.playing = None;
                 }
-                // not watched yet, as far as the show or the sequel it's in goes; where it
-                // saves is settled now, as a lookup ending meanwhile could change it
+                // not watched yet, as far as the show or the sequel it's in goes
                 let ask = (self.progress_target(&m, &ep))
-                    .filter(|(p, n)| !m.watched(&ep) && *n > p.progress() as f64)
-                    .map(|(p, n)| {
-                        let part = match p.id == m.id {
-                            true => String::new(),
-                            false => part_name(m.name(), p.name()).to_string(),
-                        };
-                        Pending::Progress(p.clone(), n as u32, part)
-                    });
+                    .is_some_and(|(p, n)| !m.watched(&ep) && n > p.progress() as f64);
                 match res {
                     Err(e) => self.toast(format!("Couldn't play episode {ep} · {e}"), true),
-                    Ok(()) if self.user.is_some() && m.on_anilist() => {
-                        if let Some(ask) = ask {
-                            let title = format!("Mark episode {ep} of {} as watched?", m.name());
-                            self.push(title, View::Confirm(ask));
-                            self.top().menu.select_key("yes");
-                        }
+                    Ok(()) if ask && self.user.is_some() && m.on_anilist() => {
+                        let title = format!("Mark episode {ep} of {} as watched?", m.name());
+                        self.ask_progress(&m, &ep, title);
                     }
                     Ok(()) => {}
                 }
@@ -2658,6 +2681,20 @@ fn next_ep(m: &Media, parts: &[(u32, Media)]) -> u32 {
     next
 }
 
+/// What saving progress `to` over `from` does to the episodes between, since AniList counts
+/// every one up to the progress as watched.
+fn recounts(from: u32, to: u32) -> Option<String> {
+    let span = |a: u32, b: u32| match a == b {
+        true => a.to_string(),
+        false => format!("{a}–{b}"),
+    };
+    match to {
+        _ if to > from + 1 => Some(format!("counts {} too", span(from + 1, to - 1))),
+        _ if to < from => Some(format!("unmarks {}", span(to + 1, from))),
+        _ => None,
+    }
+}
+
 /// The list a show is on once episode `ep` is marked watched.
 fn progress_status(m: &Media, ep: u32) -> &'static str {
     match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
@@ -2737,6 +2774,16 @@ mod tests {
         assert_eq!(super::progress_status(&m, 3), "REPEATING");
         m.media_list_entry = Some(entry("PAUSED"));
         assert_eq!(super::progress_status(&m, 3), "CURRENT");
+    }
+
+    #[test]
+    fn says_what_a_jump_in_progress_counts() {
+        assert_eq!(super::recounts(5, 6), None); // the next one
+        assert_eq!(super::recounts(5, 5), None);
+        assert_eq!(super::recounts(5, 7).unwrap(), "counts 6 too");
+        assert_eq!(super::recounts(0, 1180).unwrap(), "counts 1–1179 too");
+        assert_eq!(super::recounts(1180, 5).unwrap(), "unmarks 6–1180");
+        assert_eq!(super::recounts(6, 5).unwrap(), "unmarks 6");
     }
 
     #[test]
