@@ -111,10 +111,13 @@ enum Want {
 enum Msg {
     /// a list's refreshed shows
     Shows(u64, Result<Vec<Media>, String>, lists::Ask),
+    /// the downloaded shows as AniList has them now
+    Local(Result<Vec<Media>, String>),
     /// the next page of a ranking
     More(u64, Result<Vec<Media>, String>),
     Hits(u64, Result<Vec<String>, String>),
-    Viewer(Result<(u64, String), String>),
+    /// who's logged in, asked with this token
+    Viewer(Option<String>, Result<(u64, String, bool), String>),
     /// a prepared poster
     Cover(kitty::Loaded),
     EpInfo(u64, HashMap<String, EpInfo>),
@@ -124,6 +127,8 @@ enum Msg {
     /// a lookup's answer, with its ticket (Sources::ask)
     Resolved(Media, u64, Result<Source, String>),
     Saved(Media, Result<Option<Entry>, String>),
+    /// the show taken off the list, or why not
+    Removed(Media, Result<(), String>),
     /// progress not saved, as AniList's entry moved since the question was asked: (the
     /// entry's media, the entry now)
     Moved(Media, Option<Entry>),
@@ -373,16 +378,24 @@ fn client_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Readable only by the user, and written aside then renamed: a crash mid-write keeps the
+/// login that was there.
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     fs::create_dir_all(ani::config_dir())?;
     use std::io::Write;
-    fs::OpenOptions::new()
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let res = (fs::OpenOptions::new())
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(path)?
-        .write_all(text.as_bytes())
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .and_then(|()| fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// Accepts the bare token or the whole redirect URL with `#access_token=...`.
@@ -505,7 +518,7 @@ impl App {
         }
         if app.client.token.is_some() {
             let c = app.client.clone();
-            app.spawn(move || Msg::Viewer(c.viewer()));
+            app.spawn(move || Msg::Viewer(c.token.clone(), c.viewer()));
         }
         app.spawn(|| Msg::Release(newer_release().map(|v| (v, ani::update_command()))));
         app
@@ -1511,7 +1524,7 @@ impl App {
                         };
                         self.toast(format!("Removing {}…", m.name()), false);
                         self.saves_pending += 1;
-                        self.spawn(move || Msg::Saved(m, c.remove(entry).map(|_| None)));
+                        self.spawn(move || Msg::Removed(m, c.remove(entry)));
                     }
                     Pending::Progress(k) => {
                         let (k, c) = (k.clone(), self.client.clone());
@@ -1573,7 +1586,14 @@ impl App {
                 self.top().menu.paste(&ani::tilde(&ani::download_root()));
             }
             "downloads" => {
-                let list = ani::local_shows().into_iter().map(|(m, _)| m).collect();
+                let list: Vec<Media> = ani::local_shows().into_iter().map(|(m, _)| m).collect();
+                // saved when downloaded, maybe weeks ago: their progress is AniList's now
+                let ids: Vec<u64> = (list.iter().filter(|m| m.on_anilist()))
+                    .map(|m| m.id)
+                    .collect();
+                if !ids.is_empty() {
+                    self.spawn(move || Msg::Local(c.shows(&ids)));
+                }
                 self.push("Downloads", View::Shows(List::local(list)));
             }
             "login" => match client_id() {
@@ -1655,7 +1675,7 @@ impl App {
                 self.client.token = Some(token);
                 self.parts.clear();
                 let c = self.client.clone();
-                self.spawn(move || Msg::Viewer(c.viewer()));
+                self.spawn(move || Msg::Viewer(c.token.clone(), c.viewer()));
                 self.toast("Checking token…", false);
                 self.pop(1);
             }
@@ -1892,6 +1912,12 @@ impl App {
                     self.toast("AniList search failed, showing ani-cli's matches", true);
                 }
             }
+            // offline is when downloads are watched: no error for that
+            Msg::Local(Ok(fresh)) => {
+                ani::refresh_shows(&fresh);
+                self.refresh();
+            }
+            Msg::Local(Err(_)) => {}
             Msg::More(id, res) => {
                 let screen = self.stack.iter_mut().find(|s| s.id == id);
                 if let Some(View::Shows(list)) = screen.map(|s| &mut s.view) {
@@ -1914,14 +1940,16 @@ impl App {
                     *h = hits;
                 }
             }),
-            Msg::Viewer(Ok(user)) => {
-                let english = anilist::ENGLISH_TITLES.load(Ordering::Relaxed);
+            // asked before logging out or in again: about another login
+            Msg::Viewer(token, _) if token != self.client.token => {}
+            Msg::Viewer(_, Ok((id, name, english))) => {
+                anilist::ENGLISH_TITLES.store(english, Ordering::Relaxed);
                 let _ = write_private(
                     &user_path(),
-                    &serde_json::json!([user.0, user.1, english]).to_string(),
+                    &serde_json::json!([id, name, english]).to_string(),
                 );
                 let login = self.user.is_none();
-                self.user = Some(user);
+                self.user = Some((id, name));
                 if login {
                     self.toast(
                         format!("Logged in as {}", self.user.as_ref().unwrap().1),
@@ -1935,7 +1963,7 @@ impl App {
                     self.top().menu.select_key("list:CURRENT");
                 }
             }
-            Msg::Viewer(Err(e)) => {
+            Msg::Viewer(_, Err(e)) => {
                 // keep the token on network trouble, drop it when AniList rejects it
                 if e.contains("Invalid token") || e.contains("Unauthorized") {
                     self.log_out();
@@ -2030,13 +2058,19 @@ impl App {
                         self.toast(text, false);
                         self.update_media(m.id, entry);
                         lists::changed();
-                        if matches!(self.top().view, View::Status(_)) {
+                        // its list status question is answered, not another show's
+                        if matches!(&self.top().view, View::Status(s) if s.id == m.id) {
                             self.stack.pop();
                         }
                         self.refresh();
                     }
                     Err(e) => self.toast(format!("{} not saved · {e}", m.name()), true),
                 }
+            }
+            Msg::Removed(m, Ok(())) => self.on_msg(Msg::Saved(m, Ok(None))),
+            Msg::Removed(m, Err(e)) => {
+                self.saves_pending -= 1;
+                self.toast(format!("{} not removed · {e}", m.name()), true);
             }
             Msg::Moved(m, entry) => {
                 self.saves_pending -= 1;

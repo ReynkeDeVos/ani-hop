@@ -483,7 +483,8 @@ fn input_help(input: &Input) -> Text<'static> {
             "Where new downloads go. ~ works.".into(),
             format!("Empty goes back to {}.", ani::tilde(&ani::default_root())).into(),
             "".into(),
-            "Shows already downloaded stay in the old folder.".into(),
+            "Shows downloaded before keep their folder,".into(),
+            "new episodes of them too.".into(),
         ],
     };
     Text::from(lines).style(SOFT)
@@ -582,15 +583,28 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             .iter()
             .map(|m| Line::from(format!("• {}", m.name())))
             .collect(),
-        View::Confirm(Pending::Delete(paths)) => paths
-            .iter()
-            .map(|p| {
-                Line::from(format!(
-                    "✗ {}",
-                    p.file_name().unwrap_or_default().to_string_lossy()
-                ))
-            })
-            .collect(),
+        // a show's files under its folder, as one of the user's own may be among them
+        View::Confirm(Pending::Delete(paths)) => {
+            let name = |p: &std::path::Path| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            (paths.iter())
+                .flat_map(|p| {
+                    let files = match p.is_dir() {
+                        true => ani::show_files(p),
+                        false => Vec::new(),
+                    };
+                    let head = Line::from(format!("✗ {}", name(p)));
+                    let files = files
+                        .into_iter()
+                        .map(move |f| Line::styled(format!("    {}", name(&f)), DIM));
+                    std::iter::once(head).chain(files)
+                })
+                .collect()
+        }
         View::Confirm(Pending::Resume(jobs, _)) => jobs
             .iter()
             .map(|j| {
@@ -920,11 +934,13 @@ fn media_preview(
         lines.push(Line::styled(format!("Episodes\u{a0}{eps} are {name}"), DIM));
         lines.extend(status(p));
     }
-    if let Some(a) = &m.next_airing_episode {
+    if let Some(a) = &m.next_airing_episode
+        && let Some(left) = a.left(crate::anilist::now())
+    {
         lines.push(Line::from(format!(
             "Episode {} airs in {}",
             a.episode,
-            duration(a.time_until_airing)
+            duration(left)
         )));
     }
     // an episode list says "on disk" on each of its rows

@@ -630,7 +630,7 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
 
 /// What ani-hop knows about a show folder it downloaded into. It's kept in the config
 /// folder, so the download folder holds only episodes and subtitles.
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 struct Downloaded {
     media: Media,
     /// episode files that are the English dub, ani-cli names both the same
@@ -683,22 +683,61 @@ pub fn ours(dir: &Path) -> bool {
     dir.is_dir() && index().contains_key(dir)
 }
 
-/// Download folder of a show.
+/// Download folder of a show: the one it was downloaded into before, else a new one in the
+/// download folder named after it.
 pub fn folder(m: &Media) -> PathBuf {
-    let existing = local_shows().into_iter().find(|(lm, _)| lm.id == m.id);
-    existing
-        .map(|(_, p)| p)
-        .unwrap_or_else(|| download_root().join(m.name().replace('/', "∕")))
+    folder_in(&download_root(), index(), m)
 }
 
-pub fn local_shows() -> Vec<(Media, PathBuf)> {
-    let root = download_root();
-    let mut shows: Vec<_> = index()
+/// Two AniList shows with one name (a remake) don't share a folder: the second one's name
+/// gets its AniList id. One ani-cli found shares it with the AniList show of its name.
+fn folder_in(root: &Path, all: Index, m: &Media) -> PathBuf {
+    if let Some((_, p)) = shows_in(root, all.clone())
         .into_iter()
-        .filter(|(p, _)| p.parent() == Some(&root) && p.is_dir())
+        .find(|(s, _)| s.id == m.id)
+    {
+        return p;
+    }
+    let name = m.name().replace('/', "∕");
+    let dir = root.join(&name);
+    let taken = (all.get(&dir)).is_some_and(|d| {
+        let other = &d.media;
+        other.id != m.id && other.id != 0 && other.on_anilist() && m.on_anilist()
+    });
+    match taken && dir.is_dir() {
+        true => root.join(format!("{name} ({})", m.id)),
+        false => dir,
+    }
+}
+
+/// Puts the details AniList has now (progress, airing) on the downloaded shows it knows.
+pub fn refresh_shows(fresh: &[Media]) {
+    let _ = edit_index(|all| {
+        for d in all.values_mut() {
+            if let Some(m) = fresh.iter().find(|m| m.id == d.media.id) {
+                d.media = m.clone();
+            }
+        }
+    });
+}
+
+/// Downloaded shows and their folders, by name: also those downloaded before the download
+/// folder changed, which stay where they are.
+pub fn local_shows() -> Vec<(Media, PathBuf)> {
+    shows_in(&download_root(), index())
+}
+
+/// A show in two folders (downloaded again after the download folder changed, before 0.7)
+/// once, from the one in `root`.
+fn shows_in(root: &Path, all: Index) -> Vec<(Media, PathBuf)> {
+    let mut shows: Vec<(Media, PathBuf)> = (all.into_iter())
+        .filter(|(p, _)| p.is_dir())
         .map(|(p, d)| (d.media, p))
         .collect();
-    shows.sort_by(|a: &(Media, _), b| a.0.name().cmp(b.0.name()));
+    shows.sort_by_key(|(_, p)| p.parent() != Some(root));
+    let mut seen = std::collections::HashSet::new();
+    shows.retain(|(m, _)| seen.insert(m.id));
+    shows.sort_by(|a, b| a.0.name().cmp(b.0.name()));
     shows
 }
 
@@ -770,19 +809,33 @@ pub fn delete_episode(file: &Path) -> std::io::Result<()> {
 /// Deletes what ani-hop downloaded into a show folder (episodes, subtitles, unfinished
 /// parts) and the folder if that was all. A same-named folder may hold the user's own too.
 pub fn delete_show(dir: &Path) -> std::io::Result<()> {
-    for p in fs::read_dir(dir)?.flatten().map(|e| e.path()) {
-        let name = p.file_name().unwrap_or_default().to_string_lossy();
-        let ours = name.contains(" Episode ")
-            && (name.ends_with(".mp4") || name.ends_with(".vtt") || name.contains(".mp4."));
-        if ours {
-            fs::remove_file(&p)?;
-        }
+    fs::read_dir(dir)?;
+    for p in show_files(dir) {
+        fs::remove_file(&p)?;
     }
     edit_index(|all| {
         all.remove(dir);
     })?;
     let _ = fs::remove_dir(dir); // fails while something of the user's is left in it
     Ok(())
+}
+
+/// What deleting a show folder deletes: its episodes, subtitles and unfinished parts, by
+/// name, sorted. The question before shows them, as a folder of the user's own by that
+/// name may hold episode files of theirs.
+pub fn show_files(dir: &Path) -> Vec<PathBuf> {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = (rd.flatten().map(|e| e.path()))
+        .filter(|p| {
+            let name = p.file_name().unwrap_or_default().to_string_lossy();
+            name.contains(" Episode ")
+                && (name.ends_with(".mp4") || name.ends_with(".vtt") || name.contains(".mp4."))
+        })
+        .collect();
+    files.sort();
+    files
 }
 
 /// Drops a show folder of ours once nothing is left in it.
@@ -1032,6 +1085,66 @@ mod tests {
         let err = b"\x1b[2K\x1b[1;31mConnection error: could not fetch https://hianime.at/search?keyword=x (no HTTP response; curl exit 7)\x1b[0m\n";
         assert_eq!(last_error(err), "can't reach hianime.at");
         assert_eq!(last_error(b"No results found!\n"), "No results found!");
+    }
+
+    #[test]
+    fn remakes_get_folders_of_their_own() {
+        let root = std::env::temp_dir().join(format!("ani-hop-folders-{}", std::process::id()));
+        let show = |id: u64, name: &str| {
+            let mut m = Media {
+                id,
+                ..Default::default()
+            };
+            m.title.romaji = Some(name.into());
+            m
+        };
+        let (old, remake) = (show(1, "Trigun"), show(2, "Trigun"));
+        let mut all = Index::new();
+        all.insert(
+            root.join("Trigun"),
+            Downloaded {
+                media: old.clone(),
+                dub: Vec::new(),
+            },
+        );
+        fs::create_dir_all(root.join("Trigun")).unwrap();
+        assert_eq!(folder_in(&root, all.clone(), &old), root.join("Trigun"));
+        assert_eq!(
+            folder_in(&root, all.clone(), &remake),
+            root.join("Trigun (2)")
+        );
+        // one ani-cli found goes where the AniList show of its name is
+        let at = Source::at("q", &["Trigun".into()], 1, Vec::new());
+        let found = Media::from_ani_cli("Trigun", at);
+        assert_eq!(folder_in(&root, all.clone(), &found), root.join("Trigun"));
+        // a show downloaded before the download folder changed stays where it is
+        let elsewhere = root.join("old/Frieren");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let frieren = show(3, "Frieren");
+        all.insert(
+            elsewhere.clone(),
+            Downloaded {
+                media: frieren.clone(),
+                dub: Vec::new(),
+            },
+        );
+        let new = root.join("new");
+        assert_eq!(folder_in(&new, all.clone(), &frieren), elsewhere);
+        let listed: Vec<u64> = shows_in(&new, all.clone()).iter().map(|s| s.0.id).collect();
+        assert_eq!(listed, [3, 1]);
+        // downloaded again in the new one before 0.7: listed once, from there
+        fs::create_dir_all(new.join("Frieren")).unwrap();
+        all.insert(
+            new.join("Frieren"),
+            Downloaded {
+                media: frieren.clone(),
+                dub: Vec::new(),
+            },
+        );
+        let shows = shows_in(&new, all.clone());
+        assert_eq!(shows.len(), 2);
+        assert_eq!(shows[0].1, new.join("Frieren"));
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

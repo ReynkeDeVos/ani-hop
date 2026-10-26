@@ -248,7 +248,8 @@ impl<T: Terminal> Posters<T> {
 /// Pixels per cell; Ghostty and Kitty report the window size in pixels.
 pub fn cell_px() -> (u16, u16) {
     match ratatui::crossterm::terminal::window_size() {
-        Ok(w) if w.width > 0 && w.columns > 0 && w.rows > 0 => {
+        // a cell less than a pixel wide would be one of 0 and divide posters by it
+        Ok(w) if w.columns > 0 && w.rows > 0 && w.width >= w.columns && w.height >= w.rows => {
             (w.width / w.columns, w.height / w.rows)
         }
         _ => (10, 20),
