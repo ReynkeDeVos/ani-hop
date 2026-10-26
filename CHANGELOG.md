@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.12 – 2026-10-26
+
+### Added
+
+- A Nix flake, for NixOS and for Nix on Linux and Apple-silicon Macs: `nix profile add github:ReynkeDeVos/ani-hop` installs ani-hop with ani-cli, mpv, yt-dlp, ffmpeg and ani-skip, and NixOS or Home Manager can take it as a flake input. When a new release is out, ani-hop installed this way shows `nix profile upgrade ani-hop`, `nix flake update ani-hop` and a rebuild, or `nix run --refresh`, instead of a `cargo install` line.
+
 ## 0.6.11 – 2026-10-26
 
 ### Changed
