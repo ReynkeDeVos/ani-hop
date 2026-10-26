@@ -164,14 +164,18 @@ impl Media {
         self.progress() > 0 && crate::ani::ep_num(ep) <= self.progress() as f64
     }
 
-    /// Episodes that are out right now (None = unknown). A list from the cache may say an
-    /// episode is next that has aired since.
+    /// Episodes that are out right now (None = unknown, 0 before the first one airs). A list
+    /// from the cache may say an episode is next that has aired since.
     pub fn released(&self) -> Option<u32> {
         let out = |a: &Airing| match a.airing_at > 0 && a.airing_at <= now() {
             true => a.episode,
             false => a.episode.saturating_sub(1),
         };
-        self.next_airing_episode.as_ref().map(out).or(self.episodes)
+        let unscheduled = match self.status.as_deref() {
+            Some("NOT_YET_RELEASED") => Some(0),
+            _ => self.episodes,
+        };
+        self.next_airing_episode.as_ref().map(out).or(unscheduled)
     }
 }
 
@@ -665,6 +669,37 @@ mod tests {
         let old: super::Airing =
             serde_json::from_str(r#"{"episode": 5, "timeUntilAiring": 90}"#).unwrap();
         assert_eq!((old.episode, old.airing_at), (5, 0));
+    }
+
+    #[test]
+    fn nothing_is_out_before_the_first_episode_airs() {
+        let now = super::now();
+        let show = |status: &str, episodes, at: Option<i64>| super::Media {
+            status: Some(status.into()),
+            episodes,
+            next_airing_episode: at.map(|airing_at| super::Airing {
+                episode: 1,
+                airing_at,
+            }),
+            ..Default::default()
+        };
+        let upcoming = |episodes, at| show("NOT_YET_RELEASED", episodes, at).released();
+        assert_eq!(upcoming(Some(12), None), Some(0), "announced, no date yet");
+        assert_eq!(upcoming(None, None), Some(0));
+        assert_eq!(upcoming(Some(12), Some(now + 90)), Some(0));
+        assert_eq!(
+            upcoming(Some(12), Some(now - 90)),
+            Some(1),
+            "a cache from before it aired"
+        );
+        assert_eq!(
+            upcoming(Some(12), Some(0)),
+            Some(0),
+            "a cache from before 0.7"
+        );
+        assert_eq!(show("RELEASING", Some(12), None).released(), Some(12));
+        assert_eq!(show("FINISHED", Some(12), None).released(), Some(12));
+        assert_eq!(super::Media::default().released(), None);
     }
 
     #[test]

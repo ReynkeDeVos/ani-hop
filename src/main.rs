@@ -903,6 +903,14 @@ impl App {
         Progress::of(m, self.parts(m))
     }
 
+    /// AniList says none of `m` is out, and ani-cli has no source for it, known or being
+    /// looked up: a search could only fail, or find another show. A pick lifts it.
+    pub fn upcoming(&self, m: &Media) -> bool {
+        m.released() == Some(0)
+            && self.sources.get(m.id).is_none()
+            && !self.resolving.contains_key(&m.id)
+    }
+
     /// What episode `ep` of `m` is called and about.
     pub fn ep_about(&self, m: &Media, ep: &str) -> Option<&EpInfo> {
         let (p, n) = self.progress(m).entry(ep);
@@ -1033,6 +1041,7 @@ impl App {
                 let avail = match src {
                     Some(s) => format!("{} available", s.episodes.len()),
                     None if self.resolving.contains_key(&m.id) => "searching…".into(),
+                    None if self.upcoming(m) => "not out yet".into(),
                     None => String::new(),
                 };
                 v.push(Item::new("play", "≡  Episodes…", avail));
@@ -1193,20 +1202,22 @@ impl App {
                     .iter()
                     .filter(|m| self.local.get(&m.id).is_some_and(|eps| !eps.is_empty()))
                     .count();
+                // only what's out downloads; the preview says which isn't
+                let out: Vec<&Media> = list.iter().filter(|m| !self.upcoming(m)).collect();
                 // as the downloader decides: episodes past each show's progress
-                let which = if list.iter().any(|m| m.progress() > 0) {
+                let which = if out.iter().any(|m| m.progress() > 0) {
                     "unwatched"
                 } else {
                     "all"
                 };
-                let mut v = vec![Item::new(
-                    "download",
-                    format!(
+                let mut v = Vec::new();
+                if !out.is_empty() {
+                    let label = format!(
                         "↓  Download {which} episodes of {}",
-                        plural(list.len(), "show")
-                    ),
-                    "",
-                )];
+                        plural(out.len(), "show")
+                    );
+                    v.push(Item::new("download", label, ""));
+                }
                 if local > 0 {
                     v.push(Item::new(
                         "delete",
@@ -1412,6 +1423,7 @@ impl App {
             View::Bulk(list) => {
                 let list = list.clone();
                 if key == "download" {
+                    let list: Vec<Media> = list.into_iter().filter(|m| !self.upcoming(m)).collect();
                     let shows = plural(list.len(), "show");
                     for m in list {
                         let mut job = Job::new(m, None);
@@ -1695,12 +1707,23 @@ impl App {
     }
 
     fn open_show(&mut self, m: Media) {
-        self.resolve(&m, None); // warm up so "Episodes…" opens instantly
+        if !self.upcoming(&m) {
+            self.resolve(&m, None); // warm up so "Episodes…" opens instantly
+        }
         self.push(m.name().to_string(), View::Show(m));
     }
 
     fn show_action(&mut self, m: Media, key: &str) {
         match key {
+            // their lists open at once and say why they're empty, without asking ani-cli
+            "play" | "download" | "watched" if self.upcoming(&m) => {
+                let mode = match key {
+                    "play" => EpMode::Play,
+                    "download" => EpMode::Download,
+                    _ => EpMode::Watched,
+                };
+                self.fulfill(m, Want::Episodes(mode));
+            }
             "next" => self.play(m.clone(), self.progress(&m).next().to_string()),
             "play" => self.resolve(&m, Some(Want::Episodes(EpMode::Play))),
             // what's on disk can be deleted before ani-cli answers, or without it
@@ -2028,7 +2051,7 @@ impl App {
                     Err(e) if want.is_some() || here => {
                         // the provider may call it something else: picking it by hand fixes that
                         let e = match e.starts_with("No results") {
-                            true => "no match for this show · try Change source…".into(),
+                            true => no_match(&m).into(),
                             false => e,
                         };
                         self.toast(format!("ani-cli: {e}"), true)
@@ -2122,6 +2145,15 @@ impl App {
     }
 }
 
+/// What ani-cli finding nothing for `m` says: with only episode 1 out, the provider may not
+/// list it yet.
+fn no_match(m: &Media) -> &'static str {
+    match m.next_airing_episode.is_some() && m.released() == Some(1) {
+        true => "no match yet · new shows can take a day, or try Change source…",
+        false => "no match for this show · try Change source…",
+    }
+}
+
 pub fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
 }
@@ -2180,6 +2212,40 @@ mod tests {
             "abc.def"
         );
         assert_eq!(super::parse_token("  abc.def \n"), "abc.def");
+    }
+
+    #[test]
+    fn a_show_with_only_its_first_episode_out_may_not_be_on_ani_cli_yet() {
+        let now = super::anilist::now();
+        let show = |status: &str, episodes, next: Option<(u32, i64)>| super::Media {
+            status: Some(status.into()),
+            episodes,
+            next_airing_episode: next
+                .map(|(episode, airing_at)| super::anilist::Airing { episode, airing_at }),
+            ..Default::default()
+        };
+        let just = "no match yet · new shows can take a day, or try Change source…";
+        let other = "no match for this show · try Change source…";
+        assert_eq!(
+            super::no_match(&show("RELEASING", Some(12), Some((2, now + 600_000)))),
+            just
+        );
+        let cached = show("NOT_YET_RELEASED", Some(12), Some((1, now - 3600)));
+        assert_eq!(
+            super::no_match(&cached),
+            just,
+            "aired since the list was cached"
+        );
+        assert_eq!(super::no_match(&show("FINISHED", Some(12), None)), other);
+        assert_eq!(
+            super::no_match(&show("RELEASING", Some(12), Some((9, now + 600_000)))),
+            other
+        );
+        assert_eq!(
+            super::no_match(&show("RELEASING", Some(12), Some((1, now + 90)))),
+            other
+        );
+        assert!(!just.contains('—') && !other.contains('—'));
     }
 
     #[test]

@@ -211,6 +211,8 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         View::Show(m) => Some(app.progress(m).next().to_string()),
         _ => None,
     };
+    let unaired =
+        matches!(&app.stack.last().unwrap().view, View::Episodes(m, _) if app.upcoming(m));
     let screen = app.stack.last_mut().unwrap();
     let block = panel();
     let inner = block.inner(area).inner(Margin::new(1, 0));
@@ -310,7 +312,10 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         View::Shows(list) if list.is_local() => Some("Nothing downloaded yet"),
         View::Shows(list) if list.is_search() => Some("No shows found"),
         View::Shows(..) => Some("Nothing on this list"),
+        View::Episodes(..) if unaired => Some("Not out yet"),
         View::Episodes(..) => Some("No episodes found"),
+        // its download row goes when none of its shows is out
+        View::Bulk(_) => Some("None of them is out yet"),
         _ => None,
     };
     if let Some(text) = empty {
@@ -582,7 +587,13 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
     let lines: Vec<Line> = match &screen.view {
         View::Bulk(list) => list
             .iter()
-            .map(|m| Line::from(format!("• {}", m.name())))
+            .map(|m| {
+                let mut line = Line::from(format!("• {}", m.name()));
+                if app.upcoming(m) {
+                    line.push_span(Span::styled(" · not out yet", DIM));
+                }
+                line
+            })
             .collect(),
         // a show's files under its folder, as one of the user's own may be among them
         View::Confirm(Pending::Delete(paths)) => {
@@ -726,7 +737,11 @@ fn facts(m: &Media) -> Vec<Line<'static>> {
         m.episodes
             .filter(|&e| !(movie && e == 1))
             .map(|e| episodes(e as usize)),
-        m.status.as_deref().map(pretty),
+        // a list cached before it started airing still says it's upcoming
+        (m.status.as_deref()).map(|s| match s {
+            "NOT_YET_RELEASED" if m.released() > Some(0) => pretty("RELEASING"),
+            s => pretty(s),
+        }),
     ];
     for d in detail.into_iter().flatten() {
         if !facts.is_empty() {
@@ -1193,12 +1208,13 @@ fn pretty(s: &str) -> String {
     }
 }
 
+/// "74d 6h", "5h 3m", kept on one line.
 fn duration(secs: i64) -> String {
     let (d, h, m) = (secs / 86400, secs % 86400 / 3600, secs % 3600 / 60);
     if d > 0 {
-        format!("{d}d {h}h")
+        format!("{d}d\u{a0}{h}h")
     } else {
-        format!("{h}h {m}m")
+        format!("{h}h\u{a0}{m}m")
     }
 }
 
@@ -1243,6 +1259,28 @@ mod tests {
         assert!(!same_title("Aoki Hagane no Arpeggio: Ars Nova Cadenza", &m));
         assert!(!same_title("Frieren: Beyond Journey's End Season 2", &m));
         assert_eq!(episodes(1), "1\u{a0}episode");
+    }
+
+    #[test]
+    fn a_show_that_aired_since_its_list_was_cached_is_airing() {
+        let now = crate::anilist::now();
+        let show = |at: Option<i64>| Media {
+            format: Some("TV".into()),
+            status: Some("NOT_YET_RELEASED".into()),
+            next_airing_episode: at.map(|airing_at| crate::anilist::Airing {
+                episode: 1,
+                airing_at,
+            }),
+            ..Default::default()
+        };
+        let status = |m: Media| facts(&m)[0].to_string();
+        assert!(status(show(Some(now - 90))).ends_with("Airing"));
+        assert!(status(show(Some(now + 90))).ends_with("Upcoming"));
+        assert!(
+            status(show(Some(0))).ends_with("Upcoming"),
+            "a cache from before 0.7"
+        );
+        assert!(status(show(None)).ends_with("Upcoming"));
     }
 
     #[test]

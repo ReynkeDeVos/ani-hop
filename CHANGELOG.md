@@ -9,6 +9,7 @@
 - Deleting the downloads of several shows lists the files that go, under each show's folder.
 - A queued download whose source ani-hop knows checks it with one ani-cli search, as playing does, instead of up to five.
 - At 80 columns the settings show whether skipping openings and endings is on, and a hint too long for its row is left out instead of ending mid-word ("not l…", "loses pr…").
+- A show that isn't out yet doesn't search ani-cli anymore and doesn't end in a red "no match" error. Its page leaves out "Play episode 1" (also when AniList has no date for it yet) and says "not out yet" on "Episodes…", its episode lists open at once and say "Not out yet", and downloading several shows leaves it out. A list cached before a show started airing says "Airing" for it. When ani-cli finds nothing for a show with only its first episode out, the error says new shows can take a day.
 - The code behind episode progress, downloads, sources, lists and posters is reorganized into one part each, with tests through it. Nothing else changes on screen.
 
 ### Fixed
