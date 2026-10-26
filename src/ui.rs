@@ -159,7 +159,7 @@ fn panel() -> Block<'static> {
 
 /// A paused download's row: how far it got, without the stale speed of its last line, when
 /// that's kept (yt-dlp; ffmpeg starts over).
-fn paused(n: &crate::DlNow) -> String {
+fn paused(n: &crate::downloads::Now) -> String {
     let at = crate::got_so_far(&n.text).filter(|_| n.resumes);
     at.map_or("‖ paused".into(), |p| format!("‖ paused {p}"))
 }
@@ -335,10 +335,11 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let fetching = matches!(screen.view, View::Shows(_, Feed::Pages(_, _, true)));
     let busy = busy.or_else(|| fetching.then(|| ("more".to_string(), format!("{spin} loading…"))));
     // and the episode downloading right now on its row, or how far it got when paused
-    let busy = busy.or_else(|| match (&screen.view, &app.dl_now) {
+    let dl = app.downloads.snapshot();
+    let busy = busy.or_else(|| match (&screen.view, &dl.now) {
         (View::Episodes(m, _), Some(n)) if m.id == n.id => Some((
             n.ep.clone(),
-            match ani::paused() {
+            match dl.paused {
                 true => paused(n),
                 false => format!("↓ {}", n.text),
             },
@@ -1100,7 +1101,8 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     );
     let toast = app.toast.as_ref().filter(|t| t.2.elapsed().as_secs() < 4);
     // read once: the worker can take the last one off between two reads
-    let n = crate::dl_pending();
+    let dl = app.downloads.snapshot();
+    let n = dl.pending;
     let status = match (toast, &app.playing) {
         // shortcut: what's still underway is told apart by its "…"; give toasts a kind once a
         // finished one can end in "…"
@@ -1119,14 +1121,14 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         _ if n > 0 => {
             // how far the one downloading got first, so that's what 80 columns keep, then
             // which one it is and what's after it
-            let head = match (&app.dl_now, ani::paused()) {
+            let head = match (&dl.now, dl.paused) {
                 (Some(d), true) => paused(d),
                 (Some(d), false) => format!("{} ↓ {}", spinner(app), d.text),
                 (None, true) => format!("‖ paused · {n} queued"),
                 (None, false) => format!("{} ↓ {n} queued", spinner(app)),
             };
             let head = format!(" {head} ");
-            let tail = (app.dl_now.as_ref()).map_or(String::new(), |d| match n - 1 {
+            let tail = (dl.now.as_ref()).map_or(String::new(), |d| match n - 1 {
                 0 => format!("· {}", d.label),
                 more => format!("· {} · {more} more queued", d.label),
             });

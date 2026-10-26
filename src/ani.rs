@@ -14,19 +14,8 @@ use std::io::{BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-
-/// The running ani-cli download: pid, show folder, episode.
-type Running = (u32, PathBuf, String);
-
-/// (stopped by quitting, the running download). One lock, so quitting or stopping an
-/// episode can't race the worker starting the next one.
-static DOWNLOAD: Mutex<(bool, Option<Running>)> = Mutex::new((false, None));
-/// Downloads held by `pause`, until `resume`.
-static PAUSED: AtomicBool = AtomicBool::new(false);
-/// A download that was stopped, by quitting, pausing or taking it out of the queue.
-pub const STOPPED: &str = "stopped";
 
 const FAKE_ROFI: &str = r#"#!/bin/sh
 # ani-hop: captures ani-cli's menu instead of showing one
@@ -436,7 +425,7 @@ fn ani_cli() -> Command {
 }
 
 /// ani-cli prints its errors with colors and line clears.
-fn last_error(stderr: &[u8]) -> String {
+pub fn last_error(stderr: &[u8]) -> String {
     let s = String::from_utf8_lossy(stderr);
     let line = s
         .lines()
@@ -772,7 +761,7 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
 /// Streams one episode with ani-skip; blocks until mpv is closed.
 /// Feeds the child's output lines to `line` (also the ones redrawn with \r) until it
 /// exits; returns whether it succeeded and what it wrote to stderr.
-fn follow(mut child: Child, mut line: impl FnMut(&str)) -> (bool, Vec<u8>) {
+pub fn follow(mut child: Child, mut line: impl FnMut(&str)) -> (bool, Vec<u8>) {
     let mut stderr = child.stderr.take().unwrap();
     let err_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
@@ -1132,7 +1121,7 @@ pub fn discard(dir: &Path, eps: &[String]) {
     }
 }
 
-fn discard_parts(dir: &Path, eps: &[String]) {
+pub fn discard_parts(dir: &Path, eps: &[String]) {
     for p in parts(dir, eps) {
         let _ = fs::remove_file(p);
     }
@@ -1180,167 +1169,91 @@ fn replaces(m: &Media, saved: &Media) -> bool {
     m.on_anilist() || saved.id == 0 // 0: a new entry
 }
 
-/// Downloads one episode, calling `progress` with yt-dlp's status lines or how far ffmpeg got,
-/// and whether that's kept after a pause (yt-dlp's is). `wanted` is asked right before it
-/// starts, under the lock stopping and pausing take, so neither is ever missed.
-pub fn download(
-    m: &Media,
-    src: &Source,
-    ep: &str,
-    dub: bool,
-    wanted: impl FnOnce() -> bool,
-    mut progress: impl FnMut(&str, bool),
-) -> Result<(), String> {
-    let dir = folder(m);
-    let child = {
-        let mut dl = DOWNLOAD.lock().unwrap();
-        if dl.0 || PAUSED.load(Ordering::Relaxed) || !wanted() {
-            return Err(STOPPED.into());
+/// Makes `dir` the download folder of `m` in the index, which then knows the show: one
+/// found through ani-cli never replaces one AniList knows.
+pub fn prepare(m: &Media, dir: &Path) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    edit_index(|all| {
+        let d = all.entry(dir.to_path_buf()).or_default();
+        if replaces(m, &d.media) {
+            d.media = m.clone();
         }
-        // under the lock, so stopping another episode can't drop the folder in between; also
-        // for an episode already there, so a folder found through ani-cli gets the AniList show
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        edit_index(|all| {
-            let d = all.entry(dir.clone()).or_default();
-            if replaces(m, &d.media) {
-                d.media = m.clone();
-            }
-        })
-        .map_err(|e| e.to_string())?;
-        if local_episodes(&dir).iter().any(|(e, _)| e == ep) {
-            return Ok(()); // yt-dlp wouldn't replace it, so it stays the audio it was
-        }
-        for p in half_pieces(&dir, ep) {
-            let _ = fs::remove_file(p);
-        }
-        let child = ani_cli()
-            .args(["-d", "-S", &src.index.to_string(), "-e", ep, &src.query])
-            .env("ANI_CLI_DOWNLOAD_DIR", &dir)
-            .env("ANI_CLI_MODE", mode(dub))
-            .env("ANI_CLI_HIST_DIR", cache_dir().join("probe")) // downloading isn't watching
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("ani-cli: {e}"))?;
-        dl.1 = Some((child.id(), dir.clone(), ep.to_string()));
-        child
-    };
-    // the last percentage, for while it retries; ffmpeg's length (ffprobe) and speed
-    let (mut pct, mut length, mut speed) = (None, None, None);
-    let (_, stderr) = follow(child, |l| {
-        if let Some(line) = l.strip_prefix("[download]") {
-            if let Some(text) = ytdlp_progress(line.trim(), &mut pct) {
-                progress(&text, true);
-            }
-        } else if let Some(d) = l.strip_prefix("duration=") {
-            length = d.parse().ok().filter(|d: &f64| *d >= 1.0);
-        } else if let Some(x) = l.strip_prefix("speed=") {
-            speed = times(x);
-        } else if let Some(t) = l
-            .strip_prefix("out_time=")
-            .filter(|t| t.starts_with(|c: char| c.is_ascii_digit()))
-        {
-            progress(&so_far(t, length, speed), false);
-        }
-    });
-    // gone already: a stop killed it
-    let killed = DOWNLOAD.lock().unwrap().1.take().is_none();
-    // ani-cli exits 0 even if yt-dlp failed, so the file is the only reliable signal
-    match local_episodes(&dir).into_iter().find(|(e, _)| e == ep) {
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Deletes the pieces yt-dlp was writing when episode `ep` stopped, see `half_pieces`.
+pub fn drop_half_pieces(dir: &Path, ep: &str) {
+    for p in half_pieces(dir, ep) {
+        let _ = fs::remove_file(p);
+    }
+}
+
+/// Starts ani-cli downloading episode `ep` of `src` into `dir`; it says how far it got on
+/// stdout (see `Lines`).
+pub fn start_download(src: &Source, ep: &str, dub: bool, dir: &Path) -> Result<Child, String> {
+    ani_cli()
+        .args(["-d", "-S", &src.index.to_string(), "-e", ep, &src.query])
+        .env("ANI_CLI_DOWNLOAD_DIR", dir)
+        .env("ANI_CLI_MODE", mode(dub))
+        .env("ANI_CLI_HIST_DIR", cache_dir().join("probe")) // downloading isn't watching
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ani-cli: {e}"))
+}
+
+/// Whether a download of episode `ep` into `dir` that ended left its file. ani-cli exits 0
+/// even if yt-dlp failed, so the file is the only reliable signal. One without sound goes.
+pub fn finished(dir: &Path, ep: &str, dub: bool) -> Result<bool, String> {
+    match local_episodes(dir).into_iter().find(|(e, _)| e == ep) {
         Some((_, file)) if silent(&file) => {
             let _ = delete_episode(&file);
             Err("no sound, its audio track needs a newer ani-cli".into())
         }
         Some((_, file)) => {
             let _ = edit_index(|all| {
-                if let Some(d) = all.get_mut(&dir) {
+                if let Some(d) = all.get_mut(dir) {
                     d.dub.retain(|f| *f != name(&file));
                     if dub {
                         d.dub.push(name(&file));
                     }
                 }
             });
-            Ok(())
+            Ok(true)
         }
-        None if killed => Err(STOPPED.into()),
-        None => Err(last_error(&stderr)),
+        None => Ok(false),
     }
 }
 
-/// Holds downloads: the running one stops where it is, keeping what it got, and none starts
-/// until `resume`. Only while that's episode `ep` in `dir`, the one the user was asked about
-/// or saw: by the time the answer is handled the next may run, maybe through ffmpeg, which
-/// would start over unasked. False then, and nothing changes.
-pub fn pause(dir: &Path, ep: &str) -> bool {
-    let mut dl = DOWNLOAD.lock().unwrap();
-    if !(dl.1.as_ref()).is_some_and(|(_, d, e)| d == dir && e == ep) {
-        return false;
-    }
-    PAUSED.store(true, Ordering::Relaxed);
-    if let Some((pid, ..)) = dl.1.take() {
-        kill(pid);
-    }
-    true
+/// Reads what a download says on stdout: yt-dlp's status lines, or how far ffmpeg got
+/// (through FAKE_FFMPEG) with the episode's length and its speed.
+#[derive(Default)]
+pub struct Lines {
+    /// the last percentage, for while it retries
+    pct: Option<u32>,
+    length: Option<f64>,
+    speed: Option<f64>,
 }
 
-/// Lets downloads go on after `pause`; the caller wakes the worker. No lock: queue edits call
-/// this, and downloads take the queue's lock under DOWNLOAD's.
-pub fn resume() {
-    PAUSED.store(false, Ordering::Relaxed);
-}
-
-pub fn paused() -> bool {
-    PAUSED.load(Ordering::Relaxed)
-}
-
-/// Stops the running download for good; yt-dlp goes on from its .part files next time,
-/// ffmpeg (FAKE_FFMPEG) starts over. (Closing the terminal needs nothing: the
-/// hangup reaches our whole process group.)
-pub fn stop_download() {
-    let mut dl = DOWNLOAD.lock().unwrap();
-    dl.0 = true;
-    if let Some((pid, ..)) = dl.1.take() {
-        kill(pid);
-    }
-}
-
-/// Stops episodes of the show in `dir`, which the caller took out of the queue first: the
-/// one downloading is killed (the worker deletes what it got once it's gone), the others lose
-/// what earlier tries left. Under the lock downloads start under, so `wanted` keeps the
-/// others from starting and no start finds its folder dropped.
-pub fn stop_episodes(dir: &Path, eps: &[String]) {
-    let mut dl = DOWNLOAD.lock().unwrap();
-    let running = (dl.1.as_ref()).and_then(|(_, d, e)| (d == dir).then(|| e.clone()));
-    if running.as_ref().is_some_and(|e| eps.contains(e))
-        && let Some((pid, ..)) = dl.1.take()
-    {
-        kill(pid);
-    }
-    if ours(dir) {
-        let waiting: Vec<String> = eps
-            .iter()
-            .filter(|e| running.as_ref() != Some(e))
-            .cloned()
-            .collect();
-        discard_parts(dir, &waiting);
-        if running.is_none() {
-            let _ = drop_if_empty(dir);
+impl Lines {
+    /// What line `l` says to show, and whether that's kept after a pause (yt-dlp's is).
+    pub fn read(&mut self, l: &str) -> Option<(String, bool)> {
+        if let Some(line) = l.strip_prefix("[download]") {
+            return ytdlp_progress(line.trim(), &mut self.pct).map(|t| (t, true));
         }
+        if let Some(d) = l.strip_prefix("duration=") {
+            self.length = d.parse().ok().filter(|d: &f64| *d >= 1.0);
+        } else if let Some(x) = l.strip_prefix("speed=") {
+            self.speed = times(x);
+        } else if let Some(t) = l
+            .strip_prefix("out_time=")
+            .filter(|t| t.starts_with(|c: char| c.is_ascii_digit()))
+        {
+            return Some((so_far(t, self.length, self.speed), false));
+        }
+        None
     }
-}
-
-/// Ends an ani-cli download and what it runs.
-fn kill(pid: u32) {
-    let pid = pid.to_string();
-    // The ani-cli shell first: it holds the signal until yt-dlp is gone and then exits.
-    // Signalled after yt-dlp, it falls back to ffmpeg and keeps downloading after we quit.
-    let _ = Command::new("kill").args(["-TERM", &pid]).status();
-    let _ = Command::new("pkill").args(["-TERM", "-P", &pid]).status();
-}
-
-/// Whether downloads were stopped by quitting, so a failed one was cut short, not broken.
-pub fn stopped() -> bool {
-    DOWNLOAD.lock().unwrap().0
 }
 
 /// Whether `pid` is a running ani-hop: its lock in run/ is taken.
@@ -2017,20 +1930,6 @@ mod tests {
         assert!(ok && out.exists());
         assert_eq!(args, format!("-y\n-i\nv.mp4\n{}\n", out.display()));
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_pause_asked_about_one_episode_leaves_the_next_alone() {
-        let dir = Path::new("/tmp/ani-hop-pause-test/Show");
-        let mut sleep = Command::new("sleep").arg("30").spawn().unwrap();
-        DOWNLOAD.lock().unwrap().1 = Some((sleep.id(), dir.to_path_buf(), "2".into()));
-        // asked about 1, which finished; 2 runs now
-        assert!(!pause(dir, "1") && !paused());
-        assert!(DOWNLOAD.lock().unwrap().1.is_some());
-        assert!(pause(dir, "2") && paused());
-        assert!(DOWNLOAD.lock().unwrap().1.is_none());
-        assert!(!sleep.wait().unwrap().success(), "2 was stopped");
-        resume();
     }
 
     #[test]
