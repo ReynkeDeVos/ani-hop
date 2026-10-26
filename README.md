@@ -46,7 +46,7 @@ Restart, open Ubuntu and run the Linux line above. For posters, see the [WSL gui
 
 On other distros the script installs ani-hop, ani-cli and ani-skip, then lists the system packages to install yourself.
 
-With Nix, on NixOS or on Linux and macOS (Apple silicon):
+With Nix, on NixOS or another Linux:
 
 ```sh
 nix profile add github:ReynkeDeVos/ani-hop

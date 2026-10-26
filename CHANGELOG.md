@@ -12,6 +12,10 @@
 - A show that isn't out yet doesn't search ani-cli anymore and doesn't end in a red "no match" error. Its page leaves out "Play episode 1" (also when AniList has no date for it yet) and says "not out yet" on "Episodes…", its episode lists open at once and say "Not out yet", and downloading several shows leaves it out. A list cached before a show started airing says "Airing" for it. When ani-cli finds nothing for a show with only its first episode out, the error says new shows can take a day.
 - The code behind episode progress, downloads, sources, lists and posters is reorganized into one part each, with tests through it. Nothing else changes on screen.
 
+### Removed
+
+- The Nix flake is for Linux only, NixOS and Nix on other distros. On macOS, Homebrew installs ani-hop.
+
 ### Fixed
 
 - "Download unwatched episodes" of a season AniList splits in two, like Attack on Titan Season 3, downloaded the episodes watched in its second part again.

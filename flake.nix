@@ -7,10 +7,10 @@
   outputs =
     { nixpkgs, ... }:
     let
+      # Linux only: macOS has Homebrew
       forAll = nixpkgs.lib.genAttrs [
         "x86_64-linux"
         "aarch64-linux"
-        "aarch64-darwin"
       ];
     in
     {
@@ -18,7 +18,7 @@
         system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          inherit (pkgs) lib stdenv;
+          inherit (pkgs) lib;
           # nixpkgs' wrapper puts its ffmpeg first on ani-cli's PATH, ahead of the ffmpeg
           # ani-hop puts there to download shows whose audio is a separate track
           ani-cli = pkgs.ani-cli.overrideAttrs { installPhase = "install -Dm755 ani-cli $out/bin/ani-cli"; };
@@ -37,31 +37,30 @@
             };
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.makeWrapper ];
-            # the tests stop downloads with pkill, which nixpkgs only has for Linux; on macOS the
-            # one that needs it runs in CI's cargo test, with the system's
-            nativeCheckInputs = lib.optional stdenv.hostPlatform.isLinux pkgs.procps;
-            checkFlags = lib.optional stdenv.hostPlatform.isDarwin "--skip=ani::tests::fake_ffmpeg_renames_only_finished_downloads";
+            # the tests stop downloads with pkill
+            nativeCheckInputs = [ pkgs.procps ];
             # ani-cli's tools as nixpkgs picks them; the player and xdg-open last, so the
             # user's own (an mpv with scripts, say) wins
             postInstall = ''
               wrapProgram $out/bin/ani-hop \
                 --prefix PATH : ${
-                  lib.makeBinPath (
-                    [
-                      ani-cli
-                      pkgs.ani-skip
-                      pkgs.yt-dlp
-                      pkgs.ffmpeg
-                      pkgs.curl
-                      pkgs.curl-impersonate
-                      pkgs.gnugrep
-                      pkgs.gnused
-                    ]
-                    ++ lib.optional stdenv.hostPlatform.isLinux pkgs.procps
-                  )
+                  lib.makeBinPath [
+                    ani-cli
+                    pkgs.ani-skip
+                    pkgs.yt-dlp
+                    pkgs.ffmpeg
+                    pkgs.curl
+                    pkgs.curl-impersonate
+                    pkgs.gnugrep
+                    pkgs.gnused
+                    pkgs.procps
+                  ]
                 } \
                 --suffix PATH : ${
-                  lib.makeBinPath ([ pkgs.mpv ] ++ lib.optional stdenv.hostPlatform.isLinux pkgs.xdg-utils)
+                  lib.makeBinPath [
+                    pkgs.mpv
+                    pkgs.xdg-utils
+                  ]
                 }
             '';
             meta = {
@@ -69,7 +68,7 @@
               homepage = "https://github.com/ReynkeDeVos/ani-hop";
               license = lib.licenses.gpl3Plus;
               mainProgram = "ani-hop";
-              platforms = lib.platforms.unix;
+              platforms = lib.platforms.linux;
             };
           };
         }
