@@ -209,7 +209,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let shimmer = (app.started.elapsed().as_millis() / 30) as usize;
     // what "Continue with" on a show's page plays
     let next = match &app.stack.last().unwrap().view {
-        View::Show(m) => Some(app.next_ep(m).to_string()),
+        View::Show(m) => Some(app.progress(m).next().to_string()),
         _ => None,
     };
     let screen = app.stack.last_mut().unwrap();
@@ -507,12 +507,10 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         | View::Sources(m, ..)
         | View::Input(Input::SourceQuery(m))
         | View::Audio(Some(m))
-        | View::Confirm(
-            Pending::Progress(m, ..)
-            | Pending::Remove(m)
-            | Pending::Stop(m, _)
-            | Pending::Pause(m, _),
-        ) => Some(m.clone()),
+        | View::Confirm(Pending::Remove(m) | Pending::Stop(m, _) | Pending::Pause(m, _)) => {
+            Some(m.clone())
+        }
+        View::Confirm(Pending::Progress(mark)) => Some(mark.entry.clone()),
         _ => None,
     };
     // posters just below the cursor load ahead, so scrolling shows them instantly
@@ -847,7 +845,7 @@ fn media_preview(
 ) -> (bool, bool) {
     // on an episode of a sequel the provider runs on into, it's that sequel's poster, facts,
     // status and description; what's on disk, ani-cli's entry and the episode stay the show's
-    let part = ep.map(|ep| app.part(show, ep).0.clone());
+    let part = ep.map(|ep| app.progress(show).entry(ep).0.clone());
     let part = part.filter(|p| p.id != show.id);
     let m = part.as_ref().unwrap_or(show);
     let (fw, fh) = app.cell;
@@ -907,13 +905,14 @@ fn media_preview(
     lines.extend(status(m));
     // the provider's episodes past the show's own count toward a sequel on AniList; an
     // episode list says so with a rule between them (ui::menu)
-    let parts = if ep.is_none() { app.parts(show) } else { &[] };
+    let run = app.progress(show);
+    let parts = if ep.is_none() { run.parts() } else { &[] };
     for (before, p) in parts {
         let eps = p.episodes.map_or(format!("{}+", before + 1), |n| {
             format!("{}–{}", before + 1, before + n)
         });
         // as the episode list's rule calls it: "Part 2"
-        let name = crate::part_name(show.name(), p.name());
+        let name = run.part_name(p);
         // "Part 2" wraps whole; a long name still wraps, just not before its last word
         let name = match name.rsplit_once(' ') {
             Some((head, last)) => format!("{head}\u{a0}{last}"),
@@ -949,7 +948,7 @@ fn media_preview(
     {
         lines.push("".into());
         // its title and summary only once watched: they give things away, its date doesn't
-        let watched = app.watched(show, ep);
+        let watched = app.progress(show).watched(ep);
         let heading = match watched && !i.title.is_empty() {
             true => format!("Episode {ep} · {}", i.title),
             false => format!("Episode {ep}"),

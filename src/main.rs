@@ -4,11 +4,13 @@ mod ani;
 mod anilist;
 mod kitty;
 mod menu;
+mod progress;
 mod ui;
 
 use ani::Source;
 use anilist::{Client, Entry, EpInfo, Media, PER_PAGE};
 use menu::{Act, Item, Menu};
+use progress::{Mark, Parts, Progress};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
@@ -89,9 +91,8 @@ pub enum Input {
 
 pub enum Pending {
     Delete(Vec<PathBuf>),
-    /// marking an episode watched: the AniList entry that saves it (a sequel's, when the
-    /// provider runs on into it), the progress there, and what to call it if it's a sequel
-    Progress(Media, u32, String),
+    /// marking an episode watched: what Yes saves, as the question says it
+    Progress(Mark),
     /// taking a show off the list, which loses its progress and score
     Remove(Media),
     Quit,
@@ -139,6 +140,9 @@ pub struct Job {
     /// next, so it must not change in between (None in queues of older versions)
     #[serde(default)]
     dub: Option<bool>,
+    /// the show's parts known when it was queued, whose watched episodes `eps: None` skips
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    parts: Parts,
 }
 
 enum Msg {
@@ -167,9 +171,6 @@ enum Msg {
     /// (version, update command) of a newer ani-hop
     Release(Option<(String, String)>),
 }
-
-/// AniList sequels a provider entry runs on into, each with the episodes before it.
-type Parts = Vec<(u32, Media)>;
 
 /// The episode being started or watched.
 pub struct Playing {
@@ -581,11 +582,12 @@ fn is_queued(id: u64, ep: &str) -> bool {
     })
 }
 
-/// What a job without episodes downloads: everything after the AniList progress that
-/// isn't on disk yet.
-fn to_download(m: &Media, eps: &[String], on_disk: &[(String, PathBuf)]) -> Vec<String> {
+/// What a job without episodes downloads: every episode not watched (in its show or the
+/// parts it was queued with) and not on disk yet.
+fn to_download(j: &Job, eps: &[String], on_disk: &[(String, PathBuf)]) -> Vec<String> {
+    let run = Progress::of(&j.media, &j.parts);
     eps.iter()
-        .filter(|e| ani::ep_num(e) > m.progress() as f64)
+        .filter(|e| !run.watched(e))
         .filter(|e| !on_disk.iter().any(|(d, _)| d == *e))
         .cloned()
         .collect()
@@ -647,7 +649,7 @@ fn spawn_downloader(tx: Sender<Msg>) -> Sender<()> {
 /// stopped ones are skipped. Returns at a pause, false once quitting stopped the downloads.
 fn work(job: Job, tx: &Sender<Msg>) -> bool {
     let m = &job.media;
-    let src = match job.source.map_or_else(|| ani::resolve(m), Ok) {
+    let src = match job.source.clone().map_or_else(|| ani::resolve(m), Ok) {
         Ok(s) => s,
         Err(e) => {
             edit_queue(|q| q.retain(|j| j.id != job.id));
@@ -656,7 +658,7 @@ fn work(job: Job, tx: &Sender<Msg>) -> bool {
         }
     };
     let all = (job.eps.is_none())
-        .then(|| to_download(m, &src.episodes, &ani::local_episodes(&ani::folder(m))));
+        .then(|| to_download(&job, &src.episodes, &ani::local_episodes(&ani::folder(m))));
     edit_queue(|q| {
         if let Some(j) = q.iter_mut().find(|j| j.id == job.id) {
             // after a pause it goes on from here, without looking the show up again
@@ -895,7 +897,7 @@ impl App {
             for j in q.iter_mut().filter(|j| j.media.id == m.id) {
                 // a job the worker hasn't looked up yet gets its episodes listed, minus these
                 if let (None, Some(s)) = (&j.eps, src) {
-                    j.eps = Some(to_download(&j.media, &s.episodes, &on_disk));
+                    j.eps = Some(to_download(j, &s.episodes, &on_disk));
                 }
                 if let Some(e) = &mut j.eps {
                     e.retain(|x| !eps.contains(x));
@@ -978,6 +980,7 @@ impl App {
                 source,
                 eps,
                 dub: None,
+                parts: Vec::new(),
             });
         } else if action == "stop" && !stop.is_empty() {
             self.toast(format!("Stopped downloading {}", which(&stop)), false);
@@ -1141,7 +1144,7 @@ impl App {
                 .flat_map(|j| match (&j.eps, src) {
                     (Some(eps), _) => eps.clone(),
                     // not looked up by the worker yet
-                    (None, Some(s)) => to_download(&j.media, &s.episodes, &on_disk),
+                    (None, Some(s)) => to_download(j, &s.episodes, &on_disk),
                     (None, None) => Vec::new(),
                 })
                 .collect()
@@ -1253,36 +1256,15 @@ impl App {
         }
     }
 
-    /// The AniList entry episode `ep` of `m` counts toward, and its number there.
-    fn part<'a>(&'a self, m: &'a Media, ep: &str) -> (&'a Media, String) {
-        part(m, self.parts(m), ep)
-    }
-
-    fn progress_target<'a>(&'a self, m: &'a Media, ep: &str) -> Option<(&'a Media, f64)> {
-        progress_target(m, self.parts(m), ep)
-    }
-
-    pub fn watched(&self, m: &Media, ep: &str) -> bool {
-        watched(m, self.parts(m), ep)
+    /// `m`'s episodes as AniList counts them, with the parts known so far.
+    pub fn progress<'a>(&'a self, m: &'a Media) -> Progress<'a> {
+        Progress::of(m, self.parts(m))
     }
 
     /// What episode `ep` of `m` is called and about.
     pub fn ep_about(&self, m: &Media, ep: &str) -> Option<&EpInfo> {
-        let (p, n) = self.part(m, ep);
+        let (p, n) = self.progress(m).entry(ep);
         self.ep_info.get(&p.id)?.get(&n)
-    }
-
-    /// The episode after the last one watched, also in a sequel the provider runs on into.
-    pub fn next_ep(&self, m: &Media) -> u32 {
-        next_ep(m, self.parts(m))
-    }
-
-    /// Episodes out right now, with those of the sequels the provider runs on into.
-    fn released(&self, m: &Media) -> Option<u32> {
-        match self.parts(m).last() {
-            Some((before, p)) => p.released().map(|r| before + r),
-            None => m.released(),
-        }
     }
 
     /// Frees every poster in the terminal.
@@ -1425,9 +1407,9 @@ impl App {
             View::Show(m) => {
                 let dl = self.downloads(m);
                 let src = self.sources.get(&m.id);
-                let next = self.next_ep(m);
+                let (next, released) = (self.progress(m).next(), self.progress(m).released());
                 let mut v = Vec::new();
-                if self.released(m).is_none_or(|r| next <= r) {
+                if released.is_none_or(|r| next <= r) {
                     let verb = if next > 1 { "Continue with" } else { "Play" };
                     let on_disk = (dl.on_disk.iter()).any(|(e, _)| ani::ep_num(e) == next as f64);
                     v.push(Item::new(
@@ -1479,22 +1461,18 @@ impl App {
             }
             View::Episodes(m, mode) => {
                 let dl = self.downloads(m);
-                let parts = self.parts(m);
+                let run = self.progress(m);
                 // what a watched episode is called and about; nothing that spoils the rest
                 let item = |key: &str, ep: &str, hint: String| {
                     let mut it = Item::new(key, format!("Episode {ep}"), hint);
-                    let (p, n) = part(m, parts, ep);
-                    it.done = watched(m, parts, ep);
-                    let info = self.ep_info.get(&p.id).and_then(|i| i.get(&n));
-                    if let Some(i) = info.filter(|_| it.done) {
+                    it.done = run.watched(ep);
+                    if let Some(i) = self.ep_about(m, ep).filter(|_| it.done) {
                         if !i.title.is_empty() {
                             it.label = format!("{} · {}", it.label, i.title);
                         }
                         it.about = i.about.clone();
                     }
-                    if p.id != m.id {
-                        it.group = part_name(m.name(), p.name()).to_string();
-                    }
+                    it.group = run.group(ep).to_string();
                     it
                 };
                 // also what the provider no longer lists, so it can still be played or deleted
@@ -1628,15 +1606,13 @@ impl App {
                 Item::new("no", "No", "deletes partial files"),
                 Item::new("yes", "Yes", ""),
             ],
-            View::Confirm(Pending::Progress(m, ep, part)) => {
-                // what it saves, as that can be the entry's last (the second half of a
-                // special) or a sequel's, and the list it puts the entry on
-                let total = m.episodes.map_or("?".into(), |t| t.to_string());
-                let mut hint = format!("saves {ep}/{total}");
-                if !part.is_empty() {
-                    hint += &format!(" to {part}");
-                }
-                vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
+            // what it saves, as that can be the entry's last (the second half of a special)
+            // or a part's
+            View::Confirm(Pending::Progress(mark)) => {
+                vec![
+                    Item::new("no", "No", ""),
+                    Item::new("yes", "Yes", mark.hint()),
+                ]
             }
             View::Confirm(Pending::Stop(m, eps)) => {
                 let hint = deletes(&ani::parts(&ani::folder(m), eps));
@@ -1767,7 +1743,8 @@ impl App {
                     EpMode::Download => self.dl_act(m, keys, None),
                     EpMode::Watched => {
                         let title = format!("Watched up to episode {key} of {}?", m.name());
-                        self.ask_progress(&m, &key, title);
+                        let mark = self.progress(&m).mark(&key);
+                        self.ask_progress(&key, mark, title);
                     }
                 }
             }
@@ -1819,12 +1796,14 @@ impl App {
                 if key == "download" {
                     let shows = plural(list.len(), "show");
                     for m in list {
+                        let parts = self.parts(&m).to_vec();
                         self.download(Job {
                             id: 0,
                             media: m,
                             source: None,
                             eps: None,
                             dub: None,
+                            parts,
                         });
                     }
                     self.toast(format!("Queued {shows}, looking up their episodes…"), false);
@@ -1948,19 +1927,19 @@ impl App {
                         self.saves_pending += 1;
                         self.spawn(move || Msg::Saved(m, c.remove(entry).map(|_| None)));
                     }
-                    Pending::Progress(m, ep, _) => {
-                        let (m, ep, c) = (m.clone(), *ep, self.client.clone());
-                        let status = progress_status(&m, ep);
+                    Pending::Progress(k) => {
+                        let (k, c) = (k.clone(), self.client.clone());
                         self.saves_pending += 1;
-                        // the question showed `m`'s progress; Yes mustn't undo a save it didn't
-                        // know of (an old copy: a cached list, the episode's start, a late lookup)
-                        self.spawn(
-                            move || match c.save_progress(m.id, status, m.progress(), ep) {
+                        // the question showed `was`; Yes mustn't undo a save it didn't know of
+                        // (an old copy: a cached list, the episode's start, a late lookup)
+                        self.spawn(move || {
+                            let m = k.entry;
+                            match c.save_progress(m.id, k.status, k.was, k.to) {
                                 Ok(Ok(entry)) => Msg::Saved(m, Ok(Some(entry))),
                                 Ok(Err(now)) => Msg::Moved(m, now),
                                 Err(e) => Msg::Saved(m, Err(e)),
-                            },
-                        );
+                            }
+                        });
                         self.pop(1);
                     }
                 }
@@ -2121,7 +2100,7 @@ impl App {
 
     fn show_action(&mut self, m: Media, key: &str) {
         match key {
-            "next" => self.play(m.clone(), self.next_ep(&m).to_string()),
+            "next" => self.play(m.clone(), self.progress(&m).next().to_string()),
             "play" => self.resolve(&m, Some(Want::Episodes(EpMode::Play))),
             // what's on disk can be deleted before ani-cli answers, or without it
             "download"
@@ -2181,39 +2160,27 @@ impl App {
         });
     }
 
-    /// Asks before saving the AniList progress up to `ep`. AniList keeps a count, not single
-    /// episodes, so Yes is preselected only when that changes no other episode.
-    fn ask_progress(&mut self, m: &Media, ep: &str, title: String) {
-        let Some((p, n)) = self.progress_target(m, ep) else {
+    /// Asks before saving the AniList progress up to `ep`, as `mark` would. AniList keeps a
+    /// count, not single episodes, so Yes goes first only when that changes no other episode.
+    fn ask_progress(&mut self, ep: &str, mark: Option<Mark>, title: String) {
+        let Some(mark) = mark else {
             return self.toast(
                 format!("Episode {ep} isn't a number AniList can count"),
                 true,
             );
         };
-        let part = match p.id == m.id {
-            true => String::new(),
-            false => part_name(m.name(), p.name()).to_string(),
-        };
-        let only_this = recounts(p.progress(), n as u32).is_none();
         // what else Yes changes goes in the question, which wraps; a hint would be cut
-        let also = [recounts(p.progress(), n as u32), list_move(p, n as u32)];
-        let also = also.into_iter().flatten().collect::<Vec<_>>().join(" and ");
-        let title = match also.split_at_checked(1) {
-            Some((first, rest)) => format!("{title} {}{rest}.", first.to_uppercase()),
-            None => title,
-        };
-        let ask = Pending::Progress(p.clone(), n as u32, part);
-        self.push(title, View::Confirm(ask));
-        self.top()
-            .menu
-            .select_key(if only_this { "yes" } else { "no" });
+        let title = format!("{title} {}", mark.also()).trim_end().to_string();
+        let first = if mark.only_this() { "yes" } else { "no" };
+        self.push(title, View::Confirm(Pending::Progress(mark)));
+        self.top().menu.select_key(first);
     }
 
     fn fulfill(&mut self, m: Media, want: Want) {
         match want {
             Want::Play(ep) => self.play(m, ep),
             Want::Episodes(mode) => {
-                let next = self.next_ep(&m).to_string();
+                let next = self.progress(&m).next().to_string();
                 let title = match mode {
                     EpMode::Play => "Episodes",
                     EpMode::Download => "Downloads",
@@ -2597,14 +2564,13 @@ impl App {
                 {
                     self.playing = None;
                 }
-                // not watched yet, as far as the show or the sequel it's in goes
-                let ask = (self.progress_target(&m, &ep))
-                    .is_some_and(|(p, n)| !m.watched(&ep) && n > p.progress() as f64);
+                // not watched yet, as far as the show or the part it's in goes
+                let mark = self.progress(&m).unwatched(&ep);
                 match res {
                     Err(e) => self.toast(format!("Couldn't play episode {ep} · {e}"), true),
-                    Ok(()) if ask && self.user.is_some() && m.on_anilist() => {
+                    Ok(()) if mark.is_some() && self.user.is_some() && m.on_anilist() => {
                         let title = format!("Mark episode {ep} of {} as watched?", m.name());
-                        self.ask_progress(&m, &ep, title);
+                        self.ask_progress(&ep, mark, title);
                     }
                     Ok(()) => {}
                 }
@@ -2668,98 +2634,6 @@ fn megabytes<'a>(files: impl IntoIterator<Item = &'a PathBuf>) -> String {
     format!("{} MB", bytes >> 20)
 }
 
-/// The AniList entry episode `ep` of `m` counts toward, and its number there: past `m`'s
-/// own episodes it's in one of the sequels `parts` (each with the episodes before it).
-fn part<'a>(m: &'a Media, parts: &'a [(u32, Media)], ep: &str) -> (&'a Media, String) {
-    let n = ani::ep_num(ep);
-    // a recap 12.5 comes after 12, so it's the 12-episode part's
-    match parts
-        .iter()
-        .rev()
-        .find(|(before, _)| n.floor() > *before as f64)
-    {
-        Some((before, p)) => (p, (n - *before as f64).to_string()),
-        None => (m, ep.to_string()),
-    }
-}
-
-/// What sets a part's name apart from its show's: "Part 2" of "Attack on Titan Season 3
-/// Part 2", or all of it.
-fn part_name<'a>(show: &str, part: &'a str) -> &'a str {
-    let rest = part
-        .strip_prefix(show)
-        .map(|r| r.trim_start_matches([' ', ':', '-']));
-    rest.filter(|r| !r.is_empty()).unwrap_or(part)
-}
-
-/// Up to its show's progress (which ran past its episodes before sequels counted) or its
-/// part's.
-fn watched(m: &Media, parts: &[(u32, Media)], ep: &str) -> bool {
-    let (p, n) = part(m, parts, ep);
-    m.watched(ep) || p.watched(&n)
-}
-
-/// The AniList entry that marking episode `ep` of `m` watched saves to, and the progress
-/// there: never past that entry's episodes, which AniList would keep as progress like
-/// 13/12. An episode after them (the second half of a special the provider splits in two,
-/// an extra, one of a sequel not looked up yet) saves the entry's last. None for one that
-/// isn't a number.
-fn progress_target<'a>(
-    m: &'a Media,
-    parts: &'a [(u32, Media)],
-    ep: &str,
-) -> Option<(&'a Media, f64)> {
-    ep.parse::<f64>().ok()?;
-    let (p, n) = part(m, parts, ep);
-    let n = ani::ep_num(&n);
-    Some((p, p.episodes.map_or(n, |e| n.min(e as f64))))
-}
-
-/// The episode after the last one watched. It goes on into a part once everything before
-/// it is, so rewatching the first part doesn't skip to the end of a finished second one.
-fn next_ep(m: &Media, parts: &[(u32, Media)]) -> u32 {
-    let mut next = m.progress() + 1;
-    for (before, p) in parts {
-        if next > *before {
-            next = next.max(before + p.progress() + 1);
-        }
-    }
-    next
-}
-
-/// What saving progress `to` over `from` does to the episodes between, since AniList counts
-/// every one up to the progress as watched.
-fn recounts(from: u32, to: u32) -> Option<String> {
-    let span = |a: u32, b: u32| match a == b {
-        true => a.to_string(),
-        false => format!("{a}–{b}"),
-    };
-    match to {
-        _ if to > from + 1 => Some(format!("also marks {}", span(from + 1, to - 1))),
-        _ if to < from => Some(format!("unmarks {}", span(to + 1, from))),
-        _ => None,
-    }
-}
-
-/// The list a show moves to when episode `ep` is marked watched, if it does.
-fn list_move(m: &Media, ep: u32) -> Option<String> {
-    let to = progress_status(m, ep);
-    match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
-        Some(s) if s == to => None,
-        Some(_) => Some(format!("moves it to {}", list_label(to))),
-        None => Some(format!("adds it to {}", list_label(to))),
-    }
-}
-
-/// The list a show is on once episode `ep` is marked watched.
-fn progress_status(m: &Media, ep: u32) -> &'static str {
-    match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
-        _ if m.episodes == Some(ep) => "COMPLETED",
-        Some("REPEATING") => "REPEATING",
-        _ => "CURRENT",
-    }
-}
-
 pub fn list_label(status: &str) -> &'static str {
     LISTS
         .iter()
@@ -2810,109 +2684,6 @@ mod tests {
     }
 
     #[test]
-    fn watching_an_episode_picks_the_list() {
-        let mut m = super::Media {
-            episodes: Some(12),
-            ..Default::default()
-        };
-        assert_eq!(
-            super::progress_status(&m, 3),
-            "CURRENT",
-            "not on a list yet"
-        );
-        assert_eq!(super::progress_status(&m, 12), "COMPLETED");
-        let entry = |status: &str| super::Entry {
-            id: 1,
-            status: status.into(),
-            progress: 2,
-        };
-        m.media_list_entry = Some(entry("REPEATING"));
-        assert_eq!(super::progress_status(&m, 3), "REPEATING");
-        m.media_list_entry = Some(entry("PAUSED"));
-        assert_eq!(super::progress_status(&m, 3), "CURRENT");
-    }
-
-    #[test]
-    fn says_what_a_jump_in_progress_counts() {
-        assert_eq!(super::recounts(5, 6), None); // the next one
-        assert_eq!(super::recounts(5, 5), None);
-        assert_eq!(super::recounts(5, 7).unwrap(), "also marks 6");
-        assert_eq!(super::recounts(0, 1180).unwrap(), "also marks 1–1179");
-        assert_eq!(super::recounts(1180, 5).unwrap(), "unmarks 6–1180");
-        assert_eq!(super::recounts(6, 5).unwrap(), "unmarks 6");
-    }
-
-    #[test]
-    fn episodes_past_a_split_season_count_toward_its_sequel() {
-        let entry = |progress| {
-            Some(super::Entry {
-                id: 1,
-                status: "CURRENT".into(),
-                progress,
-            })
-        };
-        let show = |id, episodes, progress| super::Media {
-            id,
-            episodes: Some(episodes),
-            media_list_entry: entry(progress),
-            ..Default::default()
-        };
-        // Attack on Titan Season 3 at ani-cli: 22 episodes, 12 and 10 on AniList
-        let (s3, parts) = (show(1, 12, 12), [(12, show(2, 10, 3))]);
-        let at = |ep: &str| {
-            let (m, n) = super::part(&s3, &parts, ep);
-            (m.id, n)
-        };
-        assert_eq!(at("5"), (1, "5".into()));
-        assert_eq!(at("12.5"), (1, "12.5".into()), "a recap stays where it was");
-        assert_eq!(at("13"), (2, "1".into()));
-        assert_eq!(at("22"), (2, "10".into()));
-        assert_eq!(super::part(&s3, &[], "13").1, "13", "no sequels known");
-        let (m, n) = super::part(&s3, &parts, "15");
-        assert!(m.watched(&n) && !super::part(&s3, &parts, "16").0.watched("4"));
-        // nothing saves past an entry's episodes, as while its sequel is looked up: after
-        // them it's the entry's last
-        let save = |parts: &[(u32, super::Media)], ep| {
-            super::progress_target(&s3, parts, ep).map(|(m, n)| (m.id, n))
-        };
-        assert_eq!(save(&parts, "13"), Some((2, 1.0)));
-        assert_eq!(save(&parts, "12.5"), Some((1, 12.0)));
-        assert_eq!(
-            save(&[], "13"),
-            Some((1, 12.0)),
-            "the show's last, not 13/12"
-        );
-        assert_eq!(save(&parts, "23"), Some((2, 10.0)), "Part 2's last");
-        assert_eq!(save(&parts, "SP"), None);
-        let short = |part| super::part_name("Attack on Titan Season 3", part);
-        assert_eq!(short("Attack on Titan Season 3 Part 2"), "Part 2");
-        assert_eq!(
-            short("Attack on Titan Season 3"),
-            "Attack on Titan Season 3"
-        );
-        assert_eq!(short("The Final Season"), "The Final Season");
-        // a one-episode special ani-cli has in two halves
-        let special = show(3, 1, 0);
-        let second_half = super::progress_target(&special, &[], "2").map(|(m, n)| (m.id, n));
-        assert_eq!(second_half, Some((3, 1.0)));
-        let airing = super::Media::default();
-        assert!(
-            super::progress_target(&airing, &[], "13").is_some(),
-            "no count yet"
-        );
-        let next = |own, second| super::next_ep(&show(1, 12, own), &[(12, show(2, 10, second))]);
-        assert_eq!(next(12, 3), 16);
-        assert_eq!(next(12, 0), 13);
-        assert_eq!(next(3, 10), 4, "rewatching the first part");
-        assert_eq!(
-            next(22, 0),
-            23,
-            "progress saved past 12 before sequels counted"
-        );
-        assert_eq!(next(12, 10), 23);
-    }
-
-    #[test]
     fn a_paused_download_says_how_far_it_got() {
         assert_eq!(
             super::got_so_far("45.3% of ~ 529.62MiB at 4.9MiB/s ETA 01:23").as_deref(),
@@ -2939,17 +2710,32 @@ mod tests {
         let (get, stop, delete) = dl.split(&s(&["1", "2", "3", "4"]));
         assert_eq!((get, stop), (s(&["4"]), s(&["2"])));
         assert_eq!(delete, [("1".to_string(), file.clone())]);
-        // a whole-show job takes what's after the progress and not on disk
-        let m = super::Media {
+        // a whole-show job takes what's unwatched and not on disk, in its parts too
+        let watching = |id, episodes, progress| super::Media {
+            id,
+            episodes: Some(episodes),
             media_list_entry: Some(super::Entry {
-                id: 1,
+                id,
                 status: "CURRENT".into(),
-                progress: 1,
+                progress,
             }),
             ..Default::default()
         };
+        let mut job = super::Job {
+            id: 0,
+            media: watching(1, 3, 1),
+            source: None,
+            eps: None,
+            dub: None,
+            parts: Vec::new(),
+        };
         let all = s(&["1", "2", "3", "3.5"]);
         let on_disk = [("3".to_string(), file)];
-        assert_eq!(super::to_download(&m, &all, &on_disk), s(&["2", "3.5"]));
+        assert_eq!(super::to_download(&job, &all, &on_disk), s(&["2", "3.5"]));
+        // Attack on Titan Season 3 at 12/12, its Part 2 at 3/10
+        job.media = watching(1, 12, 12);
+        job.parts = vec![(12, watching(2, 10, 3))];
+        let all: Vec<String> = (1..=22).map(|e| e.to_string()).collect();
+        assert_eq!(super::to_download(&job, &all, &[]), all[15..]);
     }
 }
