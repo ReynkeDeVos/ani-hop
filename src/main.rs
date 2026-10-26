@@ -1250,11 +1250,8 @@ impl App {
         progress_target(m, self.parts(m), ep)
     }
 
-    /// Up to its show's progress (which ran past its episodes before sequels counted) or
-    /// its part's.
     pub fn watched(&self, m: &Media, ep: &str) -> bool {
-        let (p, n) = self.part(m, ep);
-        m.watched(ep) || p.watched(&n)
+        watched(m, self.parts(m), ep)
     }
 
     /// What episode `ep` of `m` is called and about.
@@ -1458,15 +1455,21 @@ impl App {
             }
             View::Episodes(m, mode) => {
                 let dl = self.downloads(m);
+                let parts = self.parts(m);
                 // what a watched episode is called and about; nothing that spoils the rest
                 let item = |key: &str, ep: &str, hint: String| {
                     let mut it = Item::new(key, format!("Episode {ep}"), hint);
-                    it.done = self.watched(m, ep);
-                    if let Some(i) = self.ep_about(m, ep).filter(|_| it.done) {
+                    let (p, n) = part(m, parts, ep);
+                    it.done = watched(m, parts, ep);
+                    let info = self.ep_info.get(&p.id).and_then(|i| i.get(&n));
+                    if let Some(i) = info.filter(|_| it.done) {
                         if !i.title.is_empty() {
                             it.label = format!("{} · {}", it.label, i.title);
                         }
                         it.about = i.about.clone();
+                    }
+                    if p.id != m.id {
+                        it.group = part_name(m.name(), p.name()).to_string();
                     }
                     it
                 };
@@ -2600,17 +2603,36 @@ fn part<'a>(m: &'a Media, parts: &'a [(u32, Media)], ep: &str) -> (&'a Media, St
     }
 }
 
-/// The AniList entry that marking episode `ep` of `m` watched saves to, and as which
-/// episode. None past that entry's episodes, which AniList would take as progress like
-/// 13/12: one the provider has extra, or in a sequel that isn't looked up (yet).
+/// What sets a part's name apart from its show's: "Part 2" of "Attack on Titan Season 3
+/// Part 2", or all of it.
+fn part_name<'a>(show: &str, part: &'a str) -> &'a str {
+    let rest = part
+        .strip_prefix(show)
+        .map(|r| r.trim_start_matches([' ', ':', '-']));
+    rest.filter(|r| !r.is_empty()).unwrap_or(part)
+}
+
+/// Up to its show's progress (which ran past its episodes before sequels counted) or its
+/// part's.
+fn watched(m: &Media, parts: &[(u32, Media)], ep: &str) -> bool {
+    let (p, n) = part(m, parts, ep);
+    m.watched(ep) || p.watched(&n)
+}
+
+/// The AniList entry that marking episode `ep` of `m` watched saves to, and the progress
+/// there: never past that entry's episodes, which AniList would keep as progress like
+/// 13/12. An episode after them (the second half of a special the provider splits in two,
+/// an extra, one of a sequel not looked up yet) saves the entry's last. None for one that
+/// isn't a number.
 fn progress_target<'a>(
     m: &'a Media,
     parts: &'a [(u32, Media)],
     ep: &str,
 ) -> Option<(&'a Media, f64)> {
+    ep.parse::<f64>().ok()?;
     let (p, n) = part(m, parts, ep);
     let n = ani::ep_num(&n);
-    (p.episodes.is_none_or(|e| n.floor() <= e as f64)).then_some((p, n))
+    Some((p, p.episodes.map_or(n, |e| n.min(e as f64))))
 }
 
 /// The episode after the last one watched. It goes on into a part once everything before
@@ -2734,15 +2756,31 @@ mod tests {
         assert_eq!(super::part(&s3, &[], "13").1, "13", "no sequels known");
         let (m, n) = super::part(&s3, &parts, "15");
         assert!(m.watched(&n) && !super::part(&s3, &parts, "16").0.watched("4"));
-        // nothing saves past an entry's episodes, as while its sequel is looked up
+        // nothing saves past an entry's episodes, as while its sequel is looked up: after
+        // them it's the entry's last
         let save = |parts: &[(u32, super::Media)], ep| {
             super::progress_target(&s3, parts, ep).map(|(m, n)| (m.id, n))
         };
         assert_eq!(save(&parts, "13"), Some((2, 1.0)));
-        assert_eq!(save(&parts, "12.5"), Some((1, 12.5)));
-        assert_eq!(save(&[], "13"), None);
-        assert_eq!(save(&parts, "23"), None, "past Part 2 too");
+        assert_eq!(save(&parts, "12.5"), Some((1, 12.0)));
+        assert_eq!(
+            save(&[], "13"),
+            Some((1, 12.0)),
+            "the show's last, not 13/12"
+        );
+        assert_eq!(save(&parts, "23"), Some((2, 10.0)), "Part 2's last");
         assert_eq!(save(&parts, "SP"), None);
+        let short = |part| super::part_name("Attack on Titan Season 3", part);
+        assert_eq!(short("Attack on Titan Season 3 Part 2"), "Part 2");
+        assert_eq!(
+            short("Attack on Titan Season 3"),
+            "Attack on Titan Season 3"
+        );
+        assert_eq!(short("The Final Season"), "The Final Season");
+        // a one-episode special ani-cli has in two halves
+        let special = show(3, 1, 0);
+        let second_half = super::progress_target(&special, &[], "2").map(|(m, n)| (m.id, n));
+        assert_eq!(second_half, Some((3, 1.0)));
         let airing = super::Media::default();
         assert!(
             super::progress_target(&airing, &[], "13").is_some(),

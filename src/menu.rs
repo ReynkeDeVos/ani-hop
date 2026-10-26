@@ -16,6 +16,8 @@ pub struct Item {
     pub about: String,
     /// a command like "More…", not something to pick: can't be marked, isn't counted
     pub action: bool,
+    /// rows of another group start under a faint rule naming it (a sequel's episodes)
+    pub group: String,
 }
 
 impl Item {
@@ -27,6 +29,7 @@ impl Item {
             done: false,
             about: String::new(),
             action: false,
+            group: String::new(),
         }
     }
 }
