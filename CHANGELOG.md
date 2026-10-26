@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.11 – 2026-10-26
+
+### Changed
+
+- On an episode of a season's second part, like episode 13 of Attack on Titan Season 3, the preview shows that part: its poster, title, facts, list status and description. Its episodes' summaries still stay hidden until watched. The line saying which episodes are the second part's is only on the show's page now, since the episode list's "Part 2" line says it there.
+
 ## 0.6.10 – 2026-10-26
 
 ### Changed

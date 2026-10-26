@@ -514,6 +514,8 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
                 .filter_map(|(i, _)| list.get(*i).cloned())
                 .collect()
         }
+        // and the sequels an episode list runs on into, whose posters its episodes show
+        View::Episodes(m, _) => app.parts(m).iter().map(|(_, p)| p.clone()).collect(),
         _ => Vec::new(),
     };
     // episode titles load while the show is open, so its episode list has them right away
@@ -721,9 +723,14 @@ fn media_preview(
     app: &mut App,
     f: &mut Frame,
     area: Rect,
-    m: &Media,
+    show: &Media,
     ep: Option<&str>,
 ) -> (bool, bool) {
+    // on an episode of a sequel the provider runs on into, it's that sequel's poster, facts,
+    // status and description; what's on disk, ani-cli's entry and the episode stay the show's
+    let part = ep.map(|ep| app.part(show, ep).0.clone());
+    let part = part.filter(|p| p.id != show.id);
+    let m = part.as_ref().unwrap_or(show);
     let (fw, fh) = app.cell;
     let rows = (area.height * 3 / 5).clamp(6, 26).min(area.height);
     let cols = ((rows as f32 * fh as f32 * 0.7) / fw.max(1) as f32).round() as u16;
@@ -815,10 +822,10 @@ fn media_preview(
         Some(Line::styled(line, Color::Green))
     };
     lines.extend(status(m));
-    // the provider's episodes past the show's own count toward a sequel on AniList; on an
-    // episode, only the sequel it counts toward shows its progress, under the line naming it
-    let at = ep.map(|ep| app.part(m, ep).0.id);
-    for (before, p) in app.parts(m) {
+    // the provider's episodes past the show's own count toward a sequel on AniList; an
+    // episode list says so with a rule between them (ui::menu)
+    let parts = if ep.is_none() { app.parts(show) } else { &[] };
+    for (before, p) in parts {
         let eps = p.episodes.map_or(format!("{}+", before + 1), |n| {
             format!("{}–{}", before + 1, before + n)
         });
@@ -826,9 +833,7 @@ fn media_preview(
             format!("Episodes\u{a0}{eps} are {}", p.name()),
             DIM,
         ));
-        if at.is_none_or(|id| id == p.id) {
-            lines.extend(status(p));
-        }
+        lines.extend(status(p));
     }
     if let Some(a) = &m.next_airing_episode {
         lines.push(Line::from(format!(
@@ -837,11 +842,11 @@ fn media_preview(
             duration(a.time_until_airing)
         )));
     }
-    let local = app.local.get(&m.id).map_or(0, Vec::len);
+    let local = app.local.get(&show.id).map_or(0, Vec::len);
     if local > 0 {
         lines.push(Line::from(format!("↓ {local} on disk")));
     }
-    if let Some(s) = app.sources.get(&m.id) {
+    if let Some(s) = app.sources.get(&show.id) {
         lines.push(Line::styled(
             format!("ani-cli: {} · {}\u{a0}episodes", s.title, s.episodes.len()),
             DIM,
@@ -849,10 +854,10 @@ fn media_preview(
     }
     let mut about = "";
     if let Some(ep) = ep
-        && let Some(i) = app.ep_about(m, ep)
+        && let Some(i) = app.ep_about(show, ep)
     {
         lines.push("".into());
-        if app.watched(m, ep) {
+        if app.watched(show, ep) {
             let title = [format!("Episode {ep}"), i.title.clone()];
             let title = title
                 .into_iter()
