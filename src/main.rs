@@ -4,13 +4,15 @@ mod ani;
 mod anilist;
 mod downloads;
 mod kitty;
+mod lists;
 mod menu;
 mod progress;
 mod source;
 mod ui;
 
-use anilist::{Client, Entry, EpInfo, Media, PER_PAGE};
+use anilist::{Client, Entry, EpInfo, Media};
 use downloads::{AniCli, Job, Queue};
+use lists::{Feed, List};
 use menu::{Act, Item, Menu};
 use progress::{Mark, Parts, Progress};
 use ratatui::crossterm::event::{
@@ -26,7 +28,7 @@ use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -56,7 +58,7 @@ pub enum View {
     Setup,
     /// switches and the AniList login
     Settings,
-    Shows(Vec<Media>, Feed),
+    Shows(List),
     /// audio picker for a show, or the default (None)
     Audio(Option<Media>),
     Show(Media),
@@ -68,17 +70,6 @@ pub enum View {
     DlChoice(Media, Vec<String>),
     Confirm(Pending),
     Input(Input),
-}
-
-/// Where a list of shows comes from.
-pub enum Feed {
-    /// the download folder, rescanned on refresh
-    Local,
-    /// an AniList list or search, all at once
-    Whole,
-    /// an AniList ranking (MediaSort) in pages: the next page if there is one, and whether
-    /// it's on its way (the first page may refresh on its own, without "More…")
-    Pages(String, Option<u32>, bool),
 }
 
 #[derive(Clone)]
@@ -128,8 +119,8 @@ enum Want {
 }
 
 enum Msg {
-    /// a list's shows, and where to cache them with LIST_CHANGES from when it was asked for
-    Shows(u64, Result<Vec<Media>, String>, Option<(PathBuf, u64)>),
+    /// a list's refreshed shows
+    Shows(u64, Result<Vec<Media>, String>, lists::Ask),
     /// the next page of a ranking
     More(u64, Result<Vec<Media>, String>),
     Hits(u64, Result<Vec<String>, String>),
@@ -379,9 +370,6 @@ fn run_in_terminal(cmd: &str) {
     let _ = std::io::stdin().read_line(&mut String::new());
 }
 
-/// Bumped on every list change, so refreshes that started before it don't count as fresh.
-static LIST_CHANGES: AtomicU64 = AtomicU64::new(0);
-
 fn token_path() -> PathBuf {
     ani::config_dir().join("token")
 }
@@ -389,36 +377,6 @@ fn token_path() -> PathBuf {
 /// Last known (id, name, english titles) of the viewer, so lists show from the first frame.
 fn user_path() -> PathBuf {
     ani::config_dir().join("user.json")
-}
-
-fn list_cache(key: &str) -> PathBuf {
-    ani::cache_dir().join("lists").join(format!("{key}.json"))
-}
-
-/// A cached list: its shows and, for a ranking, the page "More…" fetches next.
-type Cached = (Vec<Media>, Option<u32>);
-
-/// What a cached list shows when it opens, and whether that's fresh enough to skip AniList.
-/// A ranking hardly moves in an hour and keeps every page loaded; a list of yours changes as
-/// you watch, so 2 minutes. Past that only the first page shows, which the refresh replaces.
-fn from_cache(
-    cached: Option<Cached>,
-    age: Option<Duration>,
-    feed: &mut Feed,
-) -> (Vec<Media>, bool) {
-    let ttl = match feed {
-        Feed::Pages(..) => 60 * 60,
-        _ => 120,
-    };
-    let fresh = cached.is_some() && age.is_some_and(|a| a < Duration::from_secs(ttl));
-    let (mut list, next) = cached.unwrap_or_default();
-    if let Feed::Pages(_, n, _) = feed {
-        match fresh {
-            true => *n = next,
-            false => list.truncate(PER_PAGE),
-        }
-    }
-    (list, fresh)
 }
 
 fn client_id() -> Option<String> {
@@ -818,23 +776,18 @@ impl App {
     fn push_loading(
         &mut self,
         title: &str,
-        mut feed: Feed,
+        feed: Feed,
         cache: Option<String>,
         f: impl FnOnce() -> Result<Vec<Media>, String> + Send + 'static,
     ) {
-        let path = cache.map(|k| list_cache(&k));
-        let cached: Option<Cached> = path.as_ref().and_then(|p| ani::read_json(p));
-        let age = path
-            .as_ref()
-            .and_then(|p| fs::metadata(p).ok()?.modified().ok()?.elapsed().ok());
-        let (list, fresh) = from_cache(cached, age, &mut feed);
-        let id = self.push(title, View::Shows(list, feed));
-        if fresh {
+        let cache = cache.map(|k| lists::cache(&k));
+        let (list, ask) = List::open(feed, cache, std::time::SystemTime::now());
+        let id = self.push(title, View::Shows(list));
+        let Some(ask) = ask else {
             return;
-        }
+        };
         self.top().loading = true;
-        let cache = path.map(|p| (p, LIST_CHANGES.load(Ordering::Relaxed)));
-        self.spawn(move || Msg::Shows(id, f(), cache));
+        self.spawn(move || Msg::Shows(id, f(), ask));
     }
 
     fn pop(&mut self, n: usize) {
@@ -857,8 +810,10 @@ impl App {
     /// Rebuilds the visible menu from current state (keeps query and cursor).
     fn refresh(&mut self) {
         self.scan_local();
-        if let View::Shows(list, Feed::Local) = &mut self.top().view {
-            *list = ani::local_shows().into_iter().map(|(m, _)| m).collect();
+        if let View::Shows(list) = &mut self.top().view
+            && list.is_local()
+        {
+            list.shows = ani::local_shows().into_iter().map(|(m, _)| m).collect();
         }
         let items = self.items(&self.stack.last().unwrap().view);
         // a chooser whose action under the cursor went (the episode finished, say), or a pause
@@ -974,7 +929,7 @@ impl App {
         if self.parts.get(&m.id).is_none_or(|p| p.0 != key) {
             self.parts.insert(m.id, (key, Vec::new()));
             let (m, c) = (m.clone(), self.client.clone());
-            let asked = (c.token.clone(), LIST_CHANGES.load(Ordering::Relaxed));
+            let asked = (c.token.clone(), lists::changes());
             self.spawn(move || {
                 let parts = c.parts(&m, key.0);
                 Msg::Parts(m.id, key, asked.0, asked.1, parts)
@@ -1115,9 +1070,8 @@ impl App {
                 v.push(Item::new("continue", "Continue", ""));
                 v
             }
-            View::Shows(list, feed) => {
-                let mut v: Vec<Item> = list
-                    .iter()
+            View::Shows(list) => {
+                let mut v: Vec<Item> = (list.shows.iter())
                     .map(|m| {
                         let mut hint = Vec::new();
                         if let Some(n) = self.local.get(&m.id).map(Vec::len).filter(|n| *n > 0) {
@@ -1136,8 +1090,8 @@ impl App {
                         Item::new(m.id.to_string(), m.name(), hint.join(" · "))
                     })
                     .collect();
-                if let Feed::Pages(_, Some(page), _) = feed
-                    && !list.is_empty()
+                if let Some(page) = list.more_page()
+                    && !list.shows.is_empty()
                 {
                     let mut more = Item::new("more", "More…", format!("page {page}"));
                     more.action = true;
@@ -1459,15 +1413,19 @@ impl App {
                 _ => self.pop(1),
             },
             // marked shows don't count here, "More…" is what the cursor is on
-            View::Shows(_, Feed::Pages(..))
-                if screen.menu.current().is_some_and(|i| i.key == "more") =>
+            View::Shows(list)
+                if list.paged() && screen.menu.current().is_some_and(|i| i.key == "more") =>
             {
                 self.more()
             }
-            View::Shows(list, _) => {
+            View::Shows(list) => {
                 let picked: Vec<Media> = keys
                     .iter()
-                    .filter_map(|k| list.iter().find(|m| m.id.to_string() == *k).cloned())
+                    .filter_map(|k| {
+                        (list.shows.iter())
+                            .find(|m| m.id.to_string() == *k)
+                            .cloned()
+                    })
                     .collect();
                 // marks stay until the bulk action runs, so esc from it keeps them
                 if picked.len() > 1 {
@@ -1674,25 +1632,20 @@ impl App {
 
     /// Fetches the next page of the ranking on top, as "More…" and ^f do.
     fn more(&mut self) {
-        let screen = self.stack.last().unwrap();
-        let View::Shows(_, Feed::Pages(sort, next, fetching)) = &screen.view else {
+        let screen = self.top();
+        let (id, refreshing) = (screen.id, screen.loading);
+        let View::Shows(list) = &mut screen.view else {
             return;
         };
-        let Some(page) = *next else {
-            return self.toast("No more shows", false);
-        };
-        // one page at a time; the first one's refresh would drop what comes after it
-        match (screen.loading, *fetching) {
-            (true, true) => return,
-            (true, false) => return self.toast("Still refreshing the first page…", false),
-            _ => {}
+        match list.more(refreshing) {
+            Ok(Some((sort, page))) => {
+                self.top().loading = true;
+                let c = self.client.clone();
+                self.spawn(move || Msg::More(id, c.browse(&sort, None, page)));
+            }
+            Ok(None) => {}
+            Err(why) => self.toast(why, false),
         }
-        let (sort, id, c) = (sort.clone(), screen.id, self.client.clone());
-        self.top().loading = true;
-        if let View::Shows(_, Feed::Pages(_, _, f)) = &mut self.top().view {
-            *f = true;
-        }
-        self.spawn(move || Msg::More(id, c.browse(&sort, None, page)));
     }
 
     /// Cache key of a ranking, per user: its entries carry that user's list status and progress.
@@ -1717,7 +1670,7 @@ impl App {
             }
             "downloads" => {
                 let list = ani::local_shows().into_iter().map(|(m, _)| m).collect();
-                self.push("Downloads", View::Shows(list, Feed::Local));
+                self.push("Downloads", View::Shows(List::local(list)));
             }
             "login" => match client_id() {
                 Some(id) => self.start_auth(&id),
@@ -1992,37 +1945,6 @@ impl App {
         }
     }
 
-    /// Caches a ranking with every page loaded. Its first page's age stays its freshness, so
-    /// loading more never keeps that page longer than an hour.
-    fn save_pages(&self, id: u64) {
-        let screen = self.stack.iter().find(|s| s.id == id);
-        let Some(View::Shows(list, Feed::Pages(sort, next, _))) = screen.map(|s| &s.view) else {
-            return;
-        };
-        let path = list_cache(&self.ranking_key(sort));
-        let fetched = fs::metadata(&path).and_then(|m| m.modified());
-        let _ = ani::write_json(&path, &(list, next));
-        if let Ok(t) = fetched {
-            let _ = fs::File::options()
-                .write(true)
-                .open(&path)
-                .and_then(|f| f.set_modified(t));
-        }
-    }
-
-    /// Marks this user's cached lists as old, so the next visit shows them and refreshes.
-    fn outdate_lists(&self) {
-        LIST_CHANGES.fetch_add(1, Ordering::Relaxed);
-        let Ok(dir) = fs::read_dir(ani::cache_dir().join("lists")) else {
-            return;
-        };
-        for e in dir.flatten() {
-            if let Ok(f) = fs::File::options().write(true).open(e.path()) {
-                let _ = f.set_modified(std::time::UNIX_EPOCH);
-            }
-        }
-    }
-
     fn update_media(&mut self, id: u64, entry: Option<Entry>) {
         for s in &mut self.stack {
             let media: Vec<&mut Media> = match &mut s.view {
@@ -2033,7 +1955,8 @@ impl App {
                 | View::Sources(m, ..)
                 | View::Audio(Some(m))
                 | View::Input(Input::SourceQuery(m)) => vec![m],
-                View::Shows(l, _) | View::Bulk(l) => l.iter_mut().collect(),
+                View::Shows(l) => l.shows.iter_mut().collect(),
+                View::Bulk(l) => l.iter_mut().collect(),
                 _ => Vec::new(),
             };
             for m in media {
@@ -2051,63 +1974,31 @@ impl App {
 
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Shows(id, res, cache) => {
+            Msg::Shows(id, res, ask) => {
                 let fallback = res
                     .as_ref()
                     .is_ok_and(|l| l.iter().any(|m| !m.on_anilist()))
                     && self.stack.iter().any(|s| s.id == id);
-                let fetched = res.is_ok();
-                self.fill(id, res, |v, list| {
-                    if let View::Shows(l, feed) = v {
-                        if let Feed::Pages(_, next, _) = feed {
-                            *next = (list.len() >= PER_PAGE).then_some(2);
-                        }
-                        *l = list;
+                self.fill(id, res, |v, shows| {
+                    if let View::Shows(list) = v {
+                        list.refreshed(ask, shows);
                     }
                 });
-                // cached only for a screen still open: a closed one's late answer would
-                // overwrite what a newer one cached, its pages from More… too
-                let screen = self.stack.iter().find(|s| s.id == id);
-                if let (true, Some((path, changes)), Some(View::Shows(list, feed))) =
-                    (fetched, cache, screen.map(|s| &s.view))
-                {
-                    let next = match feed {
-                        Feed::Pages(_, next, _) => *next,
-                        _ => None,
-                    };
-                    let _ = ani::write_json(&path, &(list, next));
-                    // a save landed while this was in flight: keep it, but not as fresh
-                    if LIST_CHANGES.load(Ordering::Relaxed) != changes {
-                        let file = fs::File::options().write(true).open(&path);
-                        let _ = file.map(|f| f.set_modified(std::time::UNIX_EPOCH));
-                    }
-                }
                 if fallback {
                     self.toast("AniList search failed, showing ani-cli's matches", true);
                 }
             }
             Msg::More(id, res) => {
                 let screen = self.stack.iter_mut().find(|s| s.id == id);
-                if let Some(View::Shows(_, Feed::Pages(_, _, fetching))) =
-                    screen.map(|s| &mut s.view)
-                {
-                    *fetching = false;
+                if let Some(View::Shows(list)) = screen.map(|s| &mut s.view) {
+                    list.fetched();
                 }
                 let mut first = None; // Some(None): the page brought nothing new
                 self.fill(id, res, |v, more| {
-                    if let View::Shows(l, Feed::Pages(_, next, _)) = v {
-                        *next = next.filter(|_| more.len() >= PER_PAGE).map(|n| n + 1);
-                        // rankings shift between requests, a show may come round again
-                        let more: Vec<Media> = more
-                            .into_iter()
-                            .filter(|m| l.iter().all(|o| o.id != m.id))
-                            .collect();
-                        let start = l.len();
-                        l.extend(more);
-                        first = Some(l.get(start).map(|m| m.id.to_string()));
+                    if let View::Shows(list) = v {
+                        first = Some(list.more_came(more));
                     }
                 });
-                self.save_pages(id);
                 match (first, self.stack.iter_mut().find(|s| s.id == id)) {
                     (Some(Some(key)), Some(s)) => s.menu.select_key(&key),
                     (Some(None), Some(_)) => self.toast("No more shows", false),
@@ -2166,7 +2057,7 @@ impl App {
                     return;
                 }
                 // and from before a save, which they may undo: asked again while it's shown
-                if LIST_CHANGES.load(Ordering::Relaxed) != changes {
+                if lists::changes() != changes {
                     self.parts.remove(&id);
                     return;
                 }
@@ -2252,7 +2143,7 @@ impl App {
                         };
                         self.toast(text, false);
                         self.update_media(m.id, entry);
-                        self.outdate_lists();
+                        lists::changed();
                         if matches!(self.top().view, View::Status(_)) {
                             self.stack.pop();
                         }
@@ -2269,7 +2160,7 @@ impl App {
                 self.toast(format!("{} not saved · {why}", m.name()), true);
                 // what's on screen was old: AniList's entry, and lists that refresh
                 self.update_media(m.id, entry);
-                self.outdate_lists();
+                lists::changed();
                 self.refresh();
             }
             Msg::PlayStep(id, ep, step) => {
@@ -2369,35 +2260,6 @@ mod tests {
             "abc.def"
         );
         assert_eq!(super::parse_token("  abc.def \n"), "abc.def");
-    }
-
-    #[test]
-    fn rankings_keep_their_pages_for_an_hour() {
-        use super::{Feed, Media, from_cache};
-        use std::time::Duration;
-        let min = |m: u64| Some(Duration::from_secs(m * 60));
-        let pages = || Some((vec![Media::default(); 120], Some(4)));
-        let mut feed = Feed::Pages("TRENDING_DESC".into(), Some(2), false);
-        let (list, fresh) = from_cache(pages(), min(59), &mut feed);
-        assert!(fresh && list.len() == 120);
-        assert!(
-            matches!(feed, Feed::Pages(_, Some(4), _)),
-            "More… goes on with page 4"
-        );
-        let mut feed = Feed::Pages("TRENDING_DESC".into(), Some(2), false);
-        let (list, fresh) = from_cache(pages(), min(61), &mut feed);
-        assert!(
-            !fresh && list.len() == 50,
-            "past the hour: page 1, refreshed"
-        );
-        assert!(matches!(feed, Feed::Pages(_, Some(2), _)));
-        let (list, fresh) = from_cache(pages(), min(3), &mut Feed::Whole);
-        assert!(
-            !fresh && list.len() == 120,
-            "your own lists: 2 minutes, all shown"
-        );
-        let (list, fresh) = from_cache(None, None, &mut Feed::Whole);
-        assert!(!fresh && list.is_empty());
     }
 
     #[test]

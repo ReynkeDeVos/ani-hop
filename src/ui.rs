@@ -1,6 +1,6 @@
 use crate::anilist::Media;
 use crate::kitty;
-use crate::{App, Cover, EpMode, Feed, Input, PIN_REDIRECT, Pending, View, ani, list_label};
+use crate::{App, Cover, EpMode, Input, PIN_REDIRECT, Pending, View, ani, list_label};
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, BorderType, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap,
@@ -308,7 +308,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     // an empty list says so, instead of a bare 0
     let empty = match &screen.view {
         _ if !m.items.is_empty() || screen.loading => None,
-        View::Shows(_, Feed::Local) => Some("Nothing downloaded yet"),
+        View::Shows(list) if list.is_local() => Some("Nothing downloaded yet"),
         View::Shows(..) => Some("No shows found"),
         View::Episodes(..) => Some("No episodes found"),
         _ => None,
@@ -332,7 +332,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         ))
     });
     // and the next page right on "More…"
-    let fetching = matches!(screen.view, View::Shows(_, Feed::Pages(_, _, true)));
+    let fetching = matches!(&screen.view, View::Shows(list) if list.fetching());
     let busy = busy.or_else(|| fetching.then(|| ("more".to_string(), format!("{spin} loading…"))));
     // and the episode downloading right now on its row, or how far it got when paused
     let dl = app.downloads.snapshot();
@@ -496,10 +496,10 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
     f.render_widget(block, area);
     let screen = app.stack.last().unwrap();
     let media = match &screen.view {
-        View::Shows(list, _) => screen
+        View::Shows(list) => screen
             .menu
             .current()
-            .and_then(|it| list.iter().find(|m| m.id.to_string() == it.key))
+            .and_then(|it| list.shows.iter().find(|m| m.id.to_string() == it.key))
             .cloned(),
         View::Show(m)
         | View::Episodes(m, _)
@@ -516,7 +516,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
     };
     // posters just below the cursor load ahead, so scrolling shows them instantly
     let ahead: Vec<Media> = match &screen.view {
-        View::Shows(list, _) => {
+        View::Shows(list) => {
             let cur = screen.menu.state.selected().unwrap_or(0);
             screen
                 .menu
@@ -524,7 +524,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
                 .iter()
                 .skip(cur + 1)
                 .take(6)
-                .filter_map(|(i, _)| list.get(*i).cloned())
+                .filter_map(|(i, _)| list.shows.get(*i).cloned())
                 .collect()
         }
         // and the sequels an episode list runs on into, whose posters its episodes show
@@ -1084,7 +1084,7 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     if screen.menu.multi && !screen.menu.items.is_empty() {
         keys.splice(0..0, [("tab", "mark"), ("^a", "all")]);
     }
-    if matches!(screen.view, View::Shows(_, Feed::Pages(_, Some(_), _))) {
+    if matches!(&screen.view, View::Shows(list) if list.more_page().is_some()) {
         let at = keys.iter().position(|k| k.0 == "enter").unwrap();
         keys.insert(at, ("^f", "more"));
     }

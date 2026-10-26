@@ -754,14 +754,15 @@ mod tests {
         let dir = temp("pause");
         let (q, done) = queue(&dir, "a", SLOW);
         q.enqueue(job(&["1", "2"])).unwrap();
-        wait("downloading", || running(&q, "1"));
+        let part = dir.join("dl/Show/Show Episode 1.mp4.part");
+        wait("a piece", || running(&q, "1") && part.exists());
         // asked about 2, but 1 runs: nothing changes
         assert!(!q.pause(7, "2") && !q.snapshot().paused);
         assert!(q.pause(7, "1"));
         let s = q.snapshot();
         assert!(s.paused && s.pending == 2 && s.now.is_some_and(|n| n.ep == "1"));
         assert!(done.recv_timeout(Duration::from_millis(300)).is_err());
-        assert!(dir.join("dl/Show/Show Episode 1.mp4.part").exists(), "kept");
+        assert!(part.exists(), "kept");
         q.resume();
         let t = Duration::from_secs(10);
         assert_eq!(done.recv_timeout(t).unwrap(), ("Show E1".into(), Ok(())));
@@ -774,7 +775,8 @@ mod tests {
         let dir = temp("quit");
         let (q, _done) = queue(&dir, "gone", SLOW);
         q.enqueue(job(&["1", "2"])).unwrap();
-        wait("downloading", || running(&q, "1"));
+        let part = dir.join("dl/Show/Show Episode 1.mp4.part");
+        wait("a piece", || running(&q, "1") && part.exists());
         q.quit();
         wait("stopped", || q.lock().running.is_none());
         let (next, done) = queue(&dir, "next", QUICK);
