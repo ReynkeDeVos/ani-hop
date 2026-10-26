@@ -962,6 +962,38 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_waits_out_a_claim_held_for_a_moment() {
+        let dir = temp("moment");
+        let (q, _) = queue(&dir, "a", QUICK);
+        let (folder, hold) = ani::prepare_in(&dir.join("dl"), &show()).unwrap();
+        drop(hold);
+        let part = folder.join("Show Episode 1.mp4.part");
+        // held for 35 ms, as by a process starting right then, until its exec
+        let briefly = || {
+            fs::write(&part, "x").unwrap();
+            let held = q.try_claim(&folder, "1").unwrap().unwrap();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(35));
+                drop(held);
+            })
+        };
+        // leftovers of an ani-hop that's gone, dropped
+        let left = dir.join("queue/gone.json");
+        ani::write_json(&left, &vec![job(&["1"])]).unwrap();
+        let release = briefly();
+        assert_eq!(q.drop_leftovers(std::slice::from_ref(&left)), 1);
+        release.join().unwrap();
+        assert!(!part.exists(), "dropped leftovers lose their pieces");
+        // and a queued episode, stopped: its folder went with the leftovers, so it's made again
+        drop(ani::prepare_in(&dir.join("dl"), &show()).unwrap());
+        let release = briefly();
+        q.stop(&show(), &["1".into()], None, &[]).unwrap();
+        release.join().unwrap();
+        assert!(!part.exists(), "a stopped one loses its pieces");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn a_leftover_by_our_own_name_keeps_what_was_taken_over() {
         let dir = temp("ownname");
         let (q, _) = queue(&dir, "me", SLOW);
