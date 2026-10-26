@@ -1002,8 +1002,10 @@ impl App {
     /// What enter does on the Downloads list, for the footer.
     pub fn dl_verb(&self) -> &'static str {
         let screen = self.stack.last().unwrap();
-        let View::Episodes(m, EpMode::Download) = &screen.view else {
-            return "select";
+        let m = match &screen.view {
+            View::Episodes(m, EpMode::Download) => m,
+            View::Episodes(_, EpMode::Play) => return "play",
+            _ => return "select",
         };
         let eps: Vec<String> = (screen.menu.selection().iter())
             .map(|&i| screen.menu.items[i].key.clone())
@@ -1330,16 +1332,20 @@ impl App {
                 if self.user.is_some() {
                     v.extend(LISTS[2..].iter().map(list));
                 }
-                v.push(Item::new(
-                    "downloads",
-                    "Downloads",
-                    plural(self.local.len(), "show"),
-                ));
-                v.push(Item::new(
-                    "settings",
-                    "Settings & AniList…",
-                    self.user.as_ref().map_or("not logged in", |u| u.1.as_str()),
-                ));
+                let local = self.local.len();
+                let shows = if local > 0 {
+                    plural(local, "show")
+                } else {
+                    String::new()
+                };
+                v.push(Item::new("downloads", "Downloads", shows));
+                // who's logged in is in the header; logging in starts here
+                let login = if self.user.is_none() {
+                    "not logged in"
+                } else {
+                    ""
+                };
+                v.push(Item::new("settings", "Settings & AniList…", login));
                 v.push(Item::new("quit", "Quit", ""));
                 v
             }
@@ -1349,7 +1355,11 @@ impl App {
                     "Skip openings and endings",
                     if ani::skip_on() { "on" } else { "off" },
                 ),
-                Item::new("audio", "Audio…", ani::audio_label(ani::audio(None))),
+                Item::new(
+                    "audio",
+                    "Default audio…",
+                    ani::audio_label(ani::audio(None)),
+                ),
                 Item::new(
                     "folder",
                     "Download folder…",
@@ -1385,7 +1395,7 @@ impl App {
                     .map(|m| {
                         let mut hint = Vec::new();
                         if let Some(n) = self.local.get(&m.id).map(Vec::len).filter(|n| *n > 0) {
-                            hint.push(format!("↓{n}"));
+                            hint.push(format!("↓ {n}"));
                         }
                         if m.media_list_entry.is_some() {
                             hint.push(format!(
@@ -1623,15 +1633,6 @@ impl App {
                 if !part.is_empty() {
                     hint += &format!(" to {part}");
                 }
-                if let Some(also) = recounts(m.progress(), *ep) {
-                    hint += &format!(" · {also}");
-                }
-                let to = progress_status(m, *ep);
-                match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
-                    Some(s) if s == to => {}
-                    Some(_) => hint += &format!(" · moves it to {}", list_label(to)),
-                    None => hint += &format!(" · adds it to {}", list_label(to)),
-                }
                 vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
             }
             View::Confirm(Pending::Stop(m, eps)) => {
@@ -1773,9 +1774,9 @@ impl App {
             }
             View::Audio(m) => {
                 let id = m.as_ref().map(|m| m.id);
-                let name = m
-                    .as_ref()
-                    .map_or("Default audio".into(), |m| m.name().to_string());
+                let name = m.as_ref().map_or("Default audio".into(), |m| {
+                    format!("Audio for {}", m.name())
+                });
                 if let Err(e) = ani::set_audio(id, &key) {
                     return self.toast(e.to_string(), true);
                 }
@@ -2183,6 +2184,13 @@ impl App {
             false => part_name(m.name(), p.name()).to_string(),
         };
         let only_this = recounts(p.progress(), n as u32).is_none();
+        // what else Yes changes goes in the question, which wraps; a hint would be cut
+        let also = [recounts(p.progress(), n as u32), list_move(p, n as u32)];
+        let also = also.into_iter().flatten().collect::<Vec<_>>().join(" and ");
+        let title = match also.split_at_checked(1) {
+            Some((first, rest)) => format!("{title} {}{rest}.", first.to_uppercase()),
+            None => title,
+        };
         let ask = Pending::Progress(p.clone(), n as u32, part);
         self.push(title, View::Confirm(ask));
         self.top()
@@ -2512,11 +2520,11 @@ impl App {
                     }
                     Err(e) if want.is_some() || here => {
                         // the provider may call it something else: picking it by hand fixes that
-                        let tip = match e.starts_with("No results") {
-                            true => " · try Change source…",
-                            false => "",
+                        let e = match e.starts_with("No results") {
+                            true => "no match for this show · try Change source…".into(),
+                            false => e,
                         };
-                        self.toast(format!("ani-cli: {e}{tip}"), true)
+                        self.toast(format!("ani-cli: {e}"), true)
                     }
                     Err(_) => {}
                 }
@@ -2532,8 +2540,12 @@ impl App {
                 self.saves_pending -= 1;
                 match res {
                     Ok(entry) => {
-                        let text = match entry {
-                            Some(_) => format!("Saved {}", m.name()),
+                        let text = match &entry {
+                            Some(e) => {
+                                let total = m.episodes.map_or("?".into(), |t| t.to_string());
+                                let list = list_label(&e.status);
+                                format!("Saved {} · {list} · {}/{total}", m.name(), e.progress)
+                            }
                             None => format!("Removed {} from your list", m.name()),
                         };
                         self.toast(text, false);
@@ -2551,7 +2563,7 @@ impl App {
                 self.saves_pending -= 1;
                 let total = m.episodes.map_or("?".into(), |t| t.to_string());
                 let now = entry.as_ref().map_or(0, |e| e.progress);
-                let why = format!("AniList has {now}/{total} now, ask again");
+                let why = format!("AniList has {now}/{total} now, try again");
                 self.toast(format!("{} not saved · {why}", m.name()), true);
                 // what's on screen was old: AniList's entry, and lists that refresh
                 self.update_media(m.id, entry);
@@ -2712,9 +2724,19 @@ fn recounts(from: u32, to: u32) -> Option<String> {
         false => format!("{a}–{b}"),
     };
     match to {
-        _ if to > from + 1 => Some(format!("counts {} too", span(from + 1, to - 1))),
+        _ if to > from + 1 => Some(format!("also marks {}", span(from + 1, to - 1))),
         _ if to < from => Some(format!("unmarks {}", span(to + 1, from))),
         _ => None,
+    }
+}
+
+/// The list a show moves to when episode `ep` is marked watched, if it does.
+fn list_move(m: &Media, ep: u32) -> Option<String> {
+    let to = progress_status(m, ep);
+    match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
+        Some(s) if s == to => None,
+        Some(_) => Some(format!("moves it to {}", list_label(to))),
+        None => Some(format!("adds it to {}", list_label(to))),
     }
 }
 
@@ -2803,8 +2825,8 @@ mod tests {
     fn says_what_a_jump_in_progress_counts() {
         assert_eq!(super::recounts(5, 6), None); // the next one
         assert_eq!(super::recounts(5, 5), None);
-        assert_eq!(super::recounts(5, 7).unwrap(), "counts 6 too");
-        assert_eq!(super::recounts(0, 1180).unwrap(), "counts 1–1179 too");
+        assert_eq!(super::recounts(5, 7).unwrap(), "also marks 6");
+        assert_eq!(super::recounts(0, 1180).unwrap(), "also marks 1–1179");
         assert_eq!(super::recounts(1180, 5).unwrap(), "unmarks 6–1180");
         assert_eq!(super::recounts(6, 5).unwrap(), "unmarks 6");
     }

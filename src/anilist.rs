@@ -12,7 +12,7 @@ pub static ENGLISH_TITLES: AtomicBool = AtomicBool::new(false);
 
 const MEDIA: &str = "id idMal title { romaji english } synonyms coverImage { extraLarge color }
   episodes status format season seasonYear averageScore genres description(asHtml: false)
-  studios(isMain: true) { nodes { name } } nextAiringEpisode { episode timeUntilAiring }
+  studios { edges { isMain node { name } } } nextAiringEpisode { episode timeUntilAiring }
   mediaListEntry { id status progress }";
 
 /// Shows per AniList page, the most it hands out at once.
@@ -56,10 +56,28 @@ pub struct Cover {
     pub color: Option<String>,
 }
 
+/// Every studio with whether it made the show: AniList ignores `studios(isMain: true)` in
+/// list and relation queries (Frieren from a list: Toho, MADHOUSE, Shogakukan, …), so
+/// `main` picks them here. A cache from before has none until it refreshes.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Studios {
-    pub nodes: Vec<Name>,
+    pub edges: Vec<Studio>,
+}
+
+impl Studios {
+    pub fn main(&self) -> impl Iterator<Item = &str> {
+        (self.edges.iter())
+            .filter(|e| e.is_main)
+            .map(|e| e.node.name.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Studio {
+    pub is_main: bool,
+    pub node: Name,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -260,7 +278,7 @@ impl Client {
             }
             let mut res = req
                 .send_json(&body)
-                .map_err(|e| format!("Can't reach AniList ({e})"))?;
+                .map_err(|_| "Can't reach AniList".to_string())?;
             let num = |k: &str| res.headers().get(k)?.to_str().ok()?.parse::<u64>().ok();
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)

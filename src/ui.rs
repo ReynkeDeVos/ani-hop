@@ -219,7 +219,8 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     // a confirmation shows its question where the filter prompt would be, wrapped
     let question = matches!(screen.view, View::Confirm(_)).then_some(screen.title.as_str());
     let rows = question.map_or(1, |q| {
-        (Line::raw(q).width() as u16 / inner.width.max(1) + 1).min(4)
+        let q = Paragraph::new(Line::styled(q, Style::new().bold())).wrap(Wrap { trim: true });
+        (q.line_count(inner.width) as u16).clamp(1, 6)
     });
     let [prompt_area, info_area, list_area] = Layout::vertical([
         Constraint::Length(rows),
@@ -266,7 +267,12 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     // how many there are, and while filtering how many of them match
     let picks = |i: &usize| !m.items[*i].action;
     let all = (0..m.items.len()).filter(picks).count();
+    let varies = matches!(
+        screen.view,
+        View::Shows(..) | View::Episodes(..) | View::Sources(..)
+    );
     let count = match m.query.is_empty() {
+        true if !varies => String::new(), // a fixed menu: its rule alone
         true => all.to_string(),
         false => format!(
             "{}/{all}",
@@ -294,13 +300,10 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         ));
     }
     let used: usize = info.iter().map(|s| s.width()).sum();
-    info.push(Span::styled(
-        format!(
-            " {}",
-            "─".repeat((info_area.width as usize).saturating_sub(used + 1))
-        ),
-        DIM,
-    ));
+    // a gap only after something: a fixed menu's rule starts where its rows do
+    let gap = if used > 0 { " " } else { "" };
+    let line = "─".repeat((info_area.width as usize).saturating_sub(used + gap.len()));
+    info.push(Span::styled(format!("{gap}{line}"), DIM));
     f.render_widget(Line::from(info), info_area);
     // an empty list says so, instead of a bare 0
     let empty = match &screen.view {
@@ -383,6 +386,12 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 Some((key, text)) if *key == item.key => (text.clone(), ACCENT),
                 _ => (item.hint.clone(), DIM),
             };
+            let mut hint = hint;
+            while Span::raw(hint.as_str()).width() > room
+                && let Some((head, _)) = hint.rsplit_once(" · ")
+            {
+                hint = head.to_string();
+            }
             if !hint.is_empty() && room > 3 {
                 let hint = Span::styled(fit(hint, room), color);
                 spans.push(" ".repeat(width.saturating_sub(used + hint.width())).into());
@@ -537,13 +546,18 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         let (up, down) = media_preview(app, f, inner, &m, ep.as_deref());
         // a cut is never silent: the border says how to read on, and how to get back up
         let hints = [
-            (up, area.y, "shift↑", " back up "),
-            (down, area.bottom().saturating_sub(1), "shift↓", " read on "),
+            (up, area.y, "shift ↑", " back up "),
+            (
+                down,
+                area.bottom().saturating_sub(1),
+                "shift ↓",
+                " read on ",
+            ),
         ];
         for (_, y, key, what) in hints.into_iter().filter(|h| h.0) {
             let row = Rect::new(area.x, y, area.width, 1).inner(Margin::new(2, 0));
             // a narrow border drops the words, then "shift"
-            let arrow = &key["shift".len()..];
+            let arrow = key["shift".len()..].trim_start();
             let hint = [(key, what), (key, " "), (arrow, " ")]
                 .map(|(k, w)| {
                     Line::from(vec![
@@ -679,6 +693,77 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v
 }
 
+/// Score, format, episode count and status; when and by whom; genres. No-break spaces keep
+/// "12 episodes" or "Slice of Life" whole, and a wrapped line never starts with "·".
+fn facts(m: &Media) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut facts = Vec::new();
+    if let Some(s) = m.average_score {
+        facts.push(Span::styled(format!("★\u{a0}{s}%"), Color::Yellow));
+    }
+    // a movie's one episode goes without saying
+    let movie = m.format.as_deref() == Some("MOVIE");
+    let detail = [
+        m.format.as_deref().map(pretty),
+        m.episodes
+            .filter(|&e| !(movie && e == 1))
+            .map(|e| episodes(e as usize)),
+        m.status.as_deref().map(pretty),
+    ];
+    for d in detail.into_iter().flatten() {
+        if !facts.is_empty() {
+            facts.push(Span::styled("\u{a0}· ", DIM));
+        }
+        facts.push(d.into());
+    }
+    // ani-cli's shows have none of these: no rows of blanks for them
+    if !facts.is_empty() {
+        lines.push(Line::from(facts));
+    }
+    let when = [
+        m.season.as_deref().map(pretty),
+        m.season_year.map(|y| y.to_string()),
+    ];
+    let when = when
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\u{a0}");
+    let studio = m.studios.main().collect::<Vec<_>>().join(", ");
+    let made = [when, studio].into_iter().filter(|s| !s.is_empty());
+    let made = made.collect::<Vec<_>>().join("\u{a0}· ");
+    if !made.is_empty() {
+        lines.push(made.into());
+    }
+    if !m.genres.is_empty() {
+        let genres = m.genres.iter().map(|g| g.replace(' ', "\u{a0}"));
+        lines.push(Line::styled(
+            genres.collect::<Vec<_>>().join("\u{a0}· "),
+            MATCH,
+        ));
+    }
+    lines
+}
+
+/// "1 episode", "28 episodes", kept on one line.
+fn episodes(n: usize) -> String {
+    crate::plural(n, "episode").replacen(' ', "\u{a0}", 1)
+}
+
+/// Whether ani-cli's title for a source is the show's own, letters and digits alike: then
+/// the source line needn't repeat it.
+fn same_title(source: &str, show: &Media) -> bool {
+    let key = |s: &str| {
+        (s.chars().filter(|c| c.is_alphanumeric()))
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+    };
+    let titles = [&show.title.english, &show.title.romaji]
+        .into_iter()
+        .flatten();
+    (titles.map(String::as_str).chain([show.name()])).any(|t| key(t) == key(source))
+}
+
 /// "1999-12-15" as "15 Dec 1999", anything else as it is.
 fn day(iso: &str) -> String {
     const MONTHS: [&str; 12] = [
@@ -708,7 +793,7 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
         ])
     };
     let mut v = vec![Line::styled(
-        format!("↓ {}", ani::tilde(&ani::download_root())),
+        format!("↓ downloads go to {}", ani::tilde(&ani::download_root())),
         DIM,
     )];
     if let Some((new, cmd)) = &app.release {
@@ -794,25 +879,10 @@ fn media_preview(
         lines.push(Line::styled(alt.clone(), SOFT.italic()));
     }
     lines.push("".into());
-    let mut facts = Vec::new();
-    // no-break spaces: wrapping never splits a fact like "10 episodes"
-    if let Some(s) = m.average_score {
-        facts.push(Span::styled(format!("★\u{a0}{s}%"), Color::Yellow));
-    }
-    let detail = [
-        m.format.as_deref().map(pretty),
-        m.episodes.map(|e| format!("{e}\u{a0}episodes")),
-        m.status.as_deref().map(pretty),
-    ];
-    for d in detail.into_iter().flatten() {
-        if !facts.is_empty() {
-            facts.push(Span::styled(" · ", DIM));
-        }
-        facts.push(d.into());
-    }
-    // ani-cli's shows have none of these: no rows of blanks for them
-    if !facts.is_empty() {
-        lines.push(Line::from(facts));
+    // on an episode list the show's facts are one esc away, and its episode comes first
+    let facts_from = lines.len();
+    if ep.is_none() {
+        lines.extend(facts(m));
     }
     if !m.on_anilist() {
         lines.push(Line::styled(
@@ -820,30 +890,9 @@ fn media_preview(
             Color::Yellow,
         ));
     }
-    let when = [
-        m.season.as_deref().map(pretty),
-        m.season_year.map(|y| y.to_string()),
-    ];
-    let when = when.into_iter().flatten().collect::<Vec<_>>().join(" ");
-    let studio = m
-        .studios
-        .nodes
-        .iter()
-        .map(|s| s.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let made = [when, studio]
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join(" · ");
-    if !made.is_empty() {
-        lines.push(made.into());
+    if lines.len() > facts_from {
+        lines.push("".into());
     }
-    if !m.genres.is_empty() {
-        lines.push(Line::styled(m.genres.join(" · "), MATCH));
-    }
-    lines.push("".into());
     let status = |p: &Media| {
         let e = p.media_list_entry.as_ref()?;
         let total = p.episodes.map_or("?".into(), |t| t.to_string());
@@ -858,10 +907,14 @@ fn media_preview(
         let eps = p.episodes.map_or(format!("{}+", before + 1), |n| {
             format!("{}–{}", before + 1, before + n)
         });
-        lines.push(Line::styled(
-            format!("Episodes\u{a0}{eps} are {}", p.name()),
-            DIM,
-        ));
+        // as the episode list's rule calls it: "Part 2"
+        let name = crate::part_name(show.name(), p.name());
+        // "Part 2" wraps whole; a long name still wraps, just not before its last word
+        let name = match name.rsplit_once(' ') {
+            Some((head, last)) => format!("{head}\u{a0}{last}"),
+            None => name.to_string(),
+        };
+        lines.push(Line::styled(format!("Episodes\u{a0}{eps} are {name}"), DIM));
         lines.extend(status(p));
     }
     if let Some(a) = &m.next_airing_episode {
@@ -871,37 +924,37 @@ fn media_preview(
             duration(a.time_until_airing)
         )));
     }
+    // an episode list says "on disk" on each of its rows
     let local = app.local.get(&show.id).map_or(0, Vec::len);
-    if local > 0 {
+    if local > 0 && ep.is_none() {
         lines.push(Line::from(format!("↓ {local} on disk")));
     }
     if let Some(s) = app.sources.get(&show.id) {
-        lines.push(Line::styled(
-            format!("ani-cli: {} · {}\u{a0}episodes", s.title, s.episodes.len()),
-            DIM,
-        ));
+        let n = episodes(s.episodes.len());
+        // a wrong match keeps its title, so it stands out
+        let line = match same_title(&s.title, m) {
+            true => format!("ani-cli: {n}"),
+            false => format!("ani-cli: {} · {n}", s.title),
+        };
+        lines.push(Line::styled(line, DIM));
     }
     let mut about = "";
     if let Some(ep) = ep
         && let Some(i) = app.ep_about(show, ep)
     {
         lines.push("".into());
-        if app.watched(show, ep) {
-            let title = [format!("Episode {ep}"), i.title.clone()];
-            let title = title
-                .into_iter()
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>();
-            lines.push(Line::styled(title.join(" · "), Style::new().bold()));
-            about = &i.about;
-        } else {
-            lines.push(Line::styled(
-                format!("Episode {ep} · not watched yet, so no summary"),
-                DIM,
-            ));
-        }
+        // its title and summary only once watched: they give things away, its date doesn't
+        let watched = app.watched(show, ep);
+        let heading = match watched && !i.title.is_empty() {
+            true => format!("Episode {ep} · {}", i.title),
+            false => format!("Episode {ep}"),
+        };
+        lines.push(Line::styled(heading, Style::new().bold()));
         if let Some(d) = i.aired.as_deref().filter(|d| !d.is_empty()) {
             lines.push(Line::styled(format!("aired {}", day(d)), DIM));
+        }
+        if watched {
+            about = &i.about;
         }
     }
     // the gap before the description is one row, also when nothing follows the genres
@@ -1018,12 +1071,17 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     } else {
         "clear"
     };
-    let mut keys = vec![("enter", enter), ("esc", esc)];
+    let mut keys = vec![("enter", enter)];
+    // the main menu has nothing to go back to
+    if app.stack.len() > 1 || !screen.menu.query.is_empty() {
+        keys.push(("esc", esc));
+    }
     if screen.menu.multi && !screen.menu.items.is_empty() {
         keys.splice(0..0, [("tab", "mark"), ("^a", "all")]);
     }
     if matches!(screen.view, View::Shows(_, Feed::Pages(_, Some(_), _))) {
-        keys.insert(keys.len() - 2, ("^f", "more")); // before enter and esc
+        let at = keys.iter().position(|k| k.0 == "enter").unwrap();
+        keys.insert(at, ("^f", "more"));
     }
     keys.push(("^c", "quit"));
     let hints = Line::from(
@@ -1081,8 +1139,11 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     // a toast that doesn't fit beside the hints gets the line until it fades
     let crowded = toast.is_some() && status.width() + hints.width() > area.width as usize;
     let hints_width = if crowded { 0 } else { hints.width() as u16 };
+    // a column between them, so a cut status line doesn't run into the keys
     let [status_area, hints_area] =
-        Layout::horizontal([Constraint::Fill(1), Constraint::Length(hints_width)]).areas(area);
+        Layout::horizontal([Constraint::Fill(1), Constraint::Length(hints_width)])
+            .spacing(1)
+            .areas(area);
     f.render_widget(status, status_area);
     f.render_widget(hints, hints_area);
 }
@@ -1151,6 +1212,18 @@ fn strip_html(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_with_the_shows_own_title_goes_without_it() {
+        let mut m = Media::default();
+        m.title.english = Some("Frieren: Beyond Journey’s End".into());
+        m.title.romaji = Some("Sousou no Frieren".into());
+        assert!(same_title("Frieren: Beyond Journey's End", &m)); // ’ and '
+        assert!(same_title("SOUSOU NO FRIEREN", &m));
+        assert!(!same_title("Aoki Hagane no Arpeggio: Ars Nova Cadenza", &m));
+        assert!(!same_title("Frieren: Beyond Journey's End Season 2", &m));
+        assert_eq!(episodes(1), "1\u{a0}episode");
+    }
 
     #[test]
     fn writes_air_dates_out() {
