@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.16 – 2026-10-26
+
+### Added
+
+- An episode's preview says when it first aired, like "aired 15 Dec 1999". The date comes from ani.zip, like the episode's title and summary. Episode info cached before this is fetched again once, and still shows while ani.zip can't be reached.
+
+### Changed
+
+- The show information is shorter:
+  - Only the main studio, like "Fall 2023 · MADHOUSE". Shows from your lists and a season's second part listed every company involved, seven for Frieren.
+  - On an episode list, the selected episode comes right under the show's titles and list status; score, season, studio and genres are on the show's page. At 80×24 the episode's summary was below the fold.
+  - An unwatched episode shows "Episode 13" and when it aired, instead of "not watched yet, so no summary".
+  - A season split in two says "Episodes 13–22 are Part 2", as the episode list's line calls it.
+  - The ani-cli line leaves out the source's title when it's the show's own ("ani-cli: 28 episodes"), so a different one, like a wrong match, stands out.
+  - "1 episode", not "1 episodes", and a movie's count is left out. A wrapped line no longer starts with "·", and a genre like "Slice of Life" stays on one line.
+- The progress question says what else Yes changes in the question itself, like "Watched up to episode 5 of Attack on Titan Season 3? Unmarks 6–12 and moves it to Watching.", as the hint beside Yes was cut off. Yes says what it saves.
+- Without a connection, errors read "Can't reach AniList" and "ani-cli: can't reach hianime.at" instead of a system error and a cut-off address. A show ani-cli doesn't find says "no match for this show".
+- List hints drop whole parts instead of cutting a number ("0/24", not "0/2…"), fixed menus have no item count, and the footer says "enter play" on an episode list and has no "esc back" on the main menu. Settings says "Default audio…", a save says what it saved ("Saved Frieren · Completed · 28/28"), and the start screen says where downloads go.
+- On the start screen, → is the select key, with enter and ^l beside it, as ← is the back key.
+
 ## 0.6.15 – 2026-10-26
 
 ### Changed

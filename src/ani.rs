@@ -452,7 +452,15 @@ fn last_error(stderr: &[u8]) -> String {
             c => out.push(c),
         }
     }
-    out.trim().to_string()
+    let out = out.trim();
+    // "Connection error: could not fetch https://hianime.at/search?keyword=… (no HTTP res…"
+    match out.split_once("could not fetch ") {
+        Some((_, url)) => {
+            let host = url.split("://").nth(1).and_then(|u| u.split('/').next());
+            format!("can't reach {}", host.unwrap_or("its site"))
+        }
+        None => out.to_string(),
+    }
 }
 
 /// Runs ani-cli until it wants to show a menu and returns that menu as (prompt, lines).
@@ -1420,6 +1428,13 @@ mod tests {
         m.title.romaji = Some(romaji.into());
         m.title.english = Some(english.into());
         best_matches(&m, &hits.iter().map(|h| h.to_string()).collect::<Vec<_>>())[0]
+    }
+
+    #[test]
+    fn says_which_site_ani_cli_cant_reach() {
+        let err = b"\x1b[2K\x1b[1;31mConnection error: could not fetch https://hianime.at/search?keyword=x (no HTTP response; curl exit 7)\x1b[0m\n";
+        assert_eq!(last_error(err), "can't reach hianime.at");
+        assert_eq!(last_error(b"No results found!\n"), "No results found!");
     }
 
     #[test]

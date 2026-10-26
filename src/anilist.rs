@@ -12,7 +12,7 @@ pub static ENGLISH_TITLES: AtomicBool = AtomicBool::new(false);
 
 const MEDIA: &str = "id idMal title { romaji english } synonyms coverImage { extraLarge color }
   episodes status format season seasonYear averageScore genres description(asHtml: false)
-  studios(isMain: true) { nodes { name } } nextAiringEpisode { episode timeUntilAiring }
+  studios { edges { isMain node { name } } } nextAiringEpisode { episode timeUntilAiring }
   mediaListEntry { id status progress }";
 
 /// Shows per AniList page, the most it hands out at once.
@@ -56,10 +56,28 @@ pub struct Cover {
     pub color: Option<String>,
 }
 
+/// Every studio with whether it made the show: AniList ignores `studios(isMain: true)` in
+/// list and relation queries (Frieren from a list: Toho, MADHOUSE, Shogakukan, …), so
+/// `main` picks them here. A cache from before has none until it refreshes.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Studios {
-    pub nodes: Vec<Name>,
+    pub edges: Vec<Studio>,
+}
+
+impl Studios {
+    pub fn main(&self) -> impl Iterator<Item = &str> {
+        (self.edges.iter())
+            .filter(|e| e.is_main)
+            .map(|e| e.node.name.as_str())
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Studio {
+    pub is_main: bool,
+    pub node: Name,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -183,6 +201,10 @@ pub struct EpInfo {
     /// counts a season split in two on AniList as one
     #[serde(default)]
     pub number: Option<u32>,
+    /// when it first aired, as ani.zip has it ("1999-12-15", empty if it doesn't); None in a
+    /// cache from before air dates, which is then fetched again
+    #[serde(default)]
+    pub aired: Option<String>,
 }
 
 /// Titles and summaries of every episode, from ani.zip (keyed by AniList id, one request a
@@ -208,6 +230,7 @@ fn episode_info(v: &Value) -> HashMap<String, EpInfo> {
             },
             about: tidy(about.and_then(|a| a.split("\nSource:").next())),
             number: e["episodeNumber"].as_u64().map(|n| n as u32),
+            aired: Some(tidy(e["airdate"].as_str())),
         };
         (ep.clone(), info)
     })
@@ -255,7 +278,7 @@ impl Client {
             }
             let mut res = req
                 .send_json(&body)
-                .map_err(|e| format!("Can't reach AniList ({e})"))?;
+                .map_err(|_| "Can't reach AniList".to_string())?;
             let num = |k: &str| res.headers().get(k)?.to_str().ok()?.parse::<u64>().ok();
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -533,7 +556,7 @@ mod tests {
     fn reads_episode_titles_and_summaries() {
         let v = serde_json::json!({ "episodes": {
             "1": { "title": { "en": "The Journey`s End", "x-jat": "Bouken no Owari" },
-                   "summary": "It`s over.\nSource: Crunchyroll" },
+                   "summary": "It`s over.\nSource: Crunchyroll", "airdate": "2023-09-29" },
             "2": { "title": { "x-jat": "Betsu ni" }, "overview": "Magic lessons.", "episodeNumber": 14 },
             "S1": { "title": { "en": "Episode S1" } },
         }});
@@ -545,6 +568,9 @@ mod tests {
             ("Betsu ni", "Magic lessons.")
         );
         assert_eq!((eps["1"].number, eps["2"].number), (None, Some(14)));
+        // a cache from before air dates has None, a show without one an empty date
+        assert_eq!(eps["1"].aired.as_deref(), Some("2023-09-29"));
+        assert_eq!(eps["2"].aired.as_deref(), Some(""));
         assert_eq!(
             (eps["S1"].title.as_str(), eps["S1"].about.as_str()),
             ("", "")
