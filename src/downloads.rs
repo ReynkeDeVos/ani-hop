@@ -576,18 +576,8 @@ impl Queue {
             // also for an episode already there, so a folder found through ani-cli gets the
             // AniList show
             let (dir, hold) = self.0.fetch.prepare(m)?;
-            // another ani-hop may have queued it too before either saw the other's queue. A
-            // process this one starts right then holds a copy of the lock file until its exec
-            // closes it, so a claim that fails is tried again a few times first.
-            let mut tries = 0;
-            let mut held = loop {
-                match self.claim(&dir, ep)? {
-                    Some(held) => break held,
-                    None if tries < 5 => tries += 1,
-                    None => return Err("another ani-hop is downloading it".into()),
-                }
-                thread::sleep(std::time::Duration::from_millis(20));
-            };
+            // another ani-hop may have queued it too before either saw the other's queue
+            let mut held = (self.claim(&dir, ep)?).ok_or("another ani-hop is downloading it")?;
             held.folder = Some(hold);
             *claim = Some(held);
             if ani::local_episodes(&dir).iter().any(|(e, _)| e == ep) {
@@ -626,7 +616,20 @@ impl Queue {
     /// Holds episode `ep` of the show in `dir` for this ani-hop: while it downloads it, and
     /// while what's left of a stopped one is deleted, as two writing (or one deleting) the
     /// same files would spoil them. None while another holds it, this one's worker included.
+    /// A process this one starts right then holds a copy of the lock file until its exec
+    /// closes it, so a claim that fails is tried again for about 100 ms, under whatever lock
+    /// the caller holds.
     fn claim(&self, dir: &Path, ep: &str) -> Result<Option<EpisodeLock>, String> {
+        for _ in 0..5 {
+            if let Some(held) = self.try_claim(dir, ep)? {
+                return Ok(Some(held));
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        }
+        self.try_claim(dir, ep)
+    }
+
+    fn try_claim(&self, dir: &Path, ep: &str) -> Result<Option<EpisodeLock>, String> {
         let key = format!("{}\n{ep}", dir.display());
         let hash = (key.bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
             (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
