@@ -253,6 +253,8 @@ pub struct App {
     no_graphics: bool,
     /// AniList list changes not answered yet
     saves_pending: usize,
+    /// list entries saved this session, newer than the copy a playing episode started with
+    saved: HashMap<u64, Option<Entry>>,
     pub covers: HashMap<u64, Cover>,
     /// episode titles and summaries per show (empty while loading or when there are none)
     pub ep_info: HashMap<u64, HashMap<String, EpInfo>>,
@@ -750,6 +752,7 @@ impl App {
             sent: Vec::new(),
             no_graphics: false,
             saves_pending: 0,
+            saved: HashMap::new(),
             covers: HashMap::new(),
             ep_info: HashMap::new(),
             parts: HashMap::new(),
@@ -830,7 +833,9 @@ impl App {
         let _ = fs::remove_file(token_path());
         let _ = fs::remove_file(user_path());
         (self.client.token, self.user) = (None, None);
-        self.parts.clear(); // they carry this login's progress
+        // they carry this login's progress
+        self.parts.clear();
+        self.saved.clear();
     }
 
     /// Back to the main menu; an unanswered resume question stays.
@@ -2070,6 +2075,7 @@ impl App {
                 }
                 self.client.token = Some(token);
                 self.parts.clear();
+                self.saved.clear();
                 let c = self.client.clone();
                 self.spawn(move || Msg::Viewer(c.viewer()));
                 self.toast("Checking token…", false);
@@ -2311,7 +2317,8 @@ impl App {
                 | View::Status(m)
                 | View::Sources(m, ..)
                 | View::Audio(Some(m))
-                | View::Input(Input::SourceQuery(m)) => vec![m],
+                | View::Input(Input::SourceQuery(m))
+                | View::Confirm(Pending::Progress(m, ..)) => vec![m],
                 View::Shows(l, _) | View::Bulk(l) => l.iter_mut().collect(),
                 _ => Vec::new(),
             };
@@ -2525,12 +2532,21 @@ impl App {
                             None => format!("Removed {} from your list", m.name()),
                         };
                         self.toast(text, false);
+                        self.saved.insert(m.id, entry.clone());
                         self.update_media(m.id, entry);
                         self.outdate_lists();
                         if matches!(self.top().view, View::Status(_)) {
                             self.stack.pop();
                         }
                         self.refresh();
+                        // a question asked before this save landed: never on Yes when it
+                        // now changes other episodes too
+                        if let View::Confirm(Pending::Progress(p, n, _)) = &self.top().view
+                            && p.id == m.id
+                            && recounts(p.progress(), *n).is_some()
+                        {
+                            self.top().menu.select_key("no");
+                        }
                     }
                     Err(e) => self.toast(format!("{} not saved · {e}", m.name()), true),
                 }
@@ -2550,6 +2566,11 @@ impl App {
                     .is_some_and(|p| p.id == m.id && p.ep == ep)
                 {
                     self.playing = None;
+                }
+                // saved meanwhile ("Watched up to…" while it played): that entry, not the old copy
+                let mut m = m;
+                if let Some(entry) = self.saved.get(&m.id) {
+                    m.media_list_entry = entry.clone();
                 }
                 // not watched yet, as far as the show or the sequel it's in goes
                 let ask = (self.progress_target(&m, &ep))
