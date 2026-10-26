@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.6.14 – 2026-10-26
+
+### Added
+
+- "Watched up to…" on a show's page lists its episodes, and picking one saves your AniList progress up to it. That marks many episodes watched at once, or unmarks them when you pick an earlier one. AniList keeps one count per show, so an episode always counts as watched together with every one before it.
+
+### Changed
+
+- The question after an episode says when Yes also counts earlier episodes as watched, and then starts on No. Watching the latest One Piece episode on a show not on your list said only "saves 1180/?", and Yes marked all 1180 episodes watched; it now says "saves 1180/? · counts 1–1179 too". In "Watched up to…", an earlier episode says what it unmarks, like "unmarks 6–12", and starts on No too.
+
 ## 0.6.13 – 2026-10-26
 
 ### Fixed
