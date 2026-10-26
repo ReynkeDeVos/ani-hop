@@ -156,7 +156,8 @@ enum Msg {
     Saved(Media, Result<Option<Entry>, String>),
     /// (media, episode, what it waits on now; None = the player is up)
     PlayStep(u64, String, Option<&'static str>),
-    Played(Media, String, Result<(), String>),
+    /// (media, episode, result, LIST_CHANGES when it started)
+    Played(Media, String, Result<(), String>, u64),
     DlProgress(DlNow),
     DlDone(String, Result<(), String>),
     /// (version, update command) of a newer ani-hop
@@ -2160,13 +2161,16 @@ impl App {
     /// Asks before saving the AniList progress up to `ep`. AniList keeps a count, not single
     /// episodes, so Yes is preselected only when that changes no other episode.
     fn ask_progress(&mut self, m: &Media, ep: &str, title: String) {
-        // a save landing under an open question would leave its hint and Yes stale; none can
-        // start while it's open, as only its own Yes or the List status screen save
-        if self.saves_pending > 0 {
-            return self.toast(
-                format!("Still saving to AniList, episode {ep} not asked"),
-                false,
-            );
+        // one question at a time and none while a save runs: a save landing under an open one
+        // would leave its hint and Yes stale, and only a question's Yes or List status save
+        let open =
+            (self.stack.iter()).any(|s| matches!(s.view, View::Confirm(Pending::Progress(..))));
+        if self.saves_pending > 0 || open {
+            let why = match open {
+                true => "another one is open",
+                false => "still saving to AniList",
+            };
+            return self.toast(format!("Episode {ep} not asked: {why}"), false);
         }
         let Some((p, n)) = self.progress_target(m, ep) else {
             return self.toast(
@@ -2235,6 +2239,7 @@ impl App {
         let (tx, id, e) = (self.tx.clone(), m.id, ep.clone());
         let step = move |s| _ = tx.send(Msg::PlayStep(id, e.clone(), s));
         let audio = ani::audio(Some(m.id));
+        let changes = LIST_CHANGES.load(Ordering::Relaxed);
         self.spawn(move || {
             let stream = |s: &Source| match ani::stream(s, &ep, audio, || step(None)) {
                 // dubs come later or not at all, the subtitled one is the next best
@@ -2253,7 +2258,7 @@ impl App {
                 (_, Some(src)) => stream(&src),
                 _ => unreachable!(),
             };
-            Msg::Played(m, ep, res)
+            Msg::Played(m, ep, res, changes)
         });
     }
 
@@ -2551,7 +2556,7 @@ impl App {
                     p.step = step;
                 }
             }
-            Msg::Played(m, ep, res) => {
+            Msg::Played(m, ep, res, changes) => {
                 if self
                     .playing
                     .as_ref()
@@ -2559,21 +2564,17 @@ impl App {
                 {
                     self.playing = None;
                 }
-                // the show's page has every save since it started ("Watched up to…" meanwhile)
-                let mut m = m;
-                let on_screen = self.stack.iter().rev().find_map(|s| match &s.view {
-                    View::Show(x) | View::Episodes(x, _) if x.id == m.id => Some(x),
-                    _ => None,
-                });
-                if let Some(x) = on_screen {
-                    m.media_list_entry = x.media_list_entry.clone();
-                }
                 // not watched yet, as far as the show or the sequel it's in goes
                 let ask = (self.progress_target(&m, &ep))
                     .is_some_and(|(p, n)| !m.watched(&ep) && n > p.progress() as f64);
                 match res {
                     Err(e) => self.toast(format!("Couldn't play episode {ep} · {e}"), true),
                     Ok(()) if ask && self.user.is_some() && m.on_anilist() => {
+                        // a save while it played ("Watched up to…") leaves `m`'s progress behind
+                        if LIST_CHANGES.load(Ordering::Relaxed) != changes {
+                            let why = "your list changed while it played";
+                            return self.toast(format!("Episode {ep} not asked: {why}"), false);
+                        }
                         let title = format!("Mark episode {ep} of {} as watched?", m.name());
                         self.ask_progress(&m, &ep, title);
                     }
