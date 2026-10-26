@@ -1,17 +1,22 @@
-//! Kitty graphics protocol (Kitty, Ghostty). A poster's pixels go into a file in /dev/shm
-//! and only its path travels through the terminal (~100 bytes instead of megabytes of
-//! base64), so posters can be sent ahead of time and switching between them costs nothing.
-//! The terminal shows an image wherever its Unicode placeholder cells are drawn.
+//! Posters, through the Kitty graphics protocol (Kitty, Ghostty). A poster's pixels go into
+//! a file in /dev/shm and only its path travels through the terminal (~100 bytes instead of
+//! megabytes of base64), so posters can be sent ahead of time and switching between them
+//! costs nothing. The terminal shows an image wherever its Unicode placeholder cells are
+//! drawn.
 
+use crate::anilist::{self, Media};
 use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Rect, Size};
 use ratatui::style::Color;
+use std::collections::HashMap;
+use std::fs;
 use std::io::Write;
 use std::num::NonZeroU16;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 /// Set by `shutdown`; `prepare` won't write a file after that, so none outlive the app.
 static CLOSED: Mutex<bool> = Mutex::new(false);
@@ -32,15 +37,219 @@ const DIACRITICS: [char; 64] = [
 
 /// A poster the terminal already holds, `size` in cells.
 #[derive(Clone, Copy)]
-pub struct Poster {
-    pub id: u32,
-    pub size: Size,
+struct Poster {
+    id: u32,
+    size: Size,
+}
+
+/// A poster is made for a size in cells and the pixels per cell (font zoom changes those).
+pub type Key = (Size, (u16, u16));
+
+enum Cover {
+    Loading(Key),
+    Ready(Key, Poster),
+    Failed,
+}
+
+/// What the terminal is told: kitty's escape sequences, or a recording in tests.
+pub trait Terminal {
+    /// Hands a prepared poster's pixel file to the terminal as image `id`.
+    fn transmit(&mut self, id: u32, file: &Path, pixels: (u32, u32), cells: Size);
+    /// Frees image `id`.
+    fn delete(&mut self, id: u32);
+    /// Removes pixel files the terminal never read.
+    fn cleanup(&mut self);
+}
+
+/// The terminal ani-hop runs in.
+pub struct Tty;
+
+impl Terminal for Tty {
+    fn transmit(&mut self, id: u32, file: &Path, (w, h): (u32, u32), cells: Size) {
+        let file = base64(file.as_os_str().as_bytes());
+        let (c, r) = (cells.width, cells.height);
+        send(&format!(
+            "\x1b_Gq=2,a=T,U=1,i={id},f=32,t=t,s={w},v={h},c={c},r={r};{file}\x1b\\"
+        ));
+    }
+
+    fn delete(&mut self, id: u32) {
+        send(&format!("\x1b_Gq=2,a=d,d=I,i={id}\x1b\\"));
+    }
+
+    fn cleanup(&mut self) {
+        cleanup();
+    }
+}
+
+/// A poster being prepared in the background: (show, key, pixel file, its size, cells).
+pub type Loaded = (u64, Key, Result<(PathBuf, u32, u32, Size), String>);
+
+/// Fetching a show's cover (from the disk cache, else AniList) and scaling it, to run in the
+/// background.
+pub struct Load {
+    id: u64,
+    url: String,
+    key: Key,
+}
+
+impl Load {
+    pub fn run(self) -> Loaded {
+        let path = crate::ani::cache_dir()
+            .join("covers")
+            .join(format!("{}.jpg", self.id));
+        let (size, cell) = self.key;
+        // a cover cut short (a crash while it was written) is fetched again
+        let cached = fs::read(&path).ok();
+        let res = match cached.map(|b| prepare(&b, size, cell)) {
+            Some(Ok(done)) => Ok(done),
+            _ => anilist::fetch(&self.url).and_then(|bytes| {
+                let _ = crate::ani::write_bytes(&path, &bytes);
+                prepare(&bytes, size, cell)
+            }),
+        };
+        (self.id, self.key, res)
+    }
+}
+
+/// The posters of the shows on screen and just below: loading, held by the terminal, or
+/// failed (the cover's color stands in).
+pub struct Posters<T: Terminal = Tty> {
+    covers: HashMap<u64, Cover>,
+    /// poster size for the next ones, from the last layout, and the pixels per cell
+    size: Size,
+    cell: (u16, u16),
+    /// handed over as files: (file, when); one still there later is unreadable
+    sent: Vec<(PathBuf, Instant)>,
+    next_image: u32,
+    /// no posters this session: no graphics, or the terminal didn't read one
+    off: bool,
+    term: T,
+}
+
+impl<T: Terminal> Posters<T> {
+    pub fn new(term: T, on: bool) -> Self {
+        Posters {
+            covers: HashMap::new(),
+            size: Size::new(0, 0),
+            cell: (10, 20),
+            sent: Vec::new(),
+            // instances sharing one terminal (tmux panes) must not reuse each other's ids
+            next_image: std::process::id().wrapping_mul(2_654_435_761) & 0xFF_FFFF,
+            off: !on,
+            term,
+        }
+    }
+
+    /// The poster size for `rows` rows at most `cols` wide, with `cell` pixels per cell
+    /// (font zoom changes those): a cover's 0.7 aspect. The posters asked for next get it.
+    pub fn fit(&mut self, rows: u16, cols: u16, cell: (u16, u16)) -> Size {
+        let w = ((rows as f32 * cell.1 as f32 * 0.7) / cell.0.max(1) as f32).round() as u16;
+        (self.size, self.cell) = (Size::new(w.min(cols), rows), cell);
+        self.size
+    }
+
+    /// Starts loading `m`'s poster at the size from `fit`, unless it's there or loading.
+    /// `urgent` (the one on screen) goes first; look-ahead ones wait while 4 are on their way
+    /// and get asked for again next frame. What to run in the background, if anything.
+    pub fn want(&mut self, m: &Media, urgent: bool) -> Option<Load> {
+        let key = (self.size, self.cell);
+        let fresh = match self.covers.get(&m.id) {
+            Some(Cover::Loading(k) | Cover::Ready(k, _)) => *k == key,
+            Some(Cover::Failed) => true,
+            None => false,
+        };
+        let busy = (self.covers.values())
+            .filter(|c| matches!(c, Cover::Loading(_)))
+            .count();
+        if fresh || self.size.width == 0 || (busy >= 4 && !urgent) {
+            return None;
+        }
+        // nobody would read (and delete) the pixel files; the cover color stands in
+        if self.off {
+            self.covers.insert(m.id, Cover::Failed);
+            return None;
+        }
+        // shortcut: the terminal keeps ~3 MB per poster; past 60 they all go and reload from
+        // the disk cache in ms
+        if self.covers.len() > 60 {
+            self.forget();
+        }
+        if let Some(Cover::Ready(_, p)) = self.covers.get(&m.id) {
+            self.term.delete(p.id); // resized: the old one is never drawn again
+        }
+        let Some(url) = m.cover_image.extra_large.clone() else {
+            self.covers.insert(m.id, Cover::Failed);
+            return None;
+        };
+        self.covers.insert(m.id, Cover::Loading(key));
+        Some(Load { id: m.id, url, key })
+    }
+
+    /// A poster finished loading: sent to the terminal at once, even a look-ahead one, as
+    /// showing it later is free. One for another size, or no longer wanted, goes.
+    pub fn loaded(&mut self, (id, key, res): Loaded) {
+        let wanted = matches!(self.covers.get(&id), Some(Cover::Loading(k)) if *k == key);
+        match res {
+            Ok((file, w, h, cells)) if wanted => {
+                self.next_image = self.next_image % 0xFF_FFFF + 1; // 24-bit ids, never 0
+                self.term.transmit(self.next_image, &file, (w, h), cells);
+                self.sent.push((file, Instant::now()));
+                let poster = Poster {
+                    id: self.next_image,
+                    size: cells,
+                };
+                self.covers.insert(id, Cover::Ready(key, poster));
+            }
+            Ok((file, ..)) => _ = fs::remove_file(file), // stale, never sent
+            Err(_) if wanted => _ = self.covers.insert(id, Cover::Failed),
+            Err(_) => {}
+        }
+    }
+
+    /// Draws show `id`'s poster into `area`; false while there's none to draw.
+    pub fn draw(&self, id: u64, area: Rect, buf: &mut Buffer) -> bool {
+        match self.covers.get(&id) {
+            Some(Cover::Ready(_, p)) => {
+                render(p, area, buf);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The terminal deletes a poster file once it read it. One still around after 2 s means
+    /// it never will (tmux without passthrough, ssh, ...): posters go off for the session,
+    /// and true says so once.
+    pub fn check(&mut self, now: Instant) -> bool {
+        let old = |s: &(PathBuf, Instant)| now.duration_since(s.1) > Duration::from_secs(2);
+        if !self.sent.iter().any(|s| old(s) && s.0.exists()) {
+            self.sent.retain(|s| !old(s));
+            return false;
+        }
+        self.off = true;
+        self.forget();
+        true
+    }
+
+    /// Frees every poster in the terminal.
+    pub fn forget(&mut self) {
+        for c in self.covers.values() {
+            if let Cover::Ready(_, p) = c {
+                self.term.delete(p.id);
+            }
+        }
+        self.covers.clear();
+        self.sent.clear();
+        self.term.cleanup(); // files of the in-flight ones come back unwanted and go too
+    }
 }
 
 /// Pixels per cell; Ghostty and Kitty report the window size in pixels.
 pub fn cell_px() -> (u16, u16) {
     match ratatui::crossterm::terminal::window_size() {
-        Ok(w) if w.width > 0 && w.columns > 0 && w.rows > 0 => {
+        // a cell less than a pixel wide would be one of 0 and divide posters by it
+        Ok(w) if w.columns > 0 && w.rows > 0 && w.width >= w.columns && w.height >= w.rows => {
             (w.width / w.columns, w.height / w.rows)
         }
         _ => (10, 20),
@@ -137,20 +346,6 @@ pub fn init() {
     cleanup();
 }
 
-/// Hands a prepared poster to the terminal; it appears wherever `render` draws `id`.
-pub fn transmit(id: u32, path: &Path, (w, h): (u32, u32), cells: Size) {
-    let file = base64(path.as_os_str().as_bytes());
-    let (c, r) = (cells.width, cells.height);
-    send(&format!(
-        "\x1b_Gq=2,a=T,U=1,i={id},f=32,t=t,s={w},v={h},c={c},r={r};{file}\x1b\\"
-    ));
-}
-
-/// Frees a poster in the terminal.
-pub fn delete(id: u32) {
-    send(&format!("\x1b_Gq=2,a=d,d=I,i={id}\x1b\\"));
-}
-
 fn send(seq: &str) {
     // inside tmux it needs the passthrough wrapper (and `allow-passthrough on`)
     let seq = match std::env::var_os("TMUX") {
@@ -162,7 +357,7 @@ fn send(seq: &str) {
 }
 
 /// Placeholder cells for a poster; the terminal draws the image over them.
-pub fn render(p: &Poster, area: Rect, buf: &mut Buffer) {
+fn render(p: &Poster, area: Rect, buf: &mut Buffer) {
     let fg = Color::Rgb((p.id >> 16) as u8, (p.id >> 8) as u8, p.id as u8);
     let one = CellDiffOption::ForcedWidth(NonZeroU16::MIN);
     for y in 0..p.size.height.min(area.height).min(64) {
@@ -203,6 +398,113 @@ mod tests {
         assert_eq!(base64(b"Ma"), "TWE=");
         assert_eq!(base64(b"M"), "TQ==");
         assert_eq!(base64(b"/dev/shm/x"), "L2Rldi9zaG0veA==");
+    }
+
+    /// What the terminal was told.
+    #[derive(Default)]
+    struct Record(Vec<String>);
+
+    impl Terminal for Record {
+        fn transmit(&mut self, id: u32, _: &Path, _: (u32, u32), _: Size) {
+            self.0.push(format!("show {id}"));
+        }
+        fn delete(&mut self, id: u32) {
+            self.0.push(format!("free {id}"));
+        }
+        fn cleanup(&mut self) {
+            self.0.push("cleanup".into());
+        }
+    }
+
+    fn show(id: u64) -> Media {
+        let mut m = Media {
+            id,
+            ..Default::default()
+        };
+        m.cover_image.extra_large = Some(format!("https://img/{id}.jpg"));
+        m
+    }
+
+    /// A pixel file as `Load::run` leaves it, which the terminal deletes once read.
+    fn pixels(dir: &Path, name: &str) -> PathBuf {
+        let file = dir.join(name);
+        fs::write(&file, "rgba").unwrap();
+        file
+    }
+
+    #[test]
+    fn posters_load_once_per_size_and_stale_ones_go() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-posters-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut p = Posters::new(Record::default(), true);
+        assert!(p.want(&show(1), true).is_none(), "no size yet");
+        let size = p.fit(20, 30, (10, 20));
+        assert_eq!(size, Size::new(28, 20));
+        let load = p.want(&show(1), true).unwrap();
+        assert!(p.want(&show(1), true).is_none(), "on its way");
+        let cells = Size::new(28, 20);
+        p.loaded((1, load.key, Ok((pixels(&dir, "a"), 280, 400, cells))));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 30, 20));
+        assert!(p.draw(1, buf.area, &mut buf) && !p.draw(2, buf.area, &mut buf));
+        // zoomed in: made again for the new size, the old one freed
+        p.fit(20, 30, (12, 24));
+        let again = p.want(&show(1), true).unwrap();
+        let stale = pixels(&dir, "b");
+        p.loaded((1, load.key, Ok((stale.clone(), 280, 400, cells))));
+        assert!(!stale.exists(), "a poster for the old size is never sent");
+        p.loaded((1, again.key, Ok((pixels(&dir, "c"), 280, 400, cells))));
+        let first = p.next_image - 1;
+        assert_eq!(
+            p.term.0,
+            [
+                format!("show {first}"),
+                format!("free {first}"),
+                format!("show {}", first + 1)
+            ]
+        );
+        // look-ahead posters wait while four are on their way
+        let ahead: Vec<_> = (10..14).map(|id| p.want(&show(id), false)).collect();
+        assert!(ahead.iter().all(Option::is_some) && p.want(&show(20), false).is_none());
+        assert!(
+            p.want(&show(21), true).is_some(),
+            "the one on screen doesn't"
+        );
+        p.loaded((10, ahead[0].as_ref().unwrap().key, Err("HTTP 404".into())));
+        assert!(p.want(&show(10), true).is_none(), "failed: its color stays");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_terminal_that_doesnt_read_posters_gets_colors() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-unread-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut p = Posters::new(Record::default(), true);
+        p.fit(20, 30, (10, 20));
+        let load = p.want(&show(1), true).unwrap();
+        let file = pixels(&dir, "a");
+        p.loaded((1, load.key, Ok((file.clone(), 1, 1, Size::new(1, 1)))));
+        let sent = Instant::now();
+        assert!(
+            !p.check(sent + Duration::from_secs(1)),
+            "it has 2 s to read it"
+        );
+        assert!(p.check(sent + Duration::from_secs(3)), "still there: off");
+        assert!(p.term.0.ends_with(&["cleanup".to_string()]));
+        assert!(p.want(&show(2), true).is_none() && !p.check(sent + Duration::from_secs(9)));
+        // one the terminal read and deleted is fine
+        let mut p = Posters::new(Record::default(), true);
+        p.fit(20, 30, (10, 20));
+        let load = p.want(&show(1), true).unwrap();
+        p.loaded((1, load.key, Ok((pixels(&dir, "b"), 1, 1, Size::new(1, 1)))));
+        fs::remove_file(dir.join("b")).unwrap();
+        assert!(!p.check(Instant::now() + Duration::from_secs(3)));
+        // past 60 posters they all go
+        for id in 100..162 {
+            let load = p.want(&show(id), true).unwrap();
+            p.loaded((id, load.key, Err("x".into())));
+        }
+        assert!(p.covers.len() < 60 && p.term.0.contains(&"cleanup".to_string()));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

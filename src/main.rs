@@ -2,28 +2,32 @@
 
 mod ani;
 mod anilist;
+mod downloads;
 mod kitty;
+mod lists;
 mod menu;
+mod progress;
+mod source;
 mod ui;
 
-use ani::Source;
-use anilist::{Client, Entry, EpInfo, Media, PER_PAGE};
+use anilist::{Client, Entry, EpInfo, Media};
+use downloads::{AniCli, Job, Queue};
+use lists::{Feed, List};
 use menu::{Act, Item, Menu};
+use progress::{Mark, Parts, Progress};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
 };
 use ratatui::crossterm::execute;
-use ratatui::layout::Size;
-use serde::{Deserialize, Serialize};
+use source::{Lookup, Source, Sources};
+use std::collections::HashMap;
 use std::collections::hash_map::Entry::Vacant;
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -53,7 +57,7 @@ pub enum View {
     Setup,
     /// switches and the AniList login
     Settings,
-    Shows(Vec<Media>, Feed),
+    Shows(List),
     /// audio picker for a show, or the default (None)
     Audio(Option<Media>),
     Show(Media),
@@ -67,17 +71,6 @@ pub enum View {
     Input(Input),
 }
 
-/// Where a list of shows comes from.
-pub enum Feed {
-    /// the download folder, rescanned on refresh
-    Local,
-    /// an AniList list or search, all at once
-    Whole,
-    /// an AniList ranking (MediaSort) in pages: the next page if there is one, and whether
-    /// it's on its way (the first page may refresh on its own, without "More…")
-    Pages(String, Option<u32>, bool),
-}
-
 #[derive(Clone)]
 pub enum Input {
     Search,
@@ -89,9 +82,10 @@ pub enum Input {
 
 pub enum Pending {
     Delete(Vec<PathBuf>),
-    /// marking an episode watched: the AniList entry that saves it (a sequel's, when the
-    /// provider runs on into it), the progress there, and what to call it if it's a sequel
-    Progress(Media, u32, String),
+    /// marking an episode watched: what Yes saves, as the question says it
+    Progress(Mark),
+    /// taking a show off the list, which loses its progress and score
+    Remove(Media),
     Quit,
     /// queued or downloading episodes to take out of the queue
     Stop(Media, Vec<String>),
@@ -109,65 +103,43 @@ pub struct Screen {
     pub loading: bool,
 }
 
-/// A poster is made for a size in cells and the pixels per cell (font zoom changes those).
-pub type CoverKey = (Size, (u16, u16));
-
-pub enum Cover {
-    Loading(CoverKey),
-    Ready(CoverKey, kitty::Poster),
-    Failed,
-}
-
 enum Want {
     Episodes(EpMode),
     Play(String),
 }
 
-#[derive(Clone, Serialize, Deserialize)]
-pub struct Job {
-    /// tells apart jobs of one show while the worker and stops edit the queue
-    #[serde(skip)]
-    id: u64,
-    pub media: Media,
-    #[serde(skip)]
-    source: Option<Source>,
-    /// None = everything after the AniList progress
-    pub eps: Option<Vec<String>>,
-    /// audio when queued: yt-dlp resumes a half-done episode in whatever audio it gets
-    /// next, so it must not change in between (None in queues of older versions)
-    #[serde(default)]
-    dub: Option<bool>,
-}
-
 enum Msg {
-    /// a list's shows, and where to cache them with LIST_CHANGES from when it was asked for
-    Shows(u64, Result<Vec<Media>, String>, Option<(PathBuf, u64)>),
+    /// a list's refreshed shows
+    Shows(u64, Result<Vec<Media>, String>, lists::Ask),
+    /// the downloaded shows as AniList has them now
+    Local(Result<Vec<Media>, String>),
     /// the next page of a ranking
     More(u64, Result<Vec<Media>, String>),
     Hits(u64, Result<Vec<String>, String>),
-    Viewer(Result<(u64, String), String>),
-    /// prepared poster: pixel file, pixel size, size in cells
-    Cover(u64, CoverKey, Result<(PathBuf, u32, u32, Size), String>),
+    /// who's logged in, asked with this token
+    Viewer(Option<String>, Result<(u64, String, bool), String>),
+    /// a prepared poster
+    Cover(kitty::Loaded),
     EpInfo(u64, HashMap<String, EpInfo>),
     /// sequels of a show, looked up for its episode counts (App::parts_key), login and
     /// LIST_CHANGES
     Parts(u64, (u32, u32), Option<String>, u64, Result<Parts, String>),
-    Resolved(Media, Result<Source, String>),
+    /// a lookup's answer, with its ticket (Sources::ask)
+    Resolved(Media, u64, Result<Source, String>),
     Saved(Media, Result<Option<Entry>, String>),
+    /// the show taken off the list, or why not
+    Removed(Media, Result<(), String>),
     /// progress not saved, as AniList's entry moved since the question was asked: (the
     /// entry's media, the entry now)
     Moved(Media, Option<Entry>),
     /// (media, episode, what it waits on now; None = the player is up)
     PlayStep(u64, String, Option<&'static str>),
     Played(Media, String, Result<(), String>),
-    DlProgress(DlNow),
+    /// an episode downloaded or failed: ("Show E3", result)
     DlDone(String, Result<(), String>),
     /// (version, update command) of a newer ani-hop
     Release(Option<(String, String)>),
 }
-
-/// AniList sequels a provider entry runs on into, each with the episodes before it.
-type Parts = Vec<(u32, Media)>;
 
 /// The episode being started or watched.
 pub struct Playing {
@@ -179,17 +151,6 @@ pub struct Playing {
     /// when enter was pressed, for the pop-up
     pub since: Instant,
     pub color: Option<String>,
-}
-
-/// The episode being downloaded and how far it got.
-pub struct DlNow {
-    pub id: u64,
-    pub ep: String,
-    /// "Show E3", for the footer
-    pub label: String,
-    pub text: String,
-    /// yt-dlp's, which goes on from what it got after a pause; ffmpeg starts over
-    pub resumes: bool,
 }
 
 /// Where an episode stands with downloads.
@@ -247,35 +208,22 @@ pub struct App {
     rx: Receiver<Msg>,
     client: Client,
     pub user: Option<(u64, String)>,
-    /// pixels per cell, read from the terminal every frame (font zoom changes it)
-    pub cell: (u16, u16),
-    next_image: u32,
-    /// posters handed over as files: (file, when, media id); still there later = unreadable
-    sent: Vec<(PathBuf, Instant, u64)>,
-    /// the terminal didn't read a poster file, so posters are off for this session
-    no_graphics: bool,
+    pub posters: kitty::Posters,
     /// AniList list changes not answered yet
     saves_pending: usize,
-    pub covers: HashMap<u64, Cover>,
     /// episode titles and summaries per show (empty while loading or when there are none)
     pub ep_info: HashMap<u64, HashMap<String, EpInfo>>,
     /// AniList sequels per show that its provider entry runs on into, each with the episodes
     /// before it (empty while loading or when there are none), and the episode counts they
     /// were looked up for
     parts: HashMap<u64, ((u32, u32), Parts)>,
-    /// poster size in cells, set by the last layout
-    pub poster: Size,
-    pub sources: HashMap<u64, Source>,
-    /// sources re-resolved this session (the rest come from the disk cache)
-    fresh: HashSet<u64>,
+    pub sources: Sources,
     /// downloaded episodes per show, rescanned on refresh
     pub local: HashMap<u64, Vec<(String, PathBuf)>>,
     /// episodes per show other running ani-hops have queued, rescanned on refresh
     elsewhere: HashMap<u64, Vec<String>>,
     resolving: HashMap<u64, Option<Want>>,
-    /// tells the download worker there's something in the queue
-    dl_wake: Sender<()>,
-    pub dl_now: Option<DlNow>,
+    pub downloads: Queue,
     pub playing: Option<Playing>,
     pub toast: Option<(String, bool, Instant)>,
     pub started: Instant,
@@ -316,21 +264,21 @@ fn main() -> std::io::Result<()> {
         }
     }
     ani::setup()?;
-    // every way out stops the download, panics too: a left-behind ani-cli would finish the
-    // episode with ffmpeg, as a file that looks complete
-    struct StopDownload;
-    impl Drop for StopDownload {
-        fn drop(&mut self) {
-            ani::stop_download();
-        }
-    }
-    let _stop = StopDownload;
     kitty::init();
     let mut terminal = ratatui::init();
     execute!(std::io::stdout(), EnableBracketedPaste)?;
     // Kitty graphics only (Kitty and Ghostty); the query is just for font size and o=z support.
 
     let mut app = App::new();
+    // every way out stops the download, panics too: a left-behind ani-cli would finish the
+    // episode with ffmpeg, as a file that looks complete
+    struct StopDownload(Queue);
+    impl Drop for StopDownload {
+        fn drop(&mut self) {
+            self.0.quit();
+        }
+    }
+    let _stop = StopDownload(app.downloads.clone());
     let res = (|| -> std::io::Result<()> {
         let mut dirty = true;
         while !app.quit {
@@ -356,7 +304,13 @@ fn main() -> std::io::Result<()> {
                 app.on_msg(msg);
                 dirty = true;
             }
-            dirty |= app.check_sent();
+            if app.posters.check(Instant::now()) {
+                app.toast(
+                    "This terminal didn't take the posters, showing colors instead",
+                    true,
+                );
+                dirty = true;
+            }
             if let Some(cmd) = app.external.take() {
                 execute!(std::io::stdout(), DisableBracketedPaste)?;
                 ratatui::restore();
@@ -369,7 +323,7 @@ fn main() -> std::io::Result<()> {
         }
         Ok(())
     })();
-    app.forget_posters();
+    app.posters.forget();
     kitty::shutdown();
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
@@ -408,9 +362,6 @@ fn run_in_terminal(cmd: &str) {
     let _ = std::io::stdin().read_line(&mut String::new());
 }
 
-/// Bumped on every list change, so refreshes that started before it don't count as fresh.
-static LIST_CHANGES: AtomicU64 = AtomicU64::new(0);
-
 fn token_path() -> PathBuf {
     ani::config_dir().join("token")
 }
@@ -420,36 +371,6 @@ fn user_path() -> PathBuf {
     ani::config_dir().join("user.json")
 }
 
-fn list_cache(key: &str) -> PathBuf {
-    ani::cache_dir().join("lists").join(format!("{key}.json"))
-}
-
-/// A cached list: its shows and, for a ranking, the page "More…" fetches next.
-type Cached = (Vec<Media>, Option<u32>);
-
-/// What a cached list shows when it opens, and whether that's fresh enough to skip AniList.
-/// A ranking hardly moves in an hour and keeps every page loaded; a list of yours changes as
-/// you watch, so 2 minutes. Past that only the first page shows, which the refresh replaces.
-fn from_cache(
-    cached: Option<Cached>,
-    age: Option<Duration>,
-    feed: &mut Feed,
-) -> (Vec<Media>, bool) {
-    let ttl = match feed {
-        Feed::Pages(..) => 60 * 60,
-        _ => 120,
-    };
-    let fresh = cached.is_some() && age.is_some_and(|a| a < Duration::from_secs(ttl));
-    let (mut list, next) = cached.unwrap_or_default();
-    if let Feed::Pages(_, n, _) = feed {
-        match fresh {
-            true => *n = next,
-            false => list.truncate(PER_PAGE),
-        }
-    }
-    (list, fresh)
-}
-
 fn client_id() -> Option<String> {
     fs::read_to_string(ani::config_dir().join("client_id"))
         .ok()
@@ -457,16 +378,24 @@ fn client_id() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Readable only by the user, and written aside then renamed: a crash mid-write keeps the
+/// login that was there.
 fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
     fs::create_dir_all(ani::config_dir())?;
     use std::io::Write;
-    fs::OpenOptions::new()
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let res = (fs::OpenOptions::new())
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
-        .open(path)?
-        .write_all(text.as_bytes())
+        .open(&tmp)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .and_then(|()| fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
 }
 
 /// Accepts the bare token or the whole redirect URL with `#access_token=...`.
@@ -487,22 +416,6 @@ fn open_url(url: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-}
-
-/// Cover from the disk cache (or AniList), scaled and written out for the terminal.
-fn load_cover(
-    id: u64,
-    url: &str,
-    (size, cell): CoverKey,
-) -> Result<(PathBuf, u32, u32, Size), String> {
-    let path = ani::cache_dir().join("covers").join(format!("{id}.jpg"));
-    let bytes = fs::read(&path).or_else(|_| {
-        let bytes = anilist::fetch(url)?;
-        let _ = fs::create_dir_all(path.parent().unwrap());
-        let _ = fs::write(&path, &bytes);
-        Ok::<_, String>(bytes)
-    })?;
-    kitty::prepare(&bytes, size, cell)
 }
 
 /// Episode titles and summaries from the disk cache, or ani.zip once it is a day old (a
@@ -534,202 +447,6 @@ fn load_episodes(m: &Media) -> HashMap<String, EpInfo> {
     }
 }
 
-/// Downloads an ani-hop still has to do, kept on disk so the next start can resume them
-/// after quitting early, a crash or a closed terminal. One file per process, as several
-/// can run at once.
-fn queue_file(pid: &str) -> PathBuf {
-    ani::cache_dir().join("queue").join(format!("{pid}.json"))
-}
-
-fn read_queue(path: &Path) -> Vec<Job> {
-    ani::read_json(path)
-}
-
-/// This ani-hop's downloads, oldest first and the running one included: what the worker
-/// does next, what the footer counts and what the next start resumes after quitting early.
-static QUEUE: Mutex<Vec<Job>> = Mutex::new(Vec::new());
-
-fn queue<R>(f: impl FnOnce(&[Job]) -> R) -> R {
-    f(&QUEUE.lock().unwrap_or_else(|e| e.into_inner()))
-}
-
-/// Changes the queue and its saved copy; jobs with nothing left fall out.
-fn edit_queue<R>(f: impl FnOnce(&mut Vec<Job>) -> R) -> R {
-    let mut q = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
-    let r = f(&mut q);
-    q.retain(|j| j.eps.as_ref().is_none_or(|e| !e.is_empty()));
-    let path = queue_file(&std::process::id().to_string());
-    match q.is_empty() {
-        true => _ = fs::remove_file(&path),
-        false => _ = ani::write_json(&path, &*q),
-    }
-    r
-}
-
-/// Episodes still to download; a show whose episodes the worker hasn't looked up counts as one.
-pub fn dl_pending() -> usize {
-    queue(|q| q.iter().map(|j| j.eps.as_ref().map_or(1, Vec::len)).sum())
-}
-
-fn is_queued(id: u64, ep: &str) -> bool {
-    queue(|q| {
-        q.iter()
-            .filter(|j| j.media.id == id)
-            .any(|j| j.eps.as_ref().is_some_and(|e| e.iter().any(|x| x == ep)))
-    })
-}
-
-/// What a job without episodes downloads: everything after the AniList progress that
-/// isn't on disk yet.
-fn to_download(m: &Media, eps: &[String], on_disk: &[(String, PathBuf)]) -> Vec<String> {
-    eps.iter()
-        .filter(|e| ani::ep_num(e) > m.progress() as f64)
-        .filter(|e| !on_disk.iter().any(|(d, _)| d == *e))
-        .cloned()
-        .collect()
-}
-
-fn queue_files() -> Vec<PathBuf> {
-    let Ok(dir) = fs::read_dir(ani::cache_dir().join("queue")) else {
-        return Vec::new();
-    };
-    dir.flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "json"))
-        .collect()
-}
-
-/// Saved queues of ani-hops that are gone. Our own pid can only be a leftover too.
-fn orphaned_queues() -> (Vec<Job>, Vec<PathBuf>) {
-    let me = std::process::id().to_string();
-    let files: Vec<PathBuf> = queue_files()
-        .into_iter()
-        .filter(|p| {
-            let pid = p.file_stem().unwrap_or_default().to_string_lossy();
-            pid == me || !ani::running(&pid)
-        })
-        .collect();
-    (files.iter().flat_map(|p| read_queue(p)).collect(), files)
-}
-
-/// Takes over saved queues. Another ani-hop may have asked too: whoever deletes a file
-/// gets its jobs.
-fn claim(files: &[PathBuf]) -> Vec<Job> {
-    files
-        .iter()
-        .flat_map(|f| {
-            let jobs = read_queue(f);
-            fs::remove_file(f).map_or(Vec::new(), |()| jobs)
-        })
-        .collect()
-}
-
-/// Works through the queue until it's empty or paused, then waits to be woken.
-fn spawn_downloader(tx: Sender<Msg>) -> Sender<()> {
-    let (wake, woken) = mpsc::channel::<()>();
-    thread::spawn(move || {
-        for () in woken {
-            while !ani::paused()
-                && let Some(job) = queue(|q| q.first().cloned())
-            {
-                if !work(job, &tx) {
-                    return; // quitting: what's left stays saved for the next start
-                }
-            }
-        }
-    });
-    wake
-}
-
-/// Downloads a job's episodes, each looked up in the queue right before it starts, so
-/// stopped ones are skipped. Returns at a pause, false once quitting stopped the downloads.
-fn work(job: Job, tx: &Sender<Msg>) -> bool {
-    let m = &job.media;
-    let src = match job.source.map_or_else(|| ani::resolve(m), Ok) {
-        Ok(s) => s,
-        Err(e) => {
-            edit_queue(|q| q.retain(|j| j.id != job.id));
-            let _ = tx.send(Msg::DlDone(m.name().to_string(), Err(e)));
-            return true;
-        }
-    };
-    let all = (job.eps.is_none())
-        .then(|| to_download(m, &src.episodes, &ani::local_episodes(&ani::folder(m))));
-    edit_queue(|q| {
-        if let Some(j) = q.iter_mut().find(|j| j.id == job.id) {
-            // after a pause it goes on from here, without looking the show up again
-            j.source.get_or_insert_with(|| src.clone());
-            // stopping one of them may have listed them already
-            if let Some(all) = all {
-                j.eps.get_or_insert(all);
-            }
-        }
-    });
-    let dub = job.dub.unwrap_or_default();
-    loop {
-        let next = queue(|q| {
-            q.iter()
-                .find(|j| j.id == job.id)?
-                .eps
-                .as_ref()?
-                .first()
-                .cloned()
-        });
-        let Some(ep) = next else {
-            return true;
-        };
-        let label = format!("{} E{ep}", m.name());
-        let now = |text: &str, resumes| {
-            let (id, ep, label) = (m.id, ep.clone(), label.clone());
-            Msg::DlProgress(DlNow {
-                id,
-                ep,
-                label,
-                text: text.into(),
-                resumes,
-            })
-        };
-        let _ = tx.send(now("starting", true));
-        // this job's, not just queued: stopped and queued again is another job, with its audio
-        let mine = |q: &[Job]| {
-            (q.iter()).any(|j| j.id == job.id && j.eps.as_ref().is_some_and(|e| e.contains(&ep)))
-        };
-        let res = ani::download(
-            m,
-            &src,
-            &ep,
-            dub,
-            || queue(mine),
-            |p, r| _ = tx.send(now(p, r)),
-        );
-        if res.is_err() && ani::stopped() {
-            return false;
-        }
-        // paused, and maybe resumed already: it stays first, to go on from what it got
-        if res.as_ref().is_err_and(|e| e == ani::STOPPED) && queue(mine) {
-            match ani::paused() {
-                true => return true,
-                false => continue,
-            }
-        }
-        // gone from the job already: stopped (and maybe queued again since, which stays)
-        let stopped = !edit_queue(|q| {
-            let had = mine(q);
-            // done with it, also where another job of the show has it
-            for j in q.iter_mut().filter(|j| had && j.media.id == m.id) {
-                if let Some(e) = &mut j.eps {
-                    e.retain(|x| *x != ep);
-                }
-            }
-            had
-        });
-        match stopped {
-            true => ani::discard(&ani::folder(m), std::slice::from_ref(&ep)),
-            false => _ = tx.send(Msg::DlDone(label, res)),
-        }
-    }
-}
-
 impl App {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel();
@@ -742,30 +459,29 @@ impl App {
             anilist::ENGLISH_TITLES.store(*english, Ordering::Relaxed);
         }
         let client = Client { token };
+        let done = tx.clone();
+        let downloads = Queue::start(
+            ani::cache_dir().join("queue"),
+            std::process::id().to_string(),
+            AniCli,
+            move |label, res| _ = done.send(Msg::DlDone(label, res)),
+        );
         let mut app = App {
             stack: Vec::new(),
             next_id: 0,
-            dl_wake: spawn_downloader(tx.clone()),
+            downloads,
             tx,
             rx,
             client,
             user: user.map(|(id, name, _)| (id, name)),
-            cell: kitty::cell_px(),
-            // instances sharing one terminal (tmux panes) must not reuse each other's ids
-            next_image: std::process::id().wrapping_mul(2_654_435_761) & 0xFF_FFFF,
-            sent: Vec::new(),
-            no_graphics: false,
+            posters: kitty::Posters::new(kitty::Tty, kitty::supported()),
             saves_pending: 0,
-            covers: HashMap::new(),
             ep_info: HashMap::new(),
             parts: HashMap::new(),
-            poster: Size::new(0, 0),
-            sources: ani::load_resolved(),
-            fresh: HashSet::new(),
+            sources: Sources::load(),
             local: HashMap::new(),
             elsewhere: HashMap::new(),
             resolving: HashMap::new(),
-            dl_now: None,
             playing: None,
             toast: None,
             started: Instant::now(),
@@ -790,7 +506,7 @@ impl App {
             app.push(if first { "Welcome" } else { "Setup" }, View::Setup);
         }
         // on top, so it's answered before anything can log in and reset the screens
-        match orphaned_queues() {
+        match app.downloads.leftovers() {
             (jobs, files) if jobs.is_empty() => files.iter().for_each(|f| _ = fs::remove_file(f)),
             (jobs, files) => {
                 app.push(
@@ -802,7 +518,7 @@ impl App {
         }
         if app.client.token.is_some() {
             let c = app.client.clone();
-            app.spawn(move || Msg::Viewer(c.viewer()));
+            app.spawn(move || Msg::Viewer(c.token.clone(), c.viewer()));
         }
         app.spawn(|| Msg::Release(newer_release().map(|v| (v, ani::update_command()))));
         app
@@ -849,38 +565,39 @@ impl App {
         self.stack.last_mut().unwrap()
     }
 
-    /// Queues a download, saved first so quitting early doesn't lose it.
-    fn download(&mut self, mut job: Job) {
-        static NEXT: AtomicU64 = AtomicU64::new(1);
-        job.id = NEXT.fetch_add(1, Ordering::Relaxed);
-        job.dub
-            .get_or_insert_with(|| ani::dub(ani::audio(Some(job.media.id))));
-        edit_queue(|q| q.push(job));
-        ani::resume(); // asking for one is asking for downloads to go on
-        let _ = self.dl_wake.send(());
+    /// Queues a download, saved first so quitting early doesn't lose it; false (and says
+    /// why) when that can't be saved.
+    fn download(&mut self, job: Job) -> bool {
+        let res = self.downloads.enqueue(job);
+        if let Err(e) = &res {
+            self.toast(format!("Not queued · {e}"), true);
+        }
+        res.is_ok()
     }
 
     /// The episode downloading, or paused, when ffmpeg has it, which can't go on from what it
     /// got: "Episode 3", or "Show E3" when `m`, the show on screen, isn't its show.
     fn restarts(&self, m: &Media) -> Option<String> {
-        let n = self.dl_now.as_ref().filter(|n| !n.resumes)?;
+        let n = self.downloads.snapshot().now.filter(|n| !n.resumes)?;
         Some(match n.id == m.id {
             true => format!("Episode {}", n.ep),
-            false => n.label.clone(),
+            false => n.label,
         })
     }
 
     /// Whether episode `ep` of `m` is the one downloading, not paused.
     fn downloading(&self, m: &Media, ep: &str) -> bool {
-        !ani::paused() && (self.dl_now.as_ref()).is_some_and(|n| n.id == m.id && n.ep == ep)
+        let s = self.downloads.snapshot();
+        !s.paused && s.now.is_some_and(|n| n.id == m.id && n.ep == ep)
     }
 
     /// Whether enter on `stop` (queued episodes of `m`) is about pausing or resuming them all:
     /// on the one downloading, or with downloads paused, on any queued one.
     fn holds(&self, m: &Media, stop: &[String]) -> bool {
-        match ani::paused() {
+        let s = self.downloads.snapshot();
+        match s.paused {
             true => !stop.is_empty(),
-            false => (self.dl_now.as_ref()).is_some_and(|n| n.id == m.id && stop.contains(&n.ep)),
+            false => s.now.is_some_and(|n| n.id == m.id && stop.contains(&n.ep)),
         }
     }
 
@@ -888,20 +605,10 @@ impl App {
     /// deletes what it got of it.
     fn stop(&mut self, m: &Media, eps: &[String]) {
         let on_disk = self.local.get(&m.id).cloned().unwrap_or_default();
-        let src = self.sources.get(&m.id);
-        edit_queue(|q| {
-            for j in q.iter_mut().filter(|j| j.media.id == m.id) {
-                // a job the worker hasn't looked up yet gets its episodes listed, minus these
-                if let (None, Some(s)) = (&j.eps, src) {
-                    j.eps = Some(to_download(&j.media, &s.episodes, &on_disk));
-                }
-                if let Some(e) = &mut j.eps {
-                    e.retain(|x| !eps.contains(x));
-                }
-            }
-        });
-        ani::stop_episodes(&ani::folder(m), eps);
-        self.dl_now.take_if(|n| n.id == m.id && eps.contains(&n.ep));
+        let src = self.sources.get(m.id);
+        if let Err(e) = self.downloads.stop(m, eps, src, &on_disk) {
+            self.toast(e, true);
+        }
     }
 
     /// Enter on episodes in Downloads: what their state allows (download, stop, delete).
@@ -941,7 +648,7 @@ impl App {
         // ffmpeg can't go on from what it got, so pausing loses that, and asks like stopping
         if action == "pause"
             && let Some(which) = self.restarts(&m)
-            && let Some(ep) = self.dl_now.as_ref().map(|n| n.ep.clone())
+            && let Some(ep) = self.downloads.snapshot().now.map(|n| n.ep)
         {
             let title = format!("Pause downloads? {which} starts over when resumed");
             self.push(title, View::Confirm(Pending::Pause(m, ep)));
@@ -958,41 +665,37 @@ impl App {
         }
         // the question may be older than the states it was about
         if action == "download" && !get.is_empty() {
-            // a cached source gets re-checked by the worker anyway, a fresh one is ready
-            let source = (self.fresh.contains(&m.id))
-                .then(|| self.sources.get(&m.id).cloned())
-                .flatten();
+            let lookup = self.sources.lookup(m.id);
             // paused with something held, not just a pause left over from an emptied queue
-            let going = if ani::paused() && dl_pending() > 0 {
-                " · resuming downloads"
-            } else {
-                ""
+            let s = self.downloads.snapshot();
+            let going = match s.paused && s.pending > 0 {
+                true => " · resuming downloads",
+                false => "",
             };
-            self.toast(format!("Queued {}{going}", which(&get)), false);
-            let (media, eps) = (m, Some(get));
-            self.download(Job {
-                id: 0,
-                media,
-                source,
-                eps,
-                dub: None,
-            });
+            let queued = format!("Queued {}{going}", which(&get));
+            let mut job = Job::new(m, Some(get));
+            job.lookup = lookup;
+            if self.download(job) {
+                self.toast(queued, false);
+            }
         } else if action == "stop" && !stop.is_empty() {
             self.toast(format!("Stopped downloading {}", which(&stop)), false);
             self.stop(&m, &stop);
-        } else if action == "pause" && hold && !ani::paused() {
-            // the one it was offered for (holds: dl_now); one that started since may be
-            // ffmpeg's, whose pause asks first
-            let ep = self.dl_now.as_ref().map_or("", |n| n.ep.as_str());
-            if ani::pause(&ani::folder(&m), ep) {
+        } else if action == "pause" && hold && !self.downloads.snapshot().paused {
+            // the one it was offered for (holds: now); one that started since may be ffmpeg's,
+            // whose pause asks first
+            let ep = self.downloads.snapshot().now.map(|n| n.ep);
+            if self
+                .downloads
+                .pause(m.id, ep.as_deref().unwrap_or_default())
+            {
                 self.toast(
                     "Paused downloads · enter on a queued episode resumes them",
                     false,
                 );
             }
-        } else if action == "resume" && ani::paused() {
-            ani::resume();
-            let _ = self.dl_wake.send(());
+        } else if action == "resume" && self.downloads.snapshot().paused {
+            self.downloads.resume();
             self.toast("Resuming downloads", false);
         }
         self.top().menu.marked.clear();
@@ -1012,7 +715,7 @@ impl App {
             .collect();
         let (get, stop, delete) = self.downloads(m).split(&eps);
         match (get.is_empty(), stop.is_empty(), delete.is_empty()) {
-            _ if self.holds(m, &stop) && ani::paused() => "resume…",
+            _ if self.holds(m, &stop) && self.downloads.snapshot().paused => "resume…",
             _ if self.holds(m, &stop) => "pause…",
             (false, true, true) => "download",
             (true, false, true) => "stop",
@@ -1051,23 +754,18 @@ impl App {
     fn push_loading(
         &mut self,
         title: &str,
-        mut feed: Feed,
+        feed: Feed,
         cache: Option<String>,
         f: impl FnOnce() -> Result<Vec<Media>, String> + Send + 'static,
     ) {
-        let path = cache.map(|k| list_cache(&k));
-        let cached: Option<Cached> = path.as_ref().and_then(|p| ani::read_json(p));
-        let age = path
-            .as_ref()
-            .and_then(|p| fs::metadata(p).ok()?.modified().ok()?.elapsed().ok());
-        let (list, fresh) = from_cache(cached, age, &mut feed);
-        let id = self.push(title, View::Shows(list, feed));
-        if fresh {
+        let cache = cache.map(|k| lists::cache(&k));
+        let (list, ask) = List::open(feed, cache, std::time::SystemTime::now());
+        let id = self.push(title, View::Shows(list));
+        let Some(ask) = ask else {
             return;
-        }
+        };
         self.top().loading = true;
-        let cache = path.map(|p| (p, LIST_CHANGES.load(Ordering::Relaxed)));
-        self.spawn(move || Msg::Shows(id, f(), cache));
+        self.spawn(move || Msg::Shows(id, f(), ask));
     }
 
     fn pop(&mut self, n: usize) {
@@ -1090,8 +788,10 @@ impl App {
     /// Rebuilds the visible menu from current state (keeps query and cursor).
     fn refresh(&mut self) {
         self.scan_local();
-        if let View::Shows(list, Feed::Local) = &mut self.top().view {
-            *list = ani::local_shows().into_iter().map(|(m, _)| m).collect();
+        if let View::Shows(list) = &mut self.top().view
+            && list.is_local()
+        {
+            list.shows = ani::local_shows().into_iter().map(|(m, _)| m).collect();
         }
         let items = self.items(&self.stack.last().unwrap().view);
         // a chooser whose action under the cursor went (the episode finished, say), or a pause
@@ -1116,34 +816,13 @@ impl App {
             .into_iter()
             .map(|(m, p)| (m.id, ani::local_episodes(&p)))
             .collect();
-        let me = std::process::id().to_string();
-        self.elsewhere.clear();
-        for p in queue_files() {
-            let pid = p.file_stem().unwrap_or_default().to_string_lossy();
-            if pid == me || !ani::running(&pid) {
-                continue;
-            }
-            for j in read_queue(&p) {
-                let eps = self.elsewhere.entry(j.media.id).or_default();
-                eps.extend(j.eps.unwrap_or_default());
-            }
-        }
+        self.elsewhere = self.downloads.elsewhere();
     }
 
     /// Where `m`'s episodes stand, as of the last rescan and the queue now.
     fn downloads(&self, m: &Media) -> Downloads {
         let on_disk = self.local.get(&m.id).cloned().unwrap_or_default();
-        let src = self.sources.get(&m.id);
-        let queued = queue(|q| {
-            (q.iter().filter(|j| j.media.id == m.id))
-                .flat_map(|j| match (&j.eps, src) {
-                    (Some(eps), _) => eps.clone(),
-                    // not looked up by the worker yet
-                    (None, Some(s)) => to_download(&j.media, &s.episodes, &on_disk),
-                    (None, None) => Vec::new(),
-                })
-                .collect()
-        });
+        let queued = (self.downloads).queued(m, self.sources.get(m.id), &on_disk);
         let elsewhere = self.elsewhere.get(&m.id).cloned().unwrap_or_default();
         Downloads {
             on_disk,
@@ -1156,50 +835,18 @@ impl App {
     fn animating(&self) -> bool {
         ui::effects_running(self)
             || self.stack.last().unwrap().loading
-            || dl_pending() > 0 && !ani::paused()
+            || self.downloads.snapshot().pending > 0 && !self.downloads.snapshot().paused
             || self
                 .toast
                 .as_ref()
                 .is_some_and(|t| t.2.elapsed().as_secs() < 5)
     }
 
-    /// Starts loading a poster at the current size. `urgent` (the one on screen) skips the
-    /// queue; look-ahead ones wait while 4 are in flight and get asked for again next frame.
+    /// Starts loading a show's poster at the size of the last layout; `urgent` is the one on
+    /// screen.
     pub fn want_cover(&mut self, m: &Media, urgent: bool) {
-        let (size, key) = (self.poster, (self.poster, self.cell));
-        let fresh = match self.covers.get(&m.id) {
-            Some(Cover::Loading(k) | Cover::Ready(k, _)) => *k == key,
-            Some(Cover::Failed) => true,
-            None => false,
-        };
-        let busy = self
-            .covers
-            .values()
-            .filter(|c| matches!(c, Cover::Loading(_)))
-            .count();
-        if fresh || size.width == 0 || (busy >= 4 && !urgent) {
-            return;
-        }
-        // nobody would read (and delete) the pixel files; the cover color stands in
-        if !kitty::supported() || self.no_graphics {
-            self.covers.insert(m.id, Cover::Failed);
-            return;
-        }
-        // ponytail: the terminal keeps ~3 MB per poster; past 60 they all go and reload from
-        // the disk cache in ms
-        if self.covers.len() > 60 {
-            self.forget_posters();
-        }
-        if let Some(Cover::Ready(_, p)) = self.covers.get(&m.id) {
-            kitty::delete(p.id); // resized: the old one is never drawn again
-        }
-        match m.cover_image.extra_large.clone() {
-            Some(url) => {
-                self.covers.insert(m.id, Cover::Loading(key));
-                let id = m.id;
-                self.spawn(move || Msg::Cover(id, key, load_cover(id, &url, key)));
-            }
-            None => _ = self.covers.insert(m.id, Cover::Failed),
+        if let Some(load) = self.posters.want(m, urgent) {
+            self.spawn(move || Msg::Cover(load.run()));
         }
     }
 
@@ -1228,7 +875,7 @@ impl App {
         if self.parts.get(&m.id).is_none_or(|p| p.0 != key) {
             self.parts.insert(m.id, (key, Vec::new()));
             let (m, c) = (m.clone(), self.client.clone());
-            let asked = (c.token.clone(), LIST_CHANGES.load(Ordering::Relaxed));
+            let asked = (c.token.clone(), lists::changes());
             self.spawn(move || {
                 let parts = c.parts(&m, key.0);
                 Msg::Parts(m.id, key, asked.0, asked.1, parts)
@@ -1238,7 +885,7 @@ impl App {
 
     /// The provider's last whole episode and AniList's count, when the provider has more.
     fn parts_key(&self, m: &Media) -> Option<(u32, u32)> {
-        let src = self.sources.get(&m.id)?;
+        let src = self.sources.get(m.id)?;
         let last = src.episodes.iter().filter_map(|e| e.parse().ok()).max()?;
         m.episodes.filter(|own| last > *own).map(|own| (last, own))
     }
@@ -1251,65 +898,24 @@ impl App {
         }
     }
 
-    /// The AniList entry episode `ep` of `m` counts toward, and its number there.
-    fn part<'a>(&'a self, m: &'a Media, ep: &str) -> (&'a Media, String) {
-        part(m, self.parts(m), ep)
+    /// `m`'s episodes as AniList counts them, with the parts known so far.
+    pub fn progress<'a>(&'a self, m: &'a Media) -> Progress<'a> {
+        Progress::of(m, self.parts(m))
     }
 
-    fn progress_target<'a>(&'a self, m: &'a Media, ep: &str) -> Option<(&'a Media, f64)> {
-        progress_target(m, self.parts(m), ep)
-    }
-
-    pub fn watched(&self, m: &Media, ep: &str) -> bool {
-        watched(m, self.parts(m), ep)
+    /// AniList says none of `m` is out, and ani-cli has no source for it, known, picked by
+    /// hand or being looked up: a search could only fail, or find another show.
+    pub fn upcoming(&self, m: &Media) -> bool {
+        m.released() == Some(0)
+            && self.sources.get(m.id).is_none()
+            && !self.sources.picked(m.id)
+            && !self.resolving.contains_key(&m.id)
     }
 
     /// What episode `ep` of `m` is called and about.
     pub fn ep_about(&self, m: &Media, ep: &str) -> Option<&EpInfo> {
-        let (p, n) = self.part(m, ep);
+        let (p, n) = self.progress(m).entry(ep);
         self.ep_info.get(&p.id)?.get(&n)
-    }
-
-    /// The episode after the last one watched, also in a sequel the provider runs on into.
-    pub fn next_ep(&self, m: &Media) -> u32 {
-        next_ep(m, self.parts(m))
-    }
-
-    /// Episodes out right now, with those of the sequels the provider runs on into.
-    fn released(&self, m: &Media) -> Option<u32> {
-        match self.parts(m).last() {
-            Some((before, p)) => p.released().map(|r| before + r),
-            None => m.released(),
-        }
-    }
-
-    /// Frees every poster in the terminal.
-    fn forget_posters(&mut self) {
-        for c in self.covers.values() {
-            if let Cover::Ready(_, p) = c {
-                kitty::delete(p.id);
-            }
-        }
-        self.covers.clear();
-        self.sent.clear();
-        kitty::cleanup(); // files of the in-flight ones come back unwanted and go too
-    }
-
-    /// The terminal deletes a poster file once it read it. One still around after 2 s means
-    /// it never will (tmux without passthrough, ssh, ...): fall back to the cover colors.
-    fn check_sent(&mut self) -> bool {
-        let old = |s: &(PathBuf, Instant, u64)| s.1.elapsed() > Duration::from_secs(2);
-        if !self.sent.iter().any(|s| old(s) && s.0.exists()) {
-            self.sent.retain(|s| !old(s));
-            return false;
-        }
-        self.no_graphics = true;
-        self.forget_posters();
-        self.toast(
-            "This terminal didn't take the posters, showing colors instead",
-            true,
-        );
-        true
     }
 
     fn items(&self, view: &View) -> Vec<Item> {
@@ -1352,7 +958,8 @@ impl App {
             View::Settings => vec![
                 Item::new(
                     "skip",
-                    "Skip openings and endings",
+                    // short enough for its on/off at 80 columns
+                    "Skip openings/endings",
                     if ani::skip_on() { "on" } else { "off" },
                 ),
                 Item::new(
@@ -1389,9 +996,8 @@ impl App {
                 v.push(Item::new("continue", "Continue", ""));
                 v
             }
-            View::Shows(list, feed) => {
-                let mut v: Vec<Item> = list
-                    .iter()
+            View::Shows(list) => {
+                let mut v: Vec<Item> = (list.shows.iter())
                     .map(|m| {
                         let mut hint = Vec::new();
                         if let Some(n) = self.local.get(&m.id).map(Vec::len).filter(|n| *n > 0) {
@@ -1410,8 +1016,8 @@ impl App {
                         Item::new(m.id.to_string(), m.name(), hint.join(" · "))
                     })
                     .collect();
-                if let Feed::Pages(_, Some(page), _) = feed
-                    && !list.is_empty()
+                if let Some(page) = list.more_page()
+                    && !list.shows.is_empty()
                 {
                     let mut more = Item::new("more", "More…", format!("page {page}"));
                     more.action = true;
@@ -1421,10 +1027,10 @@ impl App {
             }
             View::Show(m) => {
                 let dl = self.downloads(m);
-                let src = self.sources.get(&m.id);
-                let next = self.next_ep(m);
+                let src = self.sources.get(m.id);
+                let (next, released) = (self.progress(m).next(), self.progress(m).released());
                 let mut v = Vec::new();
-                if self.released(m).is_none_or(|r| next <= r) {
+                if released.is_none_or(|r| next <= r) {
                     let verb = if next > 1 { "Continue with" } else { "Play" };
                     let on_disk = (dl.on_disk.iter()).any(|(e, _)| ani::ep_num(e) == next as f64);
                     v.push(Item::new(
@@ -1436,12 +1042,16 @@ impl App {
                 let avail = match src {
                     Some(s) => format!("{} available", s.episodes.len()),
                     None if self.resolving.contains_key(&m.id) => "searching…".into(),
+                    None if self.upcoming(m) => "not out yet".into(),
                     None => String::new(),
                 };
                 v.push(Item::new("play", "≡  Episodes…", avail));
                 let mut state = Vec::new();
                 if !dl.queued.is_empty() {
-                    let how = if ani::paused() { "paused" } else { "queued" };
+                    let how = match self.downloads.snapshot().paused {
+                        true => "paused",
+                        false => "queued",
+                    };
                     state.push(format!("{} {how}", dl.queued.len()));
                 }
                 if !dl.on_disk.is_empty() {
@@ -1476,28 +1086,24 @@ impl App {
             }
             View::Episodes(m, mode) => {
                 let dl = self.downloads(m);
-                let parts = self.parts(m);
+                let run = self.progress(m);
                 // what a watched episode is called and about; nothing that spoils the rest
                 let item = |key: &str, ep: &str, hint: String| {
                     let mut it = Item::new(key, format!("Episode {ep}"), hint);
-                    let (p, n) = part(m, parts, ep);
-                    it.done = watched(m, parts, ep);
-                    let info = self.ep_info.get(&p.id).and_then(|i| i.get(&n));
-                    if let Some(i) = info.filter(|_| it.done) {
+                    it.done = run.watched(ep);
+                    if let Some(i) = self.ep_about(m, ep).filter(|_| it.done) {
                         if !i.title.is_empty() {
                             it.label = format!("{} · {}", it.label, i.title);
                         }
                         it.about = i.about.clone();
                     }
-                    if p.id != m.id {
-                        it.group = part_name(m.name(), p.name()).to_string();
-                    }
+                    it.group = run.group(ep).to_string();
                     it
                 };
                 // also what the provider no longer lists, so it can still be played or deleted
                 let mut eps: Vec<String> = self
                     .sources
-                    .get(&m.id)
+                    .get(m.id)
                     .map(|s| s.episodes.clone())
                     .unwrap_or_default();
                 let more = (dl.on_disk.iter().map(|(e, _)| e)).chain(&dl.queued);
@@ -1521,7 +1127,7 @@ impl App {
                 // under the cursor, so → twice only pauses, and → twice again resumes
                 if self.holds(m, &stop) {
                     let over = self.restarts(m).map_or("", |_| "from the start");
-                    v.push(match ani::paused() {
+                    v.push(match self.downloads.snapshot().paused {
                         true => Item::new("resume", "▶  Resume downloads", over),
                         false => Item::new("pause", "‖  Pause downloads", ""),
                     });
@@ -1597,20 +1203,22 @@ impl App {
                     .iter()
                     .filter(|m| self.local.get(&m.id).is_some_and(|eps| !eps.is_empty()))
                     .count();
+                // only what's out downloads; the preview says which isn't
+                let out: Vec<&Media> = list.iter().filter(|m| !self.upcoming(m)).collect();
                 // as the downloader decides: episodes past each show's progress
-                let which = if list.iter().any(|m| m.progress() > 0) {
+                let which = if out.iter().any(|m| m.progress() > 0) {
                     "unwatched"
                 } else {
                     "all"
                 };
-                let mut v = vec![Item::new(
-                    "download",
-                    format!(
+                let mut v = Vec::new();
+                if !out.is_empty() {
+                    let label = format!(
                         "↓  Download {which} episodes of {}",
-                        plural(list.len(), "show")
-                    ),
-                    "",
-                )];
+                        plural(out.len(), "show")
+                    );
+                    v.push(Item::new("download", label, ""));
+                }
                 if local > 0 {
                     v.push(Item::new(
                         "delete",
@@ -1625,15 +1233,13 @@ impl App {
                 Item::new("no", "No", "deletes partial files"),
                 Item::new("yes", "Yes", ""),
             ],
-            View::Confirm(Pending::Progress(m, ep, part)) => {
-                // what it saves, as that can be the entry's last (the second half of a
-                // special) or a sequel's, and the list it puts the entry on
-                let total = m.episodes.map_or("?".into(), |t| t.to_string());
-                let mut hint = format!("saves {ep}/{total}");
-                if !part.is_empty() {
-                    hint += &format!(" to {part}");
-                }
-                vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
+            // what it saves, as that can be the entry's last (the second half of a special)
+            // or a part's
+            View::Confirm(Pending::Progress(mark)) => {
+                vec![
+                    Item::new("no", "No", ""),
+                    Item::new("yes", "Yes", mark.hint()),
+                ]
             }
             View::Confirm(Pending::Stop(m, eps)) => {
                 let hint = deletes(&ani::parts(&ani::folder(m), eps));
@@ -1641,10 +1247,10 @@ impl App {
             }
             View::Confirm(Pending::Quit) => {
                 // when it asks about downloads, which it doesn't while they're paused
-                let hint = if dl_pending() > 0 && !ani::paused() {
-                    "kept for next start"
-                } else {
-                    ""
+                let s = self.downloads.snapshot();
+                let hint = match s.pending > 0 && !s.paused {
+                    true => "kept for next start",
+                    false => "",
                 };
                 vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
             }
@@ -1686,7 +1292,8 @@ impl App {
 
     fn request_quit(&mut self) {
         // paused, nothing runs, and the queue keeps them for the next start
-        let downloads = if ani::paused() { 0 } else { dl_pending() };
+        let s = self.downloads.snapshot();
+        let downloads = if s.paused { 0 } else { s.pending };
         let busy = downloads > 0 || self.saves_pending > 0;
         if busy && !matches!(self.top().view, View::Confirm(Pending::Quit)) {
             let mut left = Vec::new();
@@ -1735,15 +1342,19 @@ impl App {
                 _ => self.pop(1),
             },
             // marked shows don't count here, "More…" is what the cursor is on
-            View::Shows(_, Feed::Pages(..))
-                if screen.menu.current().is_some_and(|i| i.key == "more") =>
+            View::Shows(list)
+                if list.paged() && screen.menu.current().is_some_and(|i| i.key == "more") =>
             {
                 self.more()
             }
-            View::Shows(list, _) => {
+            View::Shows(list) => {
                 let picked: Vec<Media> = keys
                     .iter()
-                    .filter_map(|k| list.iter().find(|m| m.id.to_string() == *k).cloned())
+                    .filter_map(|k| {
+                        (list.shows.iter())
+                            .find(|m| m.id.to_string() == *k)
+                            .cloned()
+                    })
                     .collect();
                 // marks stay until the bulk action runs, so esc from it keeps them
                 if picked.len() > 1 {
@@ -1764,7 +1375,8 @@ impl App {
                     EpMode::Download => self.dl_act(m, keys, None),
                     EpMode::Watched => {
                         let title = format!("Watched up to episode {key} of {}?", m.name());
-                        self.ask_progress(&m, &key, title);
+                        let mark = self.progress(&m).mark(&key);
+                        self.ask_progress(&key, mark, title);
                     }
                 }
             }
@@ -1785,30 +1397,26 @@ impl App {
             }
             View::Status(m) => {
                 let (m, c) = (m.clone(), self.client.clone());
-                self.toast(format!("Saving {}…", m.name()), false);
-                match (key.as_str(), m.media_list_entry.as_ref().map(|e| e.id)) {
-                    ("remove", Some(entry)) => {
-                        self.saves_pending += 1;
-                        self.spawn(move || Msg::Saved(m, c.remove(entry).map(|_| None)))
-                    }
-                    (status, _) => {
-                        let status = status.to_string();
-                        self.saves_pending += 1;
-                        self.spawn(move || {
-                            Msg::Saved(m.clone(), c.save(m.id, Some(&status), None).map(Some))
-                        })
-                    }
+                // AniList can't undo it, so a stray enter or → mustn't
+                if key == "remove" {
+                    let title = format!(
+                        "Remove {} from your list? Its progress and score go too.",
+                        m.name()
+                    );
+                    self.push(title, View::Confirm(Pending::Remove(m)));
+                    return self.top().menu.select_key("no");
                 }
+                self.toast(format!("Saving {}…", m.name()), false);
+                self.saves_pending += 1;
+                self.spawn(move || Msg::Saved(m.clone(), c.save(m.id, Some(&key), None).map(Some)));
             }
             View::Sources(m, q, hits) => {
                 let i: usize = key.parse().unwrap();
-                if let Err(e) = ani::save_override(m.id, q, &hits[i]) {
+                let (m, q, hits) = (m.clone(), q.clone(), hits.clone());
+                if let Err(e) = self.sources.choose(m.id, &q, &hits, i) {
                     return self.toast(e.to_string(), true);
                 }
-                let m = m.clone();
-                self.sources.remove(&m.id);
                 self.parts.remove(&m.id);
-                self.fresh.remove(&m.id);
                 self.toast(format!("Source set to {}", hits[i]), false);
                 self.pop(2);
                 self.resolve(&m, None);
@@ -1816,15 +1424,15 @@ impl App {
             View::Bulk(list) => {
                 let list = list.clone();
                 if key == "download" {
+                    let list: Vec<Media> = list.into_iter().filter(|m| !self.upcoming(m)).collect();
                     let shows = plural(list.len(), "show");
                     for m in list {
-                        self.download(Job {
-                            id: 0,
-                            media: m,
-                            source: None,
-                            eps: None,
-                            dub: None,
-                        });
+                        let mut job = Job::new(m, None);
+                        job.parts = self.parts(&job.media).to_vec();
+                        job.lookup = self.sources.lookup(job.media.id);
+                        if !self.download(job) {
+                            return;
+                        }
                     }
                     self.toast(format!("Queued {shows}, looking up their episodes…"), false);
                     self.pop(1);
@@ -1844,21 +1452,11 @@ impl App {
             View::Confirm(p) => {
                 if key != "yes" {
                     if let Pending::Resume(_, files) = p {
-                        let jobs = claim(files);
-                        // a show another running ani-hop downloads keeps its files
-                        let busy: Vec<u64> = queue_files()
-                            .iter()
-                            .flat_map(|f| read_queue(f))
-                            .map(|j| j.media.id)
-                            .collect();
-                        for j in jobs.iter().filter(|j| !busy.contains(&j.media.id)) {
-                            let eps = j.eps.as_deref().unwrap_or_default();
-                            ani::discard(&ani::folder(&j.media), eps);
-                        }
+                        let dropped = self.downloads.drop_leftovers(files);
                         self.toast(
-                            match jobs.is_empty() {
-                                true => "Another ani-hop took these over already",
-                                false => "Dropped the unfinished downloads",
+                            match dropped {
+                                0 => "Another ani-hop took these over already",
+                                _ => "Dropped the unfinished downloads",
                             },
                             false,
                         );
@@ -1868,16 +1466,10 @@ impl App {
                 match p {
                     Pending::Quit => self.quit = true,
                     Pending::Resume(_, files) => {
-                        let jobs = claim(files);
-                        self.toast(
-                            match jobs.is_empty() {
-                                true => "Another ani-hop took these over already",
-                                false => "Resuming the unfinished downloads",
-                            },
-                            false,
-                        );
-                        for job in jobs {
-                            self.download(job);
+                        match self.downloads.adopt(files) {
+                            Ok(0) => self.toast("Another ani-hop took these over already", false),
+                            Ok(_) => self.toast("Resuming the unfinished downloads", false),
+                            Err(e) => self.toast(format!("Not resumed · {e}"), true),
                         }
                         self.pop(1);
                     }
@@ -1913,7 +1505,7 @@ impl App {
                         // only the episode it warned about; one that started since would
                         // start over unasked. Checked where it runs: its messages may not be
                         // here yet.
-                        if ani::pause(&ani::folder(m), ep) {
+                        if self.downloads.pause(m.id, ep) {
                             self.toast(
                                 "Paused downloads · enter on a queued episode resumes them",
                                 false,
@@ -1937,19 +1529,29 @@ impl App {
                         }
                         self.top().menu.marked.clear();
                     }
-                    Pending::Progress(m, ep, _) => {
-                        let (m, ep, c) = (m.clone(), *ep, self.client.clone());
-                        let status = progress_status(&m, ep);
+                    Pending::Remove(m) => {
+                        let (m, c) = (m.clone(), self.client.clone());
+                        self.pop(1);
+                        let Some(entry) = m.media_list_entry.as_ref().map(|e| e.id) else {
+                            return;
+                        };
+                        self.toast(format!("Removing {}…", m.name()), false);
                         self.saves_pending += 1;
-                        // the question showed `m`'s progress; Yes mustn't undo a save it didn't
-                        // know of (an old copy: a cached list, the episode's start, a late lookup)
-                        self.spawn(
-                            move || match c.save_progress(m.id, status, m.progress(), ep) {
+                        self.spawn(move || Msg::Removed(m, c.remove(entry)));
+                    }
+                    Pending::Progress(k) => {
+                        let (k, c) = (k.clone(), self.client.clone());
+                        self.saves_pending += 1;
+                        // the question showed `was`; Yes mustn't undo a save it didn't know of
+                        // (an old copy: a cached list, the episode's start, a late lookup)
+                        self.spawn(move || {
+                            let m = k.entry;
+                            match c.save_progress(m.id, k.status, k.was, k.to) {
                                 Ok(Ok(entry)) => Msg::Saved(m, Ok(Some(entry))),
                                 Ok(Err(now)) => Msg::Moved(m, now),
                                 Err(e) => Msg::Saved(m, Err(e)),
-                            },
-                        );
+                            }
+                        });
                         self.pop(1);
                     }
                 }
@@ -1960,25 +1562,20 @@ impl App {
 
     /// Fetches the next page of the ranking on top, as "More…" and ^f do.
     fn more(&mut self) {
-        let screen = self.stack.last().unwrap();
-        let View::Shows(_, Feed::Pages(sort, next, fetching)) = &screen.view else {
+        let screen = self.top();
+        let (id, refreshing) = (screen.id, screen.loading);
+        let View::Shows(list) = &mut screen.view else {
             return;
         };
-        let Some(page) = *next else {
-            return self.toast("No more shows", false);
-        };
-        // one page at a time; the first one's refresh would drop what comes after it
-        match (screen.loading, *fetching) {
-            (true, true) => return,
-            (true, false) => return self.toast("Still refreshing the first page…", false),
-            _ => {}
+        match list.more(refreshing) {
+            Ok(Some((sort, page))) => {
+                self.top().loading = true;
+                let c = self.client.clone();
+                self.spawn(move || Msg::More(id, c.browse(&sort, None, page)));
+            }
+            Ok(None) => {}
+            Err(why) => self.toast(why, false),
         }
-        let (sort, id, c) = (sort.clone(), screen.id, self.client.clone());
-        self.top().loading = true;
-        if let View::Shows(_, Feed::Pages(_, _, f)) = &mut self.top().view {
-            *f = true;
-        }
-        self.spawn(move || Msg::More(id, c.browse(&sort, None, page)));
     }
 
     /// Cache key of a ranking, per user: its entries carry that user's list status and progress.
@@ -2002,8 +1599,15 @@ impl App {
                 self.top().menu.paste(&ani::tilde(&ani::download_root()));
             }
             "downloads" => {
-                let list = ani::local_shows().into_iter().map(|(m, _)| m).collect();
-                self.push("Downloads", View::Shows(list, Feed::Local));
+                let list: Vec<Media> = ani::local_shows().into_iter().map(|(m, _)| m).collect();
+                // saved when downloaded, maybe weeks ago: their progress is AniList's now
+                let ids: Vec<u64> = (list.iter().filter(|m| m.on_anilist()))
+                    .map(|m| m.id)
+                    .collect();
+                if !ids.is_empty() {
+                    self.spawn(move || Msg::Local(c.shows(&ids)));
+                }
+                self.push("Downloads", View::Shows(List::local(list)));
             }
             "login" => match client_id() {
                 Some(id) => self.start_auth(&id),
@@ -2059,7 +1663,7 @@ impl App {
                 let title = text.clone();
                 self.push_loading(&title, Feed::Whole, None, move || {
                     let found = c.browse("SEARCH_MATCH", Some(&text), 1);
-                    ani::or_ani_cli(found, &text, ani::search)
+                    source::or_ani_cli(found, &text, source::search)
                 });
             }
             Input::ClientId => {
@@ -2084,7 +1688,7 @@ impl App {
                 self.client.token = Some(token);
                 self.parts.clear();
                 let c = self.client.clone();
-                self.spawn(move || Msg::Viewer(c.viewer()));
+                self.spawn(move || Msg::Viewer(c.token.clone(), c.viewer()));
                 self.toast("Checking token…", false);
                 self.pop(1);
             }
@@ -2098,23 +1702,34 @@ impl App {
             Input::SourceQuery(m) => {
                 let id = self.push("Pick source", View::Sources(m, text.clone(), Vec::new()));
                 self.top().loading = true;
-                self.spawn(move || Msg::Hits(id, ani::search(&text).map(|r| r.0)));
+                self.spawn(move || Msg::Hits(id, source::search(&text).map(|r| r.0)));
             }
         }
     }
 
     fn open_show(&mut self, m: Media) {
-        self.resolve(&m, None); // warm up so "Episodes…" opens instantly
+        if !self.upcoming(&m) {
+            self.resolve(&m, None); // warm up so "Episodes…" opens instantly
+        }
         self.push(m.name().to_string(), View::Show(m));
     }
 
     fn show_action(&mut self, m: Media, key: &str) {
         match key {
-            "next" => self.play(m.clone(), self.next_ep(&m).to_string()),
+            // their lists open at once and say why they're empty, without asking ani-cli
+            "play" | "download" | "watched" if self.upcoming(&m) => {
+                let mode = match key {
+                    "play" => EpMode::Play,
+                    "download" => EpMode::Download,
+                    _ => EpMode::Watched,
+                };
+                self.fulfill(m, Want::Episodes(mode));
+            }
+            "next" => self.play(m.clone(), self.progress(&m).next().to_string()),
             "play" => self.resolve(&m, Some(Want::Episodes(EpMode::Play))),
             // what's on disk can be deleted before ani-cli answers, or without it
             "download"
-                if !self.sources.contains_key(&m.id) && !self.downloads(&m).on_disk.is_empty() =>
+                if self.sources.get(m.id).is_none() && !self.downloads(&m).on_disk.is_empty() =>
             {
                 self.resolve(&m, None);
                 self.fulfill(m, Want::Episodes(EpMode::Download));
@@ -2125,8 +1740,8 @@ impl App {
             "source" => {
                 let q = self
                     .sources
-                    .get(&m.id)
-                    .map_or_else(|| ani::default_query(&m), |s| s.query.clone());
+                    .get(m.id)
+                    .map_or_else(|| source::default_query(&m), |s| s.query.clone());
                 self.push("Change source", View::Input(Input::SourceQuery(m)));
                 self.top().menu.paste(&q);
             }
@@ -2144,65 +1759,54 @@ impl App {
     /// background once per session; without one, `want` waits for ani-cli.
     fn resolve(&mut self, m: &Media, want: Option<Want>) {
         let want = match want {
-            Some(w) if self.sources.contains_key(&m.id) => {
+            Some(w) if self.sources.get(m.id).is_some() => {
                 self.fulfill(m.clone(), w);
                 None
             }
             w => w,
         };
-        if self.fresh.contains(&m.id) {
+        if matches!(self.sources.lookup(m.id), Lookup::Ready(_)) {
             return;
         }
         if matches!(want, Some(Want::Episodes(_))) {
             self.toast(format!("Searching ani-cli for {}…", m.name()), false);
         }
-        if let Some(slot) = self.resolving.get_mut(&m.id) {
-            if want.is_some() {
-                *slot = want;
-            }
-            return;
+        let slot = self.resolving.entry(m.id).or_default();
+        if want.is_some() {
+            *slot = want;
         }
-        self.resolving.insert(m.id, want);
+        // none while one runs already
+        let Some(ticket) = self.sources.ask(m.id) else {
+            return;
+        };
         let m = m.clone();
         self.spawn(move || {
-            let res = ani::resolve(&m);
-            Msg::Resolved(m, res)
+            let res = source::resolve(&m);
+            Msg::Resolved(m, ticket, res)
         });
     }
 
-    /// Asks before saving the AniList progress up to `ep`. AniList keeps a count, not single
-    /// episodes, so Yes is preselected only when that changes no other episode.
-    fn ask_progress(&mut self, m: &Media, ep: &str, title: String) {
-        let Some((p, n)) = self.progress_target(m, ep) else {
+    /// Asks before saving the AniList progress up to `ep`, as `mark` would. AniList keeps a
+    /// count, not single episodes, so Yes goes first only when that changes no other episode.
+    fn ask_progress(&mut self, ep: &str, mark: Option<Mark>, title: String) {
+        let Some(mark) = mark else {
             return self.toast(
                 format!("Episode {ep} isn't a number AniList can count"),
                 true,
             );
         };
-        let part = match p.id == m.id {
-            true => String::new(),
-            false => part_name(m.name(), p.name()).to_string(),
-        };
-        let only_this = recounts(p.progress(), n as u32).is_none();
         // what else Yes changes goes in the question, which wraps; a hint would be cut
-        let also = [recounts(p.progress(), n as u32), list_move(p, n as u32)];
-        let also = also.into_iter().flatten().collect::<Vec<_>>().join(" and ");
-        let title = match also.split_at_checked(1) {
-            Some((first, rest)) => format!("{title} {}{rest}.", first.to_uppercase()),
-            None => title,
-        };
-        let ask = Pending::Progress(p.clone(), n as u32, part);
-        self.push(title, View::Confirm(ask));
-        self.top()
-            .menu
-            .select_key(if only_this { "yes" } else { "no" });
+        let title = format!("{title} {}", mark.also()).trim_end().to_string();
+        let first = if mark.only_this() { "yes" } else { "no" };
+        self.push(title, View::Confirm(Pending::Progress(mark)));
+        self.top().menu.select_key(first);
     }
 
     fn fulfill(&mut self, m: Media, want: Want) {
         match want {
             Want::Play(ep) => self.play(m, ep),
             Want::Episodes(mode) => {
-                let next = self.next_ep(&m).to_string();
+                let next = self.progress(&m).next().to_string();
                 let title = match mode {
                     EpMode::Play => "Episodes",
                     EpMode::Download => "Downloads",
@@ -2224,12 +1828,11 @@ impl App {
         let local = ani::local_episodes(&ani::folder(&m))
             .into_iter()
             .find(|(e, _)| *e == ep);
-        let src = self.sources.get(&m.id).cloned();
-        let cached = !self.fresh.contains(&m.id);
-        let step = match (&local, &src) {
+        let lookup = self.sources.lookup(m.id);
+        let step = match (&local, &lookup) {
             (Some(_), _) => "opening the player",
-            (None, None) => SEARCHING,
-            (_, Some(_)) if cached => "checking the source",
+            (None, Lookup::Resolve) => SEARCHING,
+            (_, Lookup::Check(_)) => "checking the source",
             _ => "fetching the stream",
         };
         self.playing = Some(Playing {
@@ -2241,7 +1844,7 @@ impl App {
             since: Instant::now(),
             color: m.cover_image.color.clone(),
         });
-        if local.is_none() && src.is_none() {
+        if local.is_none() && matches!(lookup, Lookup::Resolve) {
             return self.resolve(&m, Some(Want::Play(ep)));
         }
         let (tx, id, e) = (self.tx.clone(), m.id, ep.clone());
@@ -2256,14 +1859,13 @@ impl App {
                 }
                 res => res,
             };
-            let res = match (&local, src) {
+            let res = match (&local, lookup) {
                 (Some((_, file)), _) => ani::play_file(&m, &ep, file, || step(None)),
-                (_, Some(src)) if cached => ani::locate(&m, &src).and_then(|s| {
+                (_, Lookup::Ready(src)) => stream(&src),
+                (_, lookup) => lookup.run(&m).and_then(|s| {
                     step(Some("fetching the stream"));
                     stream(&s)
                 }),
-                (_, Some(src)) => stream(&src),
-                _ => unreachable!(),
             };
             Msg::Played(m, ep, res)
         });
@@ -2291,37 +1893,6 @@ impl App {
         }
     }
 
-    /// Caches a ranking with every page loaded. Its first page's age stays its freshness, so
-    /// loading more never keeps that page longer than an hour.
-    fn save_pages(&self, id: u64) {
-        let screen = self.stack.iter().find(|s| s.id == id);
-        let Some(View::Shows(list, Feed::Pages(sort, next, _))) = screen.map(|s| &s.view) else {
-            return;
-        };
-        let path = list_cache(&self.ranking_key(sort));
-        let fetched = fs::metadata(&path).and_then(|m| m.modified());
-        let _ = ani::write_json(&path, &(list, next));
-        if let Ok(t) = fetched {
-            let _ = fs::File::options()
-                .write(true)
-                .open(&path)
-                .and_then(|f| f.set_modified(t));
-        }
-    }
-
-    /// Marks this user's cached lists as old, so the next visit shows them and refreshes.
-    fn outdate_lists(&self) {
-        LIST_CHANGES.fetch_add(1, Ordering::Relaxed);
-        let Ok(dir) = fs::read_dir(ani::cache_dir().join("lists")) else {
-            return;
-        };
-        for e in dir.flatten() {
-            if let Ok(f) = fs::File::options().write(true).open(e.path()) {
-                let _ = f.set_modified(std::time::UNIX_EPOCH);
-            }
-        }
-    }
-
     fn update_media(&mut self, id: u64, entry: Option<Entry>) {
         for s in &mut self.stack {
             let media: Vec<&mut Media> = match &mut s.view {
@@ -2332,7 +1903,8 @@ impl App {
                 | View::Sources(m, ..)
                 | View::Audio(Some(m))
                 | View::Input(Input::SourceQuery(m)) => vec![m],
-                View::Shows(l, _) | View::Bulk(l) => l.iter_mut().collect(),
+                View::Shows(l) => l.shows.iter_mut().collect(),
+                View::Bulk(l) => l.iter_mut().collect(),
                 _ => Vec::new(),
             };
             for m in media {
@@ -2350,63 +1922,37 @@ impl App {
 
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Shows(id, res, cache) => {
+            Msg::Shows(id, res, ask) => {
                 let fallback = res
                     .as_ref()
                     .is_ok_and(|l| l.iter().any(|m| !m.on_anilist()))
                     && self.stack.iter().any(|s| s.id == id);
-                let fetched = res.is_ok();
-                self.fill(id, res, |v, list| {
-                    if let View::Shows(l, feed) = v {
-                        if let Feed::Pages(_, next, _) = feed {
-                            *next = (list.len() >= PER_PAGE).then_some(2);
-                        }
-                        *l = list;
+                self.fill(id, res, |v, shows| {
+                    if let View::Shows(list) = v {
+                        list.refreshed(ask, shows);
                     }
                 });
-                // cached only for a screen still open: a closed one's late answer would
-                // overwrite what a newer one cached, its pages from More… too
-                let screen = self.stack.iter().find(|s| s.id == id);
-                if let (true, Some((path, changes)), Some(View::Shows(list, feed))) =
-                    (fetched, cache, screen.map(|s| &s.view))
-                {
-                    let next = match feed {
-                        Feed::Pages(_, next, _) => *next,
-                        _ => None,
-                    };
-                    let _ = ani::write_json(&path, &(list, next));
-                    // a save landed while this was in flight: keep it, but not as fresh
-                    if LIST_CHANGES.load(Ordering::Relaxed) != changes {
-                        let file = fs::File::options().write(true).open(&path);
-                        let _ = file.map(|f| f.set_modified(std::time::UNIX_EPOCH));
-                    }
-                }
                 if fallback {
                     self.toast("AniList search failed, showing ani-cli's matches", true);
                 }
             }
+            // offline is when downloads are watched: no error for that
+            Msg::Local(Ok(fresh)) => {
+                ani::refresh_shows(&fresh);
+                self.refresh();
+            }
+            Msg::Local(Err(_)) => {}
             Msg::More(id, res) => {
                 let screen = self.stack.iter_mut().find(|s| s.id == id);
-                if let Some(View::Shows(_, Feed::Pages(_, _, fetching))) =
-                    screen.map(|s| &mut s.view)
-                {
-                    *fetching = false;
+                if let Some(View::Shows(list)) = screen.map(|s| &mut s.view) {
+                    list.fetched();
                 }
                 let mut first = None; // Some(None): the page brought nothing new
                 self.fill(id, res, |v, more| {
-                    if let View::Shows(l, Feed::Pages(_, next, _)) = v {
-                        *next = next.filter(|_| more.len() >= PER_PAGE).map(|n| n + 1);
-                        // rankings shift between requests, a show may come round again
-                        let more: Vec<Media> = more
-                            .into_iter()
-                            .filter(|m| l.iter().all(|o| o.id != m.id))
-                            .collect();
-                        let start = l.len();
-                        l.extend(more);
-                        first = Some(l.get(start).map(|m| m.id.to_string()));
+                    if let View::Shows(list) = v {
+                        first = Some(list.more_came(more));
                     }
                 });
-                self.save_pages(id);
                 match (first, self.stack.iter_mut().find(|s| s.id == id)) {
                     (Some(Some(key)), Some(s)) => s.menu.select_key(&key),
                     (Some(None), Some(_)) => self.toast("No more shows", false),
@@ -2418,14 +1964,16 @@ impl App {
                     *h = hits;
                 }
             }),
-            Msg::Viewer(Ok(user)) => {
-                let english = anilist::ENGLISH_TITLES.load(Ordering::Relaxed);
+            // asked before logging out or in again: about another login
+            Msg::Viewer(token, _) if token != self.client.token => {}
+            Msg::Viewer(_, Ok((id, name, english))) => {
+                anilist::ENGLISH_TITLES.store(english, Ordering::Relaxed);
                 let _ = write_private(
                     &user_path(),
-                    &serde_json::json!([user.0, user.1, english]).to_string(),
+                    &serde_json::json!([id, name, english]).to_string(),
                 );
                 let login = self.user.is_none();
-                self.user = Some(user);
+                self.user = Some((id, name));
                 if login {
                     self.toast(
                         format!("Logged in as {}", self.user.as_ref().unwrap().1),
@@ -2439,7 +1987,7 @@ impl App {
                     self.top().menu.select_key("list:CURRENT");
                 }
             }
-            Msg::Viewer(Err(e)) => {
+            Msg::Viewer(_, Err(e)) => {
                 // keep the token on network trouble, drop it when AniList rejects it
                 if e.contains("Invalid token") || e.contains("Unauthorized") {
                     self.log_out();
@@ -2465,7 +2013,7 @@ impl App {
                     return;
                 }
                 // and from before a save, which they may undo: asked again while it's shown
-                if LIST_CHANGES.load(Ordering::Relaxed) != changes {
+                if lists::changes() != changes {
                     self.parts.remove(&id);
                     return;
                 }
@@ -2476,26 +2024,12 @@ impl App {
                 self.parts.insert(id, (key, parts));
                 self.refresh();
             }
-            Msg::Cover(id, key, res) => {
-                let wanted = matches!(self.covers.get(&id), Some(Cover::Loading(k)) if *k == key);
-                match res {
-                    // sent now, even for look-ahead posters: showing one later is free
-                    Ok((file, w, h, cells)) if wanted => {
-                        self.next_image = self.next_image % 0xFF_FFFF + 1; // 24-bit ids, never 0
-                        kitty::transmit(self.next_image, &file, (w, h), cells);
-                        self.sent.push((file, Instant::now(), id));
-                        let poster = kitty::Poster {
-                            id: self.next_image,
-                            size: cells,
-                        };
-                        self.covers.insert(id, Cover::Ready(key, poster));
-                    }
-                    Ok((file, ..)) => _ = fs::remove_file(file), // stale, never sent
-                    Err(_) if wanted => _ = self.covers.insert(id, Cover::Failed),
-                    Err(_) => {}
+            Msg::Cover(loaded) => self.posters.loaded(loaded),
+            Msg::Resolved(m, ticket, res) => {
+                // a lookup from before the source was changed by hand
+                if !self.sources.answer(m.id, ticket, &res) {
+                    return;
                 }
-            }
-            Msg::Resolved(m, res) => {
                 let want = self.resolving.remove(&m.id).flatten();
                 // the wait is over either way; playing it starts anew below
                 let waited = self
@@ -2503,12 +2037,9 @@ impl App {
                     .take_if(|p| p.id == m.id && p.step == Some(SEARCHING));
                 let here = matches!(&self.top().view, View::Show(s) | View::Episodes(s, _) if s.id == m.id);
                 match res {
-                    Ok(src) => {
-                        self.sources.insert(m.id, src);
+                    Ok(_) => {
                         // before the menu is rebuilt, so it can't offer what went
                         self.want_parts(&m);
-                        self.fresh.insert(m.id);
-                        ani::save_resolved(&self.sources);
                         let open = (self.stack.iter())
                             .any(|s| matches!(&s.view, View::Show(x) if x.id == m.id));
                         match (want, here) {
@@ -2521,7 +2052,7 @@ impl App {
                     Err(e) if want.is_some() || here => {
                         // the provider may call it something else: picking it by hand fixes that
                         let e = match e.starts_with("No results") {
-                            true => "no match for this show · try Change source…".into(),
+                            true => no_match(&m).into(),
                             false => e,
                         };
                         self.toast(format!("ani-cli: {e}"), true)
@@ -2550,14 +2081,20 @@ impl App {
                         };
                         self.toast(text, false);
                         self.update_media(m.id, entry);
-                        self.outdate_lists();
-                        if matches!(self.top().view, View::Status(_)) {
+                        lists::changed();
+                        // its list status question is answered, not another show's
+                        if matches!(&self.top().view, View::Status(s) if s.id == m.id) {
                             self.stack.pop();
                         }
                         self.refresh();
                     }
                     Err(e) => self.toast(format!("{} not saved · {e}", m.name()), true),
                 }
+            }
+            Msg::Removed(m, Ok(())) => self.on_msg(Msg::Saved(m, Ok(None))),
+            Msg::Removed(m, Err(e)) => {
+                self.saves_pending -= 1;
+                self.toast(format!("{} not removed · {e}", m.name()), true);
             }
             Msg::Moved(m, entry) => {
                 self.saves_pending -= 1;
@@ -2567,7 +2104,7 @@ impl App {
                 self.toast(format!("{} not saved · {why}", m.name()), true);
                 // what's on screen was old: AniList's entry, and lists that refresh
                 self.update_media(m.id, entry);
-                self.outdate_lists();
+                lists::changed();
                 self.refresh();
             }
             Msg::PlayStep(id, ep, step) => {
@@ -2586,26 +2123,18 @@ impl App {
                 {
                     self.playing = None;
                 }
-                // not watched yet, as far as the show or the sequel it's in goes
-                let ask = (self.progress_target(&m, &ep))
-                    .is_some_and(|(p, n)| !m.watched(&ep) && n > p.progress() as f64);
+                // not watched yet, as far as the show or the part it's in goes
+                let mark = self.progress(&m).unwatched(&ep);
                 match res {
                     Err(e) => self.toast(format!("Couldn't play episode {ep} · {e}"), true),
-                    Ok(()) if ask && self.user.is_some() && m.on_anilist() => {
+                    Ok(()) if mark.is_some() && self.user.is_some() && m.on_anilist() => {
                         let title = format!("Mark episode {ep} of {} as watched?", m.name());
-                        self.ask_progress(&m, &ep, title);
+                        self.ask_progress(&ep, mark, title);
                     }
                     Ok(()) => {}
                 }
             }
-            // a stopped episode's last lines may still come in
-            Msg::DlProgress(now) => {
-                if is_queued(now.id, &now.ep) {
-                    self.dl_now = Some(now);
-                }
-            }
             Msg::DlDone(label, res) => {
-                self.dl_now = None;
                 match res {
                     Ok(()) => self.toast(format!("Downloaded {label}"), false),
                     Err(e) => self.toast(format!("{label}: {e}"), true),
@@ -2614,6 +2143,15 @@ impl App {
             }
             Msg::Release(v) => self.release = v,
         }
+    }
+}
+
+/// What ani-cli finding nothing for `m` says: with only episode 1 out, the provider may not
+/// list it yet.
+fn no_match(m: &Media) -> &'static str {
+    match m.next_airing_episode.is_some() && m.released() == Some(1) {
+        true => "no match yet · new shows can take a day, or try Change source…",
+        false => "no match for this show · try Change source…",
     }
 }
 
@@ -2657,103 +2195,28 @@ fn megabytes<'a>(files: impl IntoIterator<Item = &'a PathBuf>) -> String {
     format!("{} MB", bytes >> 20)
 }
 
-/// The AniList entry episode `ep` of `m` counts toward, and its number there: past `m`'s
-/// own episodes it's in one of the sequels `parts` (each with the episodes before it).
-fn part<'a>(m: &'a Media, parts: &'a [(u32, Media)], ep: &str) -> (&'a Media, String) {
-    let n = ani::ep_num(ep);
-    // a recap 12.5 comes after 12, so it's the 12-episode part's
-    match parts
-        .iter()
-        .rev()
-        .find(|(before, _)| n.floor() > *before as f64)
-    {
-        Some((before, p)) => (p, (n - *before as f64).to_string()),
-        None => (m, ep.to_string()),
-    }
-}
-
-/// What sets a part's name apart from its show's: "Part 2" of "Attack on Titan Season 3
-/// Part 2", or all of it.
-fn part_name<'a>(show: &str, part: &'a str) -> &'a str {
-    let rest = part
-        .strip_prefix(show)
-        .map(|r| r.trim_start_matches([' ', ':', '-']));
-    rest.filter(|r| !r.is_empty()).unwrap_or(part)
-}
-
-/// Up to its show's progress (which ran past its episodes before sequels counted) or its
-/// part's.
-fn watched(m: &Media, parts: &[(u32, Media)], ep: &str) -> bool {
-    let (p, n) = part(m, parts, ep);
-    m.watched(ep) || p.watched(&n)
-}
-
-/// The AniList entry that marking episode `ep` of `m` watched saves to, and the progress
-/// there: never past that entry's episodes, which AniList would keep as progress like
-/// 13/12. An episode after them (the second half of a special the provider splits in two,
-/// an extra, one of a sequel not looked up yet) saves the entry's last. None for one that
-/// isn't a number.
-fn progress_target<'a>(
-    m: &'a Media,
-    parts: &'a [(u32, Media)],
-    ep: &str,
-) -> Option<(&'a Media, f64)> {
-    ep.parse::<f64>().ok()?;
-    let (p, n) = part(m, parts, ep);
-    let n = ani::ep_num(&n);
-    Some((p, p.episodes.map_or(n, |e| n.min(e as f64))))
-}
-
-/// The episode after the last one watched. It goes on into a part once everything before
-/// it is, so rewatching the first part doesn't skip to the end of a finished second one.
-fn next_ep(m: &Media, parts: &[(u32, Media)]) -> u32 {
-    let mut next = m.progress() + 1;
-    for (before, p) in parts {
-        if next > *before {
-            next = next.max(before + p.progress() + 1);
-        }
-    }
-    next
-}
-
-/// What saving progress `to` over `from` does to the episodes between, since AniList counts
-/// every one up to the progress as watched.
-fn recounts(from: u32, to: u32) -> Option<String> {
-    let span = |a: u32, b: u32| match a == b {
-        true => a.to_string(),
-        false => format!("{a}–{b}"),
-    };
-    match to {
-        _ if to > from + 1 => Some(format!("also marks {}", span(from + 1, to - 1))),
-        _ if to < from => Some(format!("unmarks {}", span(to + 1, from))),
-        _ => None,
-    }
-}
-
-/// The list a show moves to when episode `ep` is marked watched, if it does.
-fn list_move(m: &Media, ep: u32) -> Option<String> {
-    let to = progress_status(m, ep);
-    match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
-        Some(s) if s == to => None,
-        Some(_) => Some(format!("moves it to {}", list_label(to))),
-        None => Some(format!("adds it to {}", list_label(to))),
-    }
-}
-
-/// The list a show is on once episode `ep` is marked watched.
-fn progress_status(m: &Media, ep: u32) -> &'static str {
-    match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
-        _ if m.episodes == Some(ep) => "COMPLETED",
-        Some("REPEATING") => "REPEATING",
-        _ => "CURRENT",
-    }
-}
-
 pub fn list_label(status: &str) -> &'static str {
     LISTS
         .iter()
         .find(|l| l.0 == status)
         .map_or("on list", |l| l.1)
+}
+
+/// Runs test `name` again in a child process with `env` set (temp XDG dirs, a stub first on
+/// PATH), for a test that needs a process environment of its own; the child sees
+/// ANIHOP_CHILD and does the work. Whether it passed, as that one test: a name that no
+/// longer matches would run none and pass.
+#[cfg(test)]
+pub fn in_child(name: &str, env: &[(&str, std::ffi::OsString)]) -> bool {
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([name, "--exact", "--test-threads=1"])
+        .env("ANIHOP_CHILD", "1")
+        .envs(env.iter().map(|(k, v)| (k, v)))
+        .output();
+    out.is_ok_and(|o| {
+        o.status.success()
+            && String::from_utf8_lossy(&o.stdout).contains("test result: ok. 1 passed")
+    })
 }
 
 #[cfg(test)]
@@ -2770,135 +2233,37 @@ mod tests {
     }
 
     #[test]
-    fn rankings_keep_their_pages_for_an_hour() {
-        use super::{Feed, Media, from_cache};
-        use std::time::Duration;
-        let min = |m: u64| Some(Duration::from_secs(m * 60));
-        let pages = || Some((vec![Media::default(); 120], Some(4)));
-        let mut feed = Feed::Pages("TRENDING_DESC".into(), Some(2), false);
-        let (list, fresh) = from_cache(pages(), min(59), &mut feed);
-        assert!(fresh && list.len() == 120);
-        assert!(
-            matches!(feed, Feed::Pages(_, Some(4), _)),
-            "More… goes on with page 4"
-        );
-        let mut feed = Feed::Pages("TRENDING_DESC".into(), Some(2), false);
-        let (list, fresh) = from_cache(pages(), min(61), &mut feed);
-        assert!(
-            !fresh && list.len() == 50,
-            "past the hour: page 1, refreshed"
-        );
-        assert!(matches!(feed, Feed::Pages(_, Some(2), _)));
-        let (list, fresh) = from_cache(pages(), min(3), &mut Feed::Whole);
-        assert!(
-            !fresh && list.len() == 120,
-            "your own lists: 2 minutes, all shown"
-        );
-        let (list, fresh) = from_cache(None, None, &mut Feed::Whole);
-        assert!(!fresh && list.is_empty());
-    }
-
-    #[test]
-    fn watching_an_episode_picks_the_list() {
-        let mut m = super::Media {
-            episodes: Some(12),
+    fn a_show_with_only_its_first_episode_out_may_not_be_on_ani_cli_yet() {
+        let now = super::anilist::now();
+        let show = |status: &str, episodes, next: Option<(u32, i64)>| super::Media {
+            status: Some(status.into()),
+            episodes,
+            next_airing_episode: next
+                .map(|(episode, airing_at)| super::anilist::Airing { episode, airing_at }),
             ..Default::default()
         };
+        let just = "no match yet · new shows can take a day, or try Change source…";
+        let other = "no match for this show · try Change source…";
         assert_eq!(
-            super::progress_status(&m, 3),
-            "CURRENT",
-            "not on a list yet"
+            super::no_match(&show("RELEASING", Some(12), Some((2, now + 600_000)))),
+            just
         );
-        assert_eq!(super::progress_status(&m, 12), "COMPLETED");
-        let entry = |status: &str| super::Entry {
-            id: 1,
-            status: status.into(),
-            progress: 2,
-        };
-        m.media_list_entry = Some(entry("REPEATING"));
-        assert_eq!(super::progress_status(&m, 3), "REPEATING");
-        m.media_list_entry = Some(entry("PAUSED"));
-        assert_eq!(super::progress_status(&m, 3), "CURRENT");
-    }
-
-    #[test]
-    fn says_what_a_jump_in_progress_counts() {
-        assert_eq!(super::recounts(5, 6), None); // the next one
-        assert_eq!(super::recounts(5, 5), None);
-        assert_eq!(super::recounts(5, 7).unwrap(), "also marks 6");
-        assert_eq!(super::recounts(0, 1180).unwrap(), "also marks 1–1179");
-        assert_eq!(super::recounts(1180, 5).unwrap(), "unmarks 6–1180");
-        assert_eq!(super::recounts(6, 5).unwrap(), "unmarks 6");
-    }
-
-    #[test]
-    fn episodes_past_a_split_season_count_toward_its_sequel() {
-        let entry = |progress| {
-            Some(super::Entry {
-                id: 1,
-                status: "CURRENT".into(),
-                progress,
-            })
-        };
-        let show = |id, episodes, progress| super::Media {
-            id,
-            episodes: Some(episodes),
-            media_list_entry: entry(progress),
-            ..Default::default()
-        };
-        // Attack on Titan Season 3 at ani-cli: 22 episodes, 12 and 10 on AniList
-        let (s3, parts) = (show(1, 12, 12), [(12, show(2, 10, 3))]);
-        let at = |ep: &str| {
-            let (m, n) = super::part(&s3, &parts, ep);
-            (m.id, n)
-        };
-        assert_eq!(at("5"), (1, "5".into()));
-        assert_eq!(at("12.5"), (1, "12.5".into()), "a recap stays where it was");
-        assert_eq!(at("13"), (2, "1".into()));
-        assert_eq!(at("22"), (2, "10".into()));
-        assert_eq!(super::part(&s3, &[], "13").1, "13", "no sequels known");
-        let (m, n) = super::part(&s3, &parts, "15");
-        assert!(m.watched(&n) && !super::part(&s3, &parts, "16").0.watched("4"));
-        // nothing saves past an entry's episodes, as while its sequel is looked up: after
-        // them it's the entry's last
-        let save = |parts: &[(u32, super::Media)], ep| {
-            super::progress_target(&s3, parts, ep).map(|(m, n)| (m.id, n))
-        };
-        assert_eq!(save(&parts, "13"), Some((2, 1.0)));
-        assert_eq!(save(&parts, "12.5"), Some((1, 12.0)));
+        let cached = show("NOT_YET_RELEASED", Some(12), Some((1, now - 3600)));
         assert_eq!(
-            save(&[], "13"),
-            Some((1, 12.0)),
-            "the show's last, not 13/12"
+            super::no_match(&cached),
+            just,
+            "aired since the list was cached"
         );
-        assert_eq!(save(&parts, "23"), Some((2, 10.0)), "Part 2's last");
-        assert_eq!(save(&parts, "SP"), None);
-        let short = |part| super::part_name("Attack on Titan Season 3", part);
-        assert_eq!(short("Attack on Titan Season 3 Part 2"), "Part 2");
+        assert_eq!(super::no_match(&show("FINISHED", Some(12), None)), other);
         assert_eq!(
-            short("Attack on Titan Season 3"),
-            "Attack on Titan Season 3"
+            super::no_match(&show("RELEASING", Some(12), Some((9, now + 600_000)))),
+            other
         );
-        assert_eq!(short("The Final Season"), "The Final Season");
-        // a one-episode special ani-cli has in two halves
-        let special = show(3, 1, 0);
-        let second_half = super::progress_target(&special, &[], "2").map(|(m, n)| (m.id, n));
-        assert_eq!(second_half, Some((3, 1.0)));
-        let airing = super::Media::default();
-        assert!(
-            super::progress_target(&airing, &[], "13").is_some(),
-            "no count yet"
-        );
-        let next = |own, second| super::next_ep(&show(1, 12, own), &[(12, show(2, 10, second))]);
-        assert_eq!(next(12, 3), 16);
-        assert_eq!(next(12, 0), 13);
-        assert_eq!(next(3, 10), 4, "rewatching the first part");
         assert_eq!(
-            next(22, 0),
-            23,
-            "progress saved past 12 before sequels counted"
+            super::no_match(&show("RELEASING", Some(12), Some((1, now + 90)))),
+            other
         );
-        assert_eq!(next(12, 10), 23);
+        assert!(!just.contains('—') && !other.contains('—'));
     }
 
     #[test]
@@ -2928,17 +2293,5 @@ mod tests {
         let (get, stop, delete) = dl.split(&s(&["1", "2", "3", "4"]));
         assert_eq!((get, stop), (s(&["4"]), s(&["2"])));
         assert_eq!(delete, [("1".to_string(), file.clone())]);
-        // a whole-show job takes what's after the progress and not on disk
-        let m = super::Media {
-            media_list_entry: Some(super::Entry {
-                id: 1,
-                status: "CURRENT".into(),
-                progress: 1,
-            }),
-            ..Default::default()
-        };
-        let all = s(&["1", "2", "3", "3.5"]);
-        let on_disk = [("3".to_string(), file)];
-        assert_eq!(super::to_download(&m, &all, &on_disk), s(&["2", "3.5"]));
     }
 }

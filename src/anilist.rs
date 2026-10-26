@@ -12,7 +12,7 @@ pub static ENGLISH_TITLES: AtomicBool = AtomicBool::new(false);
 
 const MEDIA: &str = "id idMal title { romaji english } synonyms coverImage { extraLarge color }
   episodes status format season seasonYear averageScore genres description(asHtml: false)
-  studios { edges { isMain node { name } } } nextAiringEpisode { episode timeUntilAiring }
+  studios { edges { isMain node { name } } } nextAiringEpisode { episode airingAt }
   mediaListEntry { id status progress }";
 
 /// Shows per AniList page, the most it hands out at once.
@@ -39,7 +39,7 @@ pub struct Media {
     pub media_list_entry: Option<Entry>,
     /// where ani-cli listed a show AniList didn't provide (its episodes stay empty)
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub ani_cli: Option<crate::ani::Source>,
+    pub ani_cli: Option<crate::source::Source>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -89,7 +89,26 @@ pub struct Name {
 #[serde(rename_all = "camelCase")]
 pub struct Airing {
     pub episode: u32,
-    pub time_until_airing: i64,
+    /// when it airs, in seconds since 1970; 0 in a cache from before 0.7, which kept only
+    /// how long it was from then
+    #[serde(default)]
+    pub airing_at: i64,
+}
+
+impl Airing {
+    /// Seconds until it airs at `now` (seconds since 1970); None once it has, or if unknown.
+    pub fn left(&self, now: i64) -> Option<i64> {
+        (self.airing_at > 0)
+            .then(|| self.airing_at - now)
+            .filter(|s| *s > 0)
+    }
+}
+
+/// Seconds since 1970.
+pub fn now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -106,7 +125,7 @@ impl Media {
     /// A show found through ani-cli alone. The id hashes the search and the entry, not the
     /// shown name, so the same pick has it again next time and a provider's own "X (2)" can't
     /// take a numbered one's (FNV-1a: std's hasher may change between releases).
-    pub fn from_ani_cli(name: &str, at: crate::ani::Source) -> Media {
+    pub fn from_ani_cli(name: &str, at: crate::source::Source) -> Media {
         let key = format!("{}\n{}\n{}", at.query, at.title, at.nth);
         let hash = (key.bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
             (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
@@ -145,12 +164,18 @@ impl Media {
         self.progress() > 0 && crate::ani::ep_num(ep) <= self.progress() as f64
     }
 
-    /// Episodes that are out right now (None = unknown).
+    /// Episodes that are out right now (None = unknown, 0 before the first one airs). A list
+    /// from the cache may say an episode is next that has aired since.
     pub fn released(&self) -> Option<u32> {
-        self.next_airing_episode
-            .as_ref()
-            .map(|a| a.episode - 1)
-            .or(self.episodes)
+        let out = |a: &Airing| match a.airing_at > 0 && a.airing_at <= now() {
+            true => a.episode,
+            false => a.episode.saturating_sub(1),
+        };
+        let unscheduled = match self.status.as_deref() {
+            Some("NOT_YET_RELEASED") => Some(0),
+            _ => self.episodes,
+        };
+        self.next_airing_episode.as_ref().map(out).or(unscheduled)
     }
 }
 
@@ -306,17 +331,18 @@ impl Client {
         Err("AniList: too many requests, try again in a minute".into())
     }
 
-    pub fn viewer(&self) -> Result<(u64, String), String> {
+    /// Who's logged in: (id, name, whether they read English titles).
+    pub fn viewer(&self) -> Result<(u64, String, bool), String> {
         let d = self.gql(
             "{ Viewer { id name options { titleLanguage } } }",
             json!({}),
         )?;
         let v = &d["Viewer"];
         let lang = v["options"]["titleLanguage"].as_str().unwrap_or("");
-        ENGLISH_TITLES.store(lang.starts_with("ENGLISH"), Ordering::Relaxed);
         Ok((
             v["id"].as_u64().unwrap_or(0),
             v["name"].as_str().unwrap_or("?").to_string(),
+            lang.starts_with("ENGLISH"),
         ))
     }
 
@@ -336,6 +362,22 @@ impl Client {
             json!({ "sort": [sort], "search": search, "page": page }),
         )?;
         serde_json::from_value(d["Page"]["media"].clone()).map_err(|e| e.to_string())
+    }
+
+    /// The shows with these AniList ids as AniList has them now: their list entries too, so
+    /// downloads saved weeks ago show the progress of today.
+    pub fn shows(&self, ids: &[u64]) -> Result<Vec<Media>, String> {
+        let q = format!(
+            "query($ids: [Int]) {{ Page(perPage: {PER_PAGE}) {{ media(id_in: $ids, type: ANIME) {{ {MEDIA} }} }} }}"
+        );
+        let mut all = Vec::new();
+        for ids in ids.chunks(PER_PAGE) {
+            let d = self.gql(&q, json!({ "ids": ids }))?;
+            let page: Vec<Media> =
+                serde_json::from_value(d["Page"]["media"].clone()).map_err(|e| e.to_string())?;
+            all.extend(page);
+        }
+        Ok(all)
     }
 
     pub fn list(&self, user: u64, status: &str) -> Result<Vec<Media>, String> {
@@ -500,7 +542,7 @@ mod tests {
                 p2.status = Some("RELEASING".into());
                 p2.next_airing_episode = Some(super::Airing {
                     episode,
-                    time_until_airing: 3600,
+                    airing_at: super::now() + 3600,
                 });
             }
             move |id: u64| {
@@ -579,7 +621,7 @@ mod tests {
 
     #[test]
     fn ani_cli_shows_keep_their_id_and_stay_off_anilist() {
-        let at = |query: &str| crate::ani::Source {
+        let at = |query: &str| crate::source::Source {
             query: query.into(),
             index: 2,
             title: "Hunter x Hunter".into(),
@@ -600,6 +642,64 @@ mod tests {
         assert!(!anilist.contains("aniCli"));
         let old: super::Media = serde_json::from_str(r#"{"id": 1}"#).unwrap();
         assert!(old.ani_cli.is_none());
+    }
+
+    #[test]
+    fn an_episode_that_aired_since_the_list_was_cached_is_out() {
+        let airing = |at| super::Airing {
+            episode: 5,
+            airing_at: at,
+        };
+        let now = super::now();
+        assert_eq!(airing(now + 90).left(now), Some(90));
+        assert_eq!(
+            airing(now - 90).left(now),
+            None,
+            "aired since: no countdown"
+        );
+        assert_eq!(airing(0).left(now), None, "a cache from before 0.7");
+        let show = |at| super::Media {
+            episodes: Some(12),
+            next_airing_episode: Some(airing(at)),
+            ..Default::default()
+        };
+        assert_eq!(show(now + 90).released(), Some(4));
+        assert_eq!(show(now - 90).released(), Some(5));
+        assert_eq!(show(0).released(), Some(4));
+        let old: super::Airing =
+            serde_json::from_str(r#"{"episode": 5, "timeUntilAiring": 90}"#).unwrap();
+        assert_eq!((old.episode, old.airing_at), (5, 0));
+    }
+
+    #[test]
+    fn nothing_is_out_before_the_first_episode_airs() {
+        let now = super::now();
+        let show = |status: &str, episodes, at: Option<i64>| super::Media {
+            status: Some(status.into()),
+            episodes,
+            next_airing_episode: at.map(|airing_at| super::Airing {
+                episode: 1,
+                airing_at,
+            }),
+            ..Default::default()
+        };
+        let upcoming = |episodes, at| show("NOT_YET_RELEASED", episodes, at).released();
+        assert_eq!(upcoming(Some(12), None), Some(0), "announced, no date yet");
+        assert_eq!(upcoming(None, None), Some(0));
+        assert_eq!(upcoming(Some(12), Some(now + 90)), Some(0));
+        assert_eq!(
+            upcoming(Some(12), Some(now - 90)),
+            Some(1),
+            "a cache from before it aired"
+        );
+        assert_eq!(
+            upcoming(Some(12), Some(0)),
+            Some(0),
+            "a cache from before 0.7"
+        );
+        assert_eq!(show("RELEASING", Some(12), None).released(), Some(12));
+        assert_eq!(show("FINISHED", Some(12), None).released(), Some(12));
+        assert_eq!(super::Media::default().released(), None);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use crate::anilist::Media;
 use crate::kitty;
-use crate::{App, Cover, EpMode, Feed, Input, PIN_REDIRECT, Pending, View, ani, list_label};
+use crate::{App, EpMode, Input, PIN_REDIRECT, Pending, View, ani, list_label};
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, BorderType, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap,
@@ -25,7 +25,6 @@ const GLINT_MS: u128 = 450;
 const POP_MS: u128 = 160;
 
 pub fn render(app: &mut App, f: &mut Frame) {
-    app.cell = kitty::cell_px();
     let [head, body, foot] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Fill(1),
@@ -159,7 +158,7 @@ fn panel() -> Block<'static> {
 
 /// A paused download's row: how far it got, without the stale speed of its last line, when
 /// that's kept (yt-dlp; ffmpeg starts over).
-fn paused(n: &crate::DlNow) -> String {
+fn paused(n: &crate::downloads::Now) -> String {
     let at = crate::got_so_far(&n.text).filter(|_| n.resumes);
     at.map_or("‖ paused".into(), |p| format!("‖ paused {p}"))
 }
@@ -209,9 +208,11 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let shimmer = (app.started.elapsed().as_millis() / 30) as usize;
     // what "Continue with" on a show's page plays
     let next = match &app.stack.last().unwrap().view {
-        View::Show(m) => Some(app.next_ep(m).to_string()),
+        View::Show(m) => Some(app.progress(m).next().to_string()),
         _ => None,
     };
+    let unaired =
+        matches!(&app.stack.last().unwrap().view, View::Episodes(m, _) if app.upcoming(m));
     let screen = app.stack.last_mut().unwrap();
     let block = panel();
     let inner = block.inner(area).inner(Margin::new(1, 0));
@@ -308,9 +309,13 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     // an empty list says so, instead of a bare 0
     let empty = match &screen.view {
         _ if !m.items.is_empty() || screen.loading => None,
-        View::Shows(_, Feed::Local) => Some("Nothing downloaded yet"),
-        View::Shows(..) => Some("No shows found"),
+        View::Shows(list) if list.is_local() => Some("Nothing downloaded yet"),
+        View::Shows(list) if list.is_search() => Some("No shows found"),
+        View::Shows(..) => Some("Nothing on this list"),
+        View::Episodes(..) if unaired => Some("Not out yet"),
         View::Episodes(..) => Some("No episodes found"),
+        // its download row goes when none of its shows is out
+        View::Bulk(_) => Some("None of them is out yet"),
         _ => None,
     };
     if let Some(text) = empty {
@@ -332,13 +337,14 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         ))
     });
     // and the next page right on "More…"
-    let fetching = matches!(screen.view, View::Shows(_, Feed::Pages(_, _, true)));
+    let fetching = matches!(&screen.view, View::Shows(list) if list.fetching());
     let busy = busy.or_else(|| fetching.then(|| ("more".to_string(), format!("{spin} loading…"))));
     // and the episode downloading right now on its row, or how far it got when paused
-    let busy = busy.or_else(|| match (&screen.view, &app.dl_now) {
+    let dl = app.downloads.snapshot();
+    let busy = busy.or_else(|| match (&screen.view, &dl.now) {
         (View::Episodes(m, _), Some(n)) if m.id == n.id => Some((
             n.ep.clone(),
-            match ani::paused() {
+            match dl.paused {
                 true => paused(n),
                 false => format!("↓ {}", n.text),
             },
@@ -392,7 +398,9 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
             {
                 hint = head.to_string();
             }
-            if !hint.is_empty() && room > 3 {
+            // a hint cut to less than half says nothing ("not l…", "loses pr…"), so it goes
+            let w = Span::raw(hint.as_str()).width();
+            if !hint.is_empty() && (w <= room || room > 3 && room * 2 >= w) {
                 let hint = Span::styled(fit(hint, room), color);
                 spans.push(" ".repeat(width.saturating_sub(used + hint.width())).into());
                 spans.push(hint);
@@ -481,7 +489,8 @@ fn input_help(input: &Input) -> Text<'static> {
             "Where new downloads go. ~ works.".into(),
             format!("Empty goes back to {}.", ani::tilde(&ani::default_root())).into(),
             "".into(),
-            "Shows already downloaded stay in the old folder.".into(),
+            "Shows downloaded before keep their folder,".into(),
+            "new episodes of them too.".into(),
         ],
     };
     Text::from(lines).style(SOFT)
@@ -493,10 +502,10 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
     f.render_widget(block, area);
     let screen = app.stack.last().unwrap();
     let media = match &screen.view {
-        View::Shows(list, _) => screen
+        View::Shows(list) => screen
             .menu
             .current()
-            .and_then(|it| list.iter().find(|m| m.id.to_string() == it.key))
+            .and_then(|it| list.shows.iter().find(|m| m.id.to_string() == it.key))
             .cloned(),
         View::Show(m)
         | View::Episodes(m, _)
@@ -505,14 +514,15 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         | View::Sources(m, ..)
         | View::Input(Input::SourceQuery(m))
         | View::Audio(Some(m))
-        | View::Confirm(Pending::Progress(m, ..) | Pending::Stop(m, _) | Pending::Pause(m, _)) => {
+        | View::Confirm(Pending::Remove(m) | Pending::Stop(m, _) | Pending::Pause(m, _)) => {
             Some(m.clone())
         }
+        View::Confirm(Pending::Progress(mark)) => Some(mark.entry.clone()),
         _ => None,
     };
     // posters just below the cursor load ahead, so scrolling shows them instantly
     let ahead: Vec<Media> = match &screen.view {
-        View::Shows(list, _) => {
+        View::Shows(list) => {
             let cur = screen.menu.state.selected().unwrap_or(0);
             screen
                 .menu
@@ -520,7 +530,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
                 .iter()
                 .skip(cur + 1)
                 .take(6)
-                .filter_map(|(i, _)| list.get(*i).cloned())
+                .filter_map(|(i, _)| list.shows.get(*i).cloned())
                 .collect()
         }
         // and the sequels an episode list runs on into, whose posters its episodes show
@@ -577,17 +587,36 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
     let lines: Vec<Line> = match &screen.view {
         View::Bulk(list) => list
             .iter()
-            .map(|m| Line::from(format!("• {}", m.name())))
-            .collect(),
-        View::Confirm(Pending::Delete(paths)) => paths
-            .iter()
-            .map(|p| {
-                Line::from(format!(
-                    "✗ {}",
-                    p.file_name().unwrap_or_default().to_string_lossy()
-                ))
+            .map(|m| {
+                let mut line = Line::from(format!("• {}", m.name()));
+                if app.upcoming(m) {
+                    line.push_span(Span::styled(" · not out yet", DIM));
+                }
+                line
             })
             .collect(),
+        // a show's files under its folder, as one of the user's own may be among them
+        View::Confirm(Pending::Delete(paths)) => {
+            let name = |p: &std::path::Path| {
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            (paths.iter())
+                .flat_map(|p| {
+                    let files = match p.is_dir() {
+                        true => ani::show_files(p),
+                        false => Vec::new(),
+                    };
+                    let head = Line::from(format!("✗ {}", name(p)));
+                    let files = files
+                        .into_iter()
+                        .map(move |f| Line::styled(format!("    {}", name(&f)), DIM));
+                    std::iter::once(head).chain(files)
+                })
+                .collect()
+        }
         View::Confirm(Pending::Resume(jobs, _)) => jobs
             .iter()
             .map(|j| {
@@ -677,7 +706,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v.push(row(
         kitty::supported(),
         "graphics",
-        "posters need Ghostty or kitty",
+        "posters: Ghostty or kitty",
     ));
     v.extend(["".into(), Line::styled("AniList", Style::new().bold())]);
     match &app.user {
@@ -708,7 +737,11 @@ fn facts(m: &Media) -> Vec<Line<'static>> {
         m.episodes
             .filter(|&e| !(movie && e == 1))
             .map(|e| episodes(e as usize)),
-        m.status.as_deref().map(pretty),
+        // a list cached before it started airing still says it's upcoming
+        (m.status.as_deref()).map(|s| match s {
+            "NOT_YET_RELEASED" if m.released() > Some(0) => pretty("RELEASING"),
+            s => pretty(s),
+        }),
     ];
     for d in detail.into_iter().flatten() {
         if !facts.is_empty() {
@@ -842,17 +875,16 @@ fn media_preview(
 ) -> (bool, bool) {
     // on an episode of a sequel the provider runs on into, it's that sequel's poster, facts,
     // status and description; what's on disk, ani-cli's entry and the episode stay the show's
-    let part = ep.map(|ep| app.part(show, ep).0.clone());
+    let part = ep.map(|ep| app.progress(show).entry(ep).0.clone());
     let part = part.filter(|p| p.id != show.id);
     let m = part.as_ref().unwrap_or(show);
-    let (fw, fh) = app.cell;
     let rows = (area.height * 3 / 5).clamp(6, 26).min(area.height);
-    let cols = ((rows as f32 * fh as f32 * 0.7) / fw.max(1) as f32).round() as u16;
-    app.poster = Size::new(cols.min(area.width / 2), rows);
+    // font zoom changes the pixels per cell, so they're read every frame
+    let size = app.posters.fit(rows, area.width / 2, kitty::cell_px());
     app.want_cover(m, true);
 
     let [poster, _, info] = Layout::horizontal([
-        Constraint::Length(app.poster.width),
+        Constraint::Length(size.width),
         Constraint::Length(2),
         Constraint::Fill(1),
     ])
@@ -902,13 +934,14 @@ fn media_preview(
     lines.extend(status(m));
     // the provider's episodes past the show's own count toward a sequel on AniList; an
     // episode list says so with a rule between them (ui::menu)
-    let parts = if ep.is_none() { app.parts(show) } else { &[] };
+    let run = app.progress(show);
+    let parts = if ep.is_none() { run.parts() } else { &[] };
     for (before, p) in parts {
         let eps = p.episodes.map_or(format!("{}+", before + 1), |n| {
             format!("{}–{}", before + 1, before + n)
         });
         // as the episode list's rule calls it: "Part 2"
-        let name = crate::part_name(show.name(), p.name());
+        let name = run.part_name(p);
         // "Part 2" wraps whole; a long name still wraps, just not before its last word
         let name = match name.rsplit_once(' ') {
             Some((head, last)) => format!("{head}\u{a0}{last}"),
@@ -917,11 +950,13 @@ fn media_preview(
         lines.push(Line::styled(format!("Episodes\u{a0}{eps} are {name}"), DIM));
         lines.extend(status(p));
     }
-    if let Some(a) = &m.next_airing_episode {
+    if let Some(a) = &m.next_airing_episode
+        && let Some(left) = a.left(crate::anilist::now())
+    {
         lines.push(Line::from(format!(
             "Episode {} airs in {}",
             a.episode,
-            duration(a.time_until_airing)
+            duration(left)
         )));
     }
     // an episode list says "on disk" on each of its rows
@@ -929,7 +964,7 @@ fn media_preview(
     if local > 0 && ep.is_none() {
         lines.push(Line::from(format!("↓ {local} on disk")));
     }
-    if let Some(s) = app.sources.get(&show.id) {
+    if let Some(s) = app.sources.get(show.id) {
         let n = episodes(s.episodes.len());
         // a wrong match keeps its title, so it stands out
         let line = match same_title(&s.title, m) {
@@ -944,7 +979,7 @@ fn media_preview(
     {
         lines.push("".into());
         // its title and summary only once watched: they give things away, its date doesn't
-        let watched = app.watched(show, ep);
+        let watched = app.progress(show).watched(ep);
         let heading = match watched && !i.title.is_empty() {
             true => format!("Episode {ep} · {}", i.title),
             false => format!("Episode {ep}"),
@@ -985,10 +1020,9 @@ fn media_preview(
     let page_h = end.max(rows);
     let page_area = Rect::new(area.x, area.y, area.width, page_h.max(area.height));
     let mut page = Buffer::empty(page_area);
-    match app.covers.get(&m.id) {
-        Some(Cover::Ready(_, p)) => kitty::render(p, poster, &mut page),
-        // the cover's dominant color stands in while it loads
-        _ => Block::new().bg(accent).render(poster, &mut page),
+    // the cover's dominant color stands in while it loads
+    if !app.posters.draw(m.id, poster, &mut page) {
+        Block::new().bg(accent).render(poster, &mut page);
     }
     let head_area = Rect::new(info.x, info.y, info.width, head_h);
     head.render(head_area, &mut page);
@@ -1079,7 +1113,7 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     if screen.menu.multi && !screen.menu.items.is_empty() {
         keys.splice(0..0, [("tab", "mark"), ("^a", "all")]);
     }
-    if matches!(screen.view, View::Shows(_, Feed::Pages(_, Some(_), _))) {
+    if matches!(&screen.view, View::Shows(list) if list.more_page().is_some()) {
         let at = keys.iter().position(|k| k.0 == "enter").unwrap();
         keys.insert(at, ("^f", "more"));
     }
@@ -1096,7 +1130,8 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     );
     let toast = app.toast.as_ref().filter(|t| t.2.elapsed().as_secs() < 4);
     // read once: the worker can take the last one off between two reads
-    let n = crate::dl_pending();
+    let dl = app.downloads.snapshot();
+    let n = dl.pending;
     let status = match (toast, &app.playing) {
         // shortcut: what's still underway is told apart by its "…"; give toasts a kind once a
         // finished one can end in "…"
@@ -1115,14 +1150,14 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         _ if n > 0 => {
             // how far the one downloading got first, so that's what 80 columns keep, then
             // which one it is and what's after it
-            let head = match (&app.dl_now, ani::paused()) {
+            let head = match (&dl.now, dl.paused) {
                 (Some(d), true) => paused(d),
                 (Some(d), false) => format!("{} ↓ {}", spinner(app), d.text),
                 (None, true) => format!("‖ paused · {n} queued"),
                 (None, false) => format!("{} ↓ {n} queued", spinner(app)),
             };
             let head = format!(" {head} ");
-            let tail = (app.dl_now.as_ref()).map_or(String::new(), |d| match n - 1 {
+            let tail = (dl.now.as_ref()).map_or(String::new(), |d| match n - 1 {
                 0 => format!("· {}", d.label),
                 more => format!("· {} · {more} more queued", d.label),
             });
@@ -1173,12 +1208,13 @@ fn pretty(s: &str) -> String {
     }
 }
 
+/// "74d 6h", "5h 3m", kept on one line.
 fn duration(secs: i64) -> String {
     let (d, h, m) = (secs / 86400, secs % 86400 / 3600, secs % 3600 / 60);
     if d > 0 {
-        format!("{d}d {h}h")
+        format!("{d}d\u{a0}{h}h")
     } else {
-        format!("{h}h {m}m")
+        format!("{h}h\u{a0}{m}m")
     }
 }
 
@@ -1223,6 +1259,28 @@ mod tests {
         assert!(!same_title("Aoki Hagane no Arpeggio: Ars Nova Cadenza", &m));
         assert!(!same_title("Frieren: Beyond Journey's End Season 2", &m));
         assert_eq!(episodes(1), "1\u{a0}episode");
+    }
+
+    #[test]
+    fn a_show_that_aired_since_its_list_was_cached_is_airing() {
+        let now = crate::anilist::now();
+        let show = |at: Option<i64>| Media {
+            format: Some("TV".into()),
+            status: Some("NOT_YET_RELEASED".into()),
+            next_airing_episode: at.map(|airing_at| crate::anilist::Airing {
+                episode: 1,
+                airing_at,
+            }),
+            ..Default::default()
+        };
+        let status = |m: Media| facts(&m)[0].to_string();
+        assert!(status(show(Some(now - 90))).ends_with("Airing"));
+        assert!(status(show(Some(now + 90))).ends_with("Upcoming"));
+        assert!(
+            status(show(Some(0))).ends_with("Upcoming"),
+            "a cache from before 0.7"
+        );
+        assert!(status(show(None)).ends_with("Upcoming"));
     }
 
     #[test]
