@@ -2,42 +2,53 @@
 
 ![ani-hop demo](demo.avif)
 
-A fast terminal UI for anime: browse trending, top rated and search results, then stream or download episodes through [ani-cli](https://github.com/pystardust/ani-cli). Log in with [AniList](https://anilist.co) to get your lists and have your progress tracked after every episode.
+A fast terminal UI for anime: find a show, then stream or download it through [ani-cli](https://github.com/pystardust/ani-cli).
 
-## Why ani-hop
-
-| | |
-|---|---|
-| **No scraper of its own** | Every source comes from ani-cli, which a large community keeps working when the sites change. Updating ani-cli is enough; ani-hop itself doesn't need a new release. |
-| **Maintained** | FastAnime, later renamed Viu, the closest TUI of this kind, was archived in 2026. |
-| **One binary** | Written in Rust, with no Python environment and no fzf or rofi needed. It starts instantly. |
-| **Posters in the terminal** | Drawn with the Kitty graphics protocol, even inside tmux/herdr. |
-| **AniList built in** | Your lists, watched episodes marked, and progress saved after every episode. |
-| **Find an episode by what happens in it** | Watched episodes show their title and summary, and the filter searches them. Episodes you haven't seen stay blank, so nothing spoils. |
-| **Downloads in the background** | Keep browsing while they run, or pause them; unfinished ones come back after a restart. |
-| **Sub or dub** | Japanese or the English dub, each with or without English subtitles, for all shows or just one. Downloads follow the choice; if an episode has no dub yet, the stream falls back to subtitles. |
-| **Skips openings and endings** | With ani-skip, in streams and downloads alike; switch it off in the settings. |
+- **No scraper of its own.** Every source comes from ani-cli, which a large community keeps working. When a site changes, updating ani-cli is enough.
+- **One binary.** Written in Rust, starts instantly, needs no Python, fzf or rofi.
+- **Posters in the terminal.** In Ghostty and kitty, even inside tmux.
+- **AniList built in.** Your lists, watched episodes marked, progress saved after every episode.
+- **Find an episode by what happens in it.** The filter searches the titles and summaries of watched episodes. Unwatched ones stay blank, so nothing spoils.
+- **Downloads in the background.** Pause them or quit; unfinished ones come back after a restart.
+- **Sub or dub.** For all shows or just one, with openings and endings skipped.
 
 ## Install
 
-**Debian/Ubuntu, Fedora, Arch and their derivatives.** One line installs ani-hop and everything it needs. mpv and ffmpeg come from your distro. ani-cli and ani-skip do too where it has them new enough, so they update with the system: on Arch from the AUR through yay or paru. Otherwise they come from upstream into `~/.local/bin`, where `ani-cli -U` keeps ani-cli current without sudo. Run it again to update. On Arch with yay or paru it will install the AUR package `ani-hop-bin` instead, once that is published (AUR sign-ups are closed for now). On other distros it installs ani-hop, ani-cli and ani-skip and lists the system packages to install yourself.
+### Debian, Ubuntu, Fedora, Arch
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh
 ```
 
-**Homebrew (macOS on Apple silicon, Linux).** ani-cli comes from its own tap:
+Installs ani-hop, ani-cli, mpv and the rest. Run it again to update; ani-hop tells you when there's a new version.
+
+### macOS (Apple silicon)
 
 ```sh
 brew tap pystardust/ani-cli https://github.com/pystardust/ani-cli.git
 brew install pystardust/ani-cli/ani-cli reynkedevos/tap/ani-hop
 ```
 
-**Windows.** ani-hop runs in WSL. Install it with `wsl --install -d Ubuntu-26.04` in an admin PowerShell, restart, then run the `install.sh` line above in Ubuntu. The [WSL guide](docs/distribution.md#windows-via-wsl-step-by-step) has the details, including posters through kitty.
+Update with `brew upgrade`. The same works with Homebrew on Linux.
 
-**From source.** `cargo install --locked --git https://github.com/ReynkeDeVos/ani-hop` (Rust 1.89 or newer). It then needs [ani-cli](https://github.com/pystardust/ani-cli) 5.1 or newer, [mpv](https://mpv.io), [yt-dlp](https://github.com/yt-dlp/yt-dlp), ffmpeg, curl, patch and xdg-utils; [ani-skip](https://github.com/synacktraa/ani-skip) is optional.
+### Windows
 
-Posters need [Ghostty](https://ghostty.org) or [kitty](https://sw.kovidgoyal.net/kitty/). ani-hop checks its tools at the start and offers to install what's missing. It also says when ani-cli is too old or a new ani-hop is out, with the command that updates it.
+ani-hop runs in WSL. In PowerShell as admin:
+
+```powershell
+wsl --install -d Ubuntu-26.04
+```
+
+Restart, open Ubuntu and run the Linux line above. For posters, see the [WSL guide](docs/distribution.md#windows-via-wsl-step-by-step).
+
+<details>
+<summary>Other distros, or from source</summary>
+
+On other distros the script installs ani-hop, ani-cli and ani-skip, then lists the system packages to install yourself.
+
+From source: `cargo install --locked --git https://github.com/ReynkeDeVos/ani-hop` (Rust 1.89 or newer). It needs [ani-cli](https://github.com/pystardust/ani-cli) 5.1 or newer, [mpv](https://mpv.io), [yt-dlp](https://github.com/yt-dlp/yt-dlp), ffmpeg, curl, patch and xdg-utils; [ani-skip](https://github.com/synacktraa/ani-skip) is optional. ani-hop checks for them at the start and offers to install what's missing.
+
+</details>
 
 ## License
 
