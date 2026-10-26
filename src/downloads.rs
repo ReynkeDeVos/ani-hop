@@ -576,8 +576,18 @@ impl Queue {
             // also for an episode already there, so a folder found through ani-cli gets the
             // AniList show
             let (dir, hold) = self.0.fetch.prepare(m)?;
-            // another ani-hop may have queued it too before either saw the other's queue
-            let mut held = (self.claim(&dir, ep)?).ok_or("another ani-hop is downloading it")?;
+            // another ani-hop may have queued it too before either saw the other's queue. A
+            // process this one starts right then holds a copy of the lock file until its exec
+            // closes it, so a claim that fails is tried again a few times first.
+            let mut tries = 0;
+            let mut held = loop {
+                match self.claim(&dir, ep)? {
+                    Some(held) => break held,
+                    None if tries < 5 => tries += 1,
+                    None => return Err("another ani-hop is downloading it".into()),
+                }
+                thread::sleep(std::time::Duration::from_millis(20));
+            };
             held.folder = Some(hold);
             *claim = Some(held);
             if ani::local_episodes(&dir).iter().any(|(e, _)| e == ep) {
@@ -937,11 +947,14 @@ mod tests {
         q.discard(&folder, &["1".into()]);
         assert!(part.exists() && folder.is_dir());
         claim.discard();
-        assert!(
-            !part.exists() && !folder.exists(),
-            "deleted, then the empty folder"
-        );
-        assert!(q.claim(&folder, "1").unwrap().is_some(), "let go");
+        assert!(!part.exists(), "deleted while held");
+        // a process another test forks right then holds the folder's lock file too, until its
+        // exec closes it, and the folder waits for the next cleanup
+        wait("then the empty folder", || {
+            let _ = ani::drop_if_empty(&folder);
+            !folder.exists()
+        });
+        wait("let go", || q.claim(&folder, "1").unwrap().is_some());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -967,6 +980,8 @@ mod tests {
         assert_eq!(q.drop_leftovers(std::slice::from_ref(&mine)), 1);
         assert!(!mine.exists());
         q.enqueue(job(&["2"])).unwrap();
+        // running, so its worker has saved what it does before the folder goes below
+        wait("downloading", || running(&q, "2"));
         assert_eq!(q.drop_leftovers(std::slice::from_ref(&mine)), 1);
         let kept = read_queue(&mine);
         assert_eq!(kept.len(), 1);

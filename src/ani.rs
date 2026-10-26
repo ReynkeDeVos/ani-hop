@@ -1207,7 +1207,12 @@ mod tests {
         delete_show(&dir).unwrap();
         assert!(dir.is_dir() && ours(&dir));
         drop(hold);
-        drop_if_empty(&dir).unwrap();
+        // a process another test forks right then holds the lock file too, until its exec
+        let start = std::time::Instant::now();
+        while dir.exists() && start.elapsed().as_secs() < 2 {
+            drop_if_empty(&dir).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(!dir.exists() && !ours(&dir), "dropped once let go");
         fs::remove_dir_all(&root).unwrap();
     }
