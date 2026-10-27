@@ -39,7 +39,7 @@ ani-hop runs in WSL. In PowerShell as admin:
 wsl --install -d Ubuntu-26.04
 ```
 
-Restart, open Ubuntu and run the Linux line above. For posters, see the [WSL guide](docs/distribution.md#windows-via-wsl-step-by-step).
+Restart, open Ubuntu and run the Linux line above. For posters, run ani-hop in kitty: `sudo apt install -y kitty`, then `kitty &`, and `ani-hop` in the kitty window. If kitty says "Wayland: Failed to connect to display", add `linux_display_server x11` to `~/.config/kitty/kitty.conf`.
 
 <details>
 <summary>Other distros, Nix, or from source</summary>
