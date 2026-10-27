@@ -1,18 +1,19 @@
 use crate::anilist::Media;
 use crate::kitty;
-use crate::{App, EpMode, Input, PIN_REDIRECT, Pending, View, ani, list_label};
+use crate::preview::{self, Shown};
+use crate::{App, EpMode, Input, PIN_REDIRECT, Pending, View, ani};
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, BorderType, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap,
 };
 
 // ANSI colors on purpose: they follow the terminal (and Omarchy) theme.
-const ACCENT: Color = Color::Magenta;
-const MATCH: Color = Color::Cyan;
-const DIM: Color = Color::DarkGray;
+pub const ACCENT: Color = Color::Magenta;
+pub const MATCH: Color = Color::Cyan;
+pub const DIM: Color = Color::DarkGray;
 /// Text to read that steps back: faint main text is easier on the eyes than DIM in most
 /// themes (Omarchy's color 7 is the main text itself, so there's no ANSI shade between).
-const SOFT: Style = Style::new().add_modifier(Modifier::DIM);
+pub const SOFT: Style = Style::new().add_modifier(Modifier::DIM);
 /// the row under the cursor
 const SELECTED: Style = Style::new()
     .add_modifier(Modifier::BOLD)
@@ -21,7 +22,6 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const LOGO: [&str; 2] = ["▄▀█ █▄ █ █ ▄▄ █ █ █▀█ █▀█", "█▀█ █ ▀█ █    █▀█ █▄█ █▀▀"];
 const SHADES: [&str; 4] = ["░", "▒", "▓", "█"];
 const BOOT_MS: u128 = 500;
-const GLINT_MS: u128 = 450;
 const POP_MS: u128 = 160;
 
 pub fn render(app: &mut App, f: &mut Frame) {
@@ -31,11 +31,13 @@ pub fn render(app: &mut App, f: &mut Frame) {
         Constraint::Length(1),
     ])
     .areas(f.area());
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]).areas(body);
+    let screen = app.stack.last().unwrap();
+    let (left, right) = split(body, question(screen).filter(|_| widens(&screen.view)));
     header(app, f, head);
     menu(app, f, left);
-    preview(app, f, right);
+    if let Some(right) = right {
+        preview(app, f, right);
+    }
     footer(app, f, foot);
     starting(app, f);
     boot(app, f.buffer_mut());
@@ -44,14 +46,14 @@ pub fn render(app: &mut App, f: &mut Frame) {
 // Effects never hide content for long: speed first, the shine comes on top.
 pub fn effects_running(app: &App) -> bool {
     app.started.elapsed().as_millis() < BOOT_MS
-        || app.glint.1.elapsed().as_millis() < GLINT_MS
-        || app.playing.as_ref().is_some_and(|p| p.step.is_some())
+        || app.preview.animating()
+        || app.playback.now().is_some_and(|p| p.step.is_some())
 }
 
 /// While an episode starts, a box pops up in the middle with a running bar, so enter
 /// visibly did something at once. It goes when mpv shows the episode.
 fn starting(app: &App, f: &mut Frame) {
-    let Some((p, step)) = app.playing.as_ref().and_then(|p| Some((p, p.step?))) else {
+    let Some((p, step)) = app.playback.now().and_then(|p| Some((p, p.step?))) else {
         return;
     };
     // the cover color, unless it's too dark to see
@@ -100,7 +102,7 @@ fn starting(app: &App, f: &mut Frame) {
 }
 
 /// How far a left-to-right front with a `band`-wide tail has passed `x`, at progress `t`.
-fn swept(t: f32, x: u16, width: u16, band: f32) -> f32 {
+pub fn swept(t: f32, x: u16, width: u16, band: f32) -> f32 {
     t * (width as f32 + band) - x as f32
 }
 
@@ -117,22 +119,6 @@ fn boot(app: &App, buf: &mut Buffer) {
         let d = swept(t, x, area.width, 25.0);
         if d < 25.0 && cell.symbol() != " " && !cell.symbol().contains('\u{10EEEE}') {
             cell.set_symbol(SHADES[(d.max(0.0) / 25.0 * 4.0) as usize]);
-        }
-    }
-}
-
-/// A white sweep across the title that settles into its cover color.
-fn glint(app: &App, buf: &mut Buffer, area: Rect, (r, g, b): (u8, u8, u8)) {
-    let t = app.glint.1.elapsed().as_millis() as f32 / GLINT_MS as f32;
-    if t >= 1.0 {
-        return;
-    }
-    let lerp = |c: u8, w: f32| (c as f32 + (255.0 - c as f32) * w) as u8;
-    for pos in area.positions() {
-        let cell = &mut buf[pos];
-        if cell.fg == Color::Rgb(r, g, b) {
-            let w = 1.0 - (swept(t, pos.x - area.x, area.width, 12.0) / 12.0).clamp(0.0, 1.0);
-            cell.fg = Color::Rgb(lerp(r, w), lerp(g, w), lerp(b, w));
         }
     }
 }
@@ -156,13 +142,6 @@ fn panel() -> Block<'static> {
         .border_style(DIM)
 }
 
-/// A paused download's row: how far it got, without the stale speed of its last line, when
-/// that's kept (yt-dlp; ffmpeg starts over).
-fn paused(n: &crate::downloads::Now) -> String {
-    let at = crate::got_so_far(&n.text).filter(|_| n.resumes);
-    at.map_or("‖ paused".into(), |p| format!("‖ paused {p}"))
-}
-
 fn spinner(app: &App) -> &'static str {
     SPINNER[(app.started.elapsed().as_millis() / 80) as usize % SPINNER.len()]
 }
@@ -178,17 +157,25 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
     };
     let [crumbs_area, user_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(user.width() as u16)])
+            .spacing(1)
             .areas(area);
-    // newest crumbs first; whatever doesn't fit folds into "…" (the current one never does)
+    // newest crumbs first; whatever doesn't fit folds into "…", and the current one is cut
+    // in the middle, keeping a season's or part's name
+    let crumbs: Vec<&str> = app.stack.iter().skip(1).rev().map(crumb).collect();
     let mut room = (crumbs_area.width as usize).saturating_sub(10);
-    let mut shown = Vec::new();
-    for t in app.stack.iter().skip(1).rev().map(crumb) {
-        let w = Span::raw(t).width() + 3;
-        if w > room && !shown.is_empty() {
-            shown.push("…");
-            break;
-        }
-        room = room.saturating_sub(w);
+    let mut shown: Vec<String> = Vec::new();
+    for (i, t) in crumbs.iter().enumerate() {
+        // room for " › …" while older ones follow
+        let fold = if i + 1 < crumbs.len() { 4 } else { 0 };
+        let t = match i {
+            0 => fit_middle(t, room.saturating_sub(3 + fold)),
+            _ if Span::raw(*t).width() + 3 + fold > room => {
+                shown.push("…".into());
+                break;
+            }
+            _ => t.to_string(),
+        };
+        room = room.saturating_sub(Span::raw(t.as_str()).width() + 3);
         shown.push(t);
     }
     let mut crumbs = vec![Span::styled(
@@ -203,6 +190,46 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(user, user_area);
 }
 
+/// The question a confirmation asks, and how many answers it has.
+fn question(screen: &crate::Screen) -> Option<(&str, usize)> {
+    let asks = matches!(screen.view, View::Confirm(_));
+    asks.then_some((screen.title.as_str(), screen.menu.items.len()))
+}
+
+/// Where the menu's rows go in its panel at `area`.
+fn menu_inner(area: Rect) -> Rect {
+    panel().inner(area).inner(Margin::new(1, 0))
+}
+
+/// Rows question `q` gets in `inner`: what it wraps to, but leaving the rule under it and
+/// its `answers` on screen; and whether that's all of it.
+fn question_rows(q: &str, answers: usize, inner: Rect) -> (u16, bool) {
+    let q = Paragraph::new(Line::styled(q, Style::new().bold())).wrap(Wrap { trim: true });
+    let need = q.line_count(inner.width) as u16;
+    let room = inner.height.saturating_sub(1 + answers as u16).max(1);
+    (need.clamp(1, room), need <= room)
+}
+
+/// Whether a question too long beside the preview may take its place: not one whose preview
+/// lists what it acts on (the files Delete takes, the downloads Resume picks up).
+fn widens(view: &View) -> bool {
+    !matches!(
+        view,
+        View::Confirm(Pending::Delete(_) | Pending::Resume(..))
+    )
+}
+
+/// The menu's side of `body`, and the preview's: a question too long for its side takes the
+/// whole width, so what it changes reads in full before it's answered.
+fn split(body: Rect, asked: Option<(&str, usize)>) -> (Rect, Option<Rect>) {
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]).areas(body);
+    match asked {
+        Some((q, answers)) if !question_rows(q, answers, menu_inner(left)).1 => (body, None),
+        _ => (left, Some(right)),
+    }
+}
+
 fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let spin = spinner(app);
     let shimmer = (app.started.elapsed().as_millis() / 30) as usize;
@@ -213,16 +240,19 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     };
     let unaired =
         matches!(&app.stack.last().unwrap().view, View::Episodes(m, _) if app.upcoming(m));
+    // the episode downloading right now on its row, or how far it got when paused
+    let dl_row = match &app.stack.last().unwrap().view {
+        View::Episodes(m, _) => app.show_downloads(m).row(),
+        _ => None,
+    };
     let screen = app.stack.last_mut().unwrap();
     let block = panel();
-    let inner = block.inner(area).inner(Margin::new(1, 0));
+    let inner = menu_inner(area);
     f.render_widget(block, area);
     // a confirmation shows its question where the filter prompt would be, wrapped
-    let question = matches!(screen.view, View::Confirm(_)).then_some(screen.title.as_str());
-    let rows = question.map_or(1, |q| {
-        let q = Paragraph::new(Line::styled(q, Style::new().bold())).wrap(Wrap { trim: true });
-        (q.line_count(inner.width) as u16).clamp(1, 6)
-    });
+    let asked = question(screen);
+    let rows = asked.map_or(1, |(q, answers)| question_rows(q, answers, inner).0);
+    let question = asked.map(|(q, _)| q);
     let [prompt_area, info_area, list_area] = Layout::vertical([
         Constraint::Length(rows),
         Constraint::Length(1),
@@ -281,17 +311,17 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         ),
     };
     let mut info = vec![Span::styled(
-        if m.items.is_empty() && screen.loading {
+        if m.items.is_empty() && screen.loading() {
             String::new()
         } else {
             count
         },
         DIM,
     )];
-    if screen.loading {
+    if screen.loading() {
         info.push(Span::styled(format!(" {spin}"), ACCENT));
     }
-    if screen.loading && m.items.is_empty() {
+    if screen.loading() && m.items.is_empty() {
         f.render_widget(skeleton(list_area, shimmer), list_area);
     }
     if !m.marked.is_empty() {
@@ -308,7 +338,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     f.render_widget(Line::from(info), info_area);
     // an empty list says so, instead of a bare 0
     let empty = match &screen.view {
-        _ if !m.items.is_empty() || screen.loading => None,
+        _ if !m.items.is_empty() || screen.loading() => None,
         View::Shows(list) if list.is_local() => Some("Nothing downloaded yet"),
         View::Shows(list) if list.is_search() => Some("No shows found"),
         View::Shows(..) => Some("Nothing on this list"),
@@ -324,7 +354,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     }
 
     // the episode being started shows it right where enter was pressed
-    let busy = app.playing.as_ref().and_then(|p| {
+    let busy = app.playback.now().and_then(|p| {
         let key = match &screen.view {
             View::Episodes(m, EpMode::Play) if m.id == p.id => p.ep.clone(),
             View::Show(m) if m.id == p.id && next.as_ref() == Some(&p.ep) => "next".into(),
@@ -339,19 +369,9 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     // and the next page right on "More…"
     let fetching = matches!(&screen.view, View::Shows(list) if list.fetching());
     let busy = busy.or_else(|| fetching.then(|| ("more".to_string(), format!("{spin} loading…"))));
-    // and the episode downloading right now on its row, or how far it got when paused
-    let dl = app.downloads.snapshot();
-    let busy = busy.or_else(|| match (&screen.view, &dl.now) {
-        (View::Episodes(m, _), Some(n)) if m.id == n.id => Some((
-            n.ep.clone(),
-            match dl.paused {
-                true => paused(n),
-                false => format!("↓ {}", n.text),
-            },
-        )),
-        _ => None,
-    });
-    let width = list_area.width.saturating_sub(1) as usize; // minus the pointer column
+    let busy = busy.or(dl_row);
+    let width = list_area.width.saturating_sub(1).max(2) as usize; // minus the pointer column
+    let titles = matches!(screen.view, View::Shows(..) | View::Sources(..));
     let selected = m.state.selected();
     let rows: Vec<ListItem> = (m.matches.iter().enumerate())
         .map(|(k, (i, hits))| {
@@ -362,17 +382,9 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 _ => " ",
             };
             let mut spans = vec![Span::styled(mark, Color::Green), " ".into()];
-            spans.extend(item.label.chars().enumerate().map(|(ci, ch)| {
-                let hit = hits.binary_search(&(ci as u32)).is_ok();
-                Span::styled(
-                    ch.to_string(),
-                    match (hit, item.done) {
-                        (true, _) => Style::new().fg(MATCH).bold(),
-                        (false, true) => SOFT,
-                        _ => Style::new(),
-                    },
-                )
-            }));
+            let plain = if item.done { SOFT } else { Style::new() };
+            let room = titles.then_some(width - 2);
+            spans.extend(row_label(&item.label, hits, plain, room));
             let mut used: usize = spans.iter().map(|s| s.width()).sum();
             // a title too long for the row ends in "…", like a cut hint
             if used > width {
@@ -381,10 +393,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 {
                     used -= s.width();
                 }
-                spans.push(Span::styled(
-                    "…",
-                    if item.done { SOFT } else { Style::new() },
-                ));
+                spans.push(Span::styled("…", plain));
                 used += 1;
             }
             let room = width.saturating_sub(used + 2);
@@ -393,6 +402,9 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 _ => (item.hint.clone(), DIM),
             };
             let mut hint = hint;
+            if Span::raw(hint.as_str()).width() > room && !item.short.is_empty() {
+                hint = item.short.clone();
+            }
             while Span::raw(hint.as_str()).width() > room
                 && let Some((head, _)) = hint.rsplit_once(" · ")
             {
@@ -459,38 +471,35 @@ fn skeleton(area: Rect, tick: usize) -> Text<'static> {
 fn input_help(input: &Input) -> Text<'static> {
     let lines: Vec<Line> = match input {
         Input::Search => vec!["Type a title and press enter.".into()],
+        // one line per step or idea, wrapped by the pane, as 80 columns leave it 29
         Input::ClientId => vec![
             "One-time setup: ani-hop needs your own AniList API client.".into(),
             "".into(),
-            "1. Open anilist.co/settings/developer".into(),
-            "   → Create New Client".into(),
-            "2. Name: ani-hop".into(),
-            "   Redirect URL:".into(),
-            Line::from(vec![
-                "   ".into(),
-                Span::styled(PIN_REDIRECT, Style::new().fg(ACCENT).not_dim()),
-            ]),
-            "3. Paste the client ID here and press enter.".into(),
+            "1. On anilist.co/settings/developer, choose Create New Client.".into(),
+            "2. Name it ani-hop, with this redirect URL:".into(),
+            Line::styled(PIN_REDIRECT, Style::new().fg(ACCENT).not_dim()),
+            "3. Paste its client ID here and press enter.".into(),
         ],
         Input::Token => vec![
-            "Approve ani-hop in your browser, then paste".into(),
-            "the token AniList shows and press enter.".into(),
+            "Approve ani-hop in your browser, then paste the token AniList shows and press enter."
+                .into(),
             "".into(),
             Line::styled(
                 "Pasting the whole redirect URL works too.",
                 Style::new().italic(),
             ),
+            "".into(),
+            "Wrong client ID? Press enter with this empty.".into(),
         ],
         Input::SourceQuery(_) => vec![
-            "Search ani-cli with this text, then pick the".into(),
-            "right entry. ani-hop remembers the choice.".into(),
+            "Search ani-cli with this text, then pick the right entry. ani-hop remembers it."
+                .into(),
         ],
         Input::DownloadDir => vec![
-            "Where new downloads go. ~ works.".into(),
+            "Where downloads go. ~ works.".into(),
             format!("Empty goes back to {}.", ani::tilde(&ani::default_root())).into(),
             "".into(),
-            "Shows downloaded before keep their folder,".into(),
-            "new episodes of them too.".into(),
+            "Shows downloaded before keep their folder, also for new episodes.".into(),
         ],
     };
     Text::from(lines).style(SOFT)
@@ -537,52 +546,22 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         View::Episodes(m, _) => app.parts(m).iter().map(|(_, p)| p.clone()).collect(),
         _ => Vec::new(),
     };
-    // episode titles load while the show is open, so its episode list has them right away
-    let shows_eps = matches!(screen.view, View::Show(_) | View::Episodes(..));
     let ep = match &screen.view {
-        View::Episodes(..) => screen.menu.current(),
+        View::Episodes(..) => screen.menu.current().map(|it| it.key.clone()),
         _ => None,
     };
-    let ep = ep.map(|it| it.key.clone());
-    // another show or episode, or none, starts at its top
-    let shown = media.as_ref().map(|m| (m.id, ep.clone()));
-    if app.scroll.0 != shown {
-        app.scroll = (shown, 0);
-    }
+    app.preview.read(media.as_ref().map(|m| (m.id, ep.clone())));
     if let Some(m) = media {
-        if shows_eps {
-            app.want_episodes(&m);
-        }
-        let (up, down) = media_preview(app, f, inner, &m, ep.as_deref());
-        // a cut is never silent: the border says how to read on, and how to get back up
-        let hints = [
-            (up, area.y, "shift ↑", " back up "),
-            (
-                down,
-                area.bottom().saturating_sub(1),
-                "shift ↓",
-                " read on ",
-            ),
-        ];
-        for (_, y, key, what) in hints.into_iter().filter(|h| h.0) {
-            let row = Rect::new(area.x, y, area.width, 1).inner(Margin::new(2, 0));
-            // a narrow border drops the words, then "shift"
-            let arrow = key["shift".len()..].trim_start();
-            let hint = [(key, what), (key, " "), (arrow, " ")]
-                .map(|(k, w)| {
-                    Line::from(vec![
-                        " ".into(),
-                        Span::styled(k, ACCENT),
-                        Span::styled(w, DIM),
-                    ])
-                })
-                .into_iter()
-                .find(|h| h.width() <= row.width as usize);
-            if let Some(hint) = hint {
-                f.render_widget(hint.right_aligned(), row);
-            }
-        }
-        return ahead.iter().for_each(|m| app.want_cover(m, false));
+        let page = preview::page(&Shown {
+            show: &m,
+            ep: ep.as_deref(),
+            progress: app.progress(&m),
+            entries: &app.entries,
+            source: app.sources.get(m.id),
+            on_disk: app.local.get(&m.id).map_or(0, Vec::len),
+            info: ep.as_deref().and_then(|ep| app.ep_about(&m, ep)),
+        });
+        return app.preview.draw(&page, &ahead, f, area, inner);
     }
     let lines: Vec<Line> = match &screen.view {
         View::Bulk(list) => list
@@ -641,7 +620,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     };
     let row = |good: bool, name: &str, what: &'static str| {
         // extras: without them ani-hop works, just plainer
-        let mark = match good || !matches!(name, "ani-skip" | "graphics") {
+        let mark = match good || !(ani::optional(name) || name == "graphics") {
             true => mark(good),
             false => Span::styled("  ○ ", Color::Yellow),
         };
@@ -722,93 +701,6 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v
 }
 
-/// Score, format, episode count and status; when and by whom; genres. No-break spaces keep
-/// "12 episodes" or "Slice of Life" whole, and a wrapped line never starts with "·".
-fn facts(m: &Media) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut facts = Vec::new();
-    if let Some(s) = m.average_score {
-        facts.push(Span::styled(format!("★\u{a0}{s}%"), Color::Yellow));
-    }
-    // a movie's one episode goes without saying
-    let movie = m.format.as_deref() == Some("MOVIE");
-    let detail = [
-        m.format.as_deref().map(pretty),
-        m.episodes
-            .filter(|&e| !(movie && e == 1))
-            .map(|e| episodes(e as usize)),
-        // a list cached before it started airing still says it's upcoming
-        (m.status.as_deref()).map(|s| match s {
-            "NOT_YET_RELEASED" if m.released() > Some(0) => pretty("RELEASING"),
-            s => pretty(s),
-        }),
-    ];
-    for d in detail.into_iter().flatten() {
-        if !facts.is_empty() {
-            facts.push(Span::styled("\u{a0}· ", DIM));
-        }
-        facts.push(d.into());
-    }
-    // ani-cli's shows have none of these: no rows of blanks for them
-    if !facts.is_empty() {
-        lines.push(Line::from(facts));
-    }
-    let when = [
-        m.season.as_deref().map(pretty),
-        m.season_year.map(|y| y.to_string()),
-    ];
-    let when = when
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join("\u{a0}");
-    let studio = m.studios.main().collect::<Vec<_>>().join(", ");
-    let made = [when, studio].into_iter().filter(|s| !s.is_empty());
-    let made = made.collect::<Vec<_>>().join("\u{a0}· ");
-    if !made.is_empty() {
-        lines.push(made.into());
-    }
-    if !m.genres.is_empty() {
-        let genres = m.genres.iter().map(|g| g.replace(' ', "\u{a0}"));
-        lines.push(Line::styled(
-            genres.collect::<Vec<_>>().join("\u{a0}· "),
-            MATCH,
-        ));
-    }
-    lines
-}
-
-/// "1 episode", "28 episodes", kept on one line.
-fn episodes(n: usize) -> String {
-    crate::plural(n, "episode").replacen(' ', "\u{a0}", 1)
-}
-
-/// Whether ani-cli's title for a source is the show's own, letters and digits alike: then
-/// the source line needn't repeat it.
-fn same_title(source: &str, show: &Media) -> bool {
-    let key = |s: &str| {
-        (s.chars().filter(|c| c.is_alphanumeric()))
-            .flat_map(char::to_lowercase)
-            .collect::<String>()
-    };
-    let titles = [&show.title.english, &show.title.romaji]
-        .into_iter()
-        .flatten();
-    (titles.map(String::as_str).chain([show.name()])).any(|t| key(t) == key(source))
-}
-
-/// "1999-12-15" as "15 Dec 1999", anything else as it is.
-fn day(iso: &str) -> String {
-    const MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
-    let mut p = iso.splitn(3, '-').map(|n| n.parse::<usize>().ok());
-    match (p.next().flatten(), p.next().flatten(), p.next().flatten()) {
-        (Some(y), Some(m @ 1..=12), Some(d)) => format!("{d} {} {y}", MONTHS[m - 1]),
-        _ => iso.to_string(),
-    }
-}
-
 /// The start panel in `area`: the logo only where everything else fits under it, as a short
 /// screen keeps an update notice (two or three rows at 80 columns) and every key instead.
 fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
@@ -864,248 +756,17 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
     v
 }
 
-/// A show's poster with its facts beside it, and its description flowing around it. What
-/// doesn't fit pages with shift+↓↑; returns whether there's more (above, below).
-fn media_preview(
-    app: &mut App,
-    f: &mut Frame,
-    area: Rect,
-    show: &Media,
-    ep: Option<&str>,
-) -> (bool, bool) {
-    // on an episode of a sequel the provider runs on into, it's that sequel's poster, facts,
-    // status and description; what's on disk, ani-cli's entry and the episode stay the show's
-    let part = ep.map(|ep| app.progress(show).entry(ep).0.clone());
-    let part = part.filter(|p| p.id != show.id);
-    let m = part.as_ref().unwrap_or(show);
-    let rows = (area.height * 3 / 5).clamp(6, 26).min(area.height);
-    // font zoom changes the pixels per cell, so they're read every frame
-    let size = app.posters.fit(rows, area.width / 2, kitty::cell_px());
-    app.want_cover(m, true);
-
-    let [poster, _, info] = Layout::horizontal([
-        Constraint::Length(size.width),
-        Constraint::Length(2),
-        Constraint::Fill(1),
-    ])
-    .areas(Rect::new(area.x, area.y, area.width, rows));
-    let accent = m
-        .cover_image
-        .color
-        .as_deref()
-        .and_then(hex)
-        .unwrap_or(ACCENT);
-    if app.glint.0 != m.id {
-        app.glint = (m.id, std::time::Instant::now());
-    }
-
-    let mut lines = vec![Line::styled(
-        m.name().to_string(),
-        Style::new().fg(accent).bold(),
-    )];
-    let alt = [&m.title.romaji, &m.title.english]
-        .into_iter()
-        .flatten()
-        .find(|t| t.as_str() != m.name());
-    if let Some(alt) = alt {
-        lines.push(Line::styled(alt.clone(), SOFT.italic()));
-    }
-    lines.push("".into());
-    // on an episode list the show's facts are one esc away, and its episode comes first
-    let facts_from = lines.len();
-    if ep.is_none() {
-        lines.extend(facts(m));
-    }
-    if !m.on_anilist() {
-        lines.push(Line::styled(
-            "Found through ani-cli: no AniList details or progress sync",
-            Color::Yellow,
-        ));
-    }
-    if lines.len() > facts_from {
-        lines.push("".into());
-    }
-    let status = |p: &Media| {
-        let e = p.media_list_entry.as_ref()?;
-        let total = p.episodes.map_or("?".into(), |t| t.to_string());
-        let line = format!("● {} · {}/{total}", list_label(&e.status), e.progress);
-        Some(Line::styled(line, Color::Green))
-    };
-    lines.extend(status(m));
-    // the provider's episodes past the show's own count toward a sequel on AniList; an
-    // episode list says so with a rule between them (ui::menu)
-    let run = app.progress(show);
-    let parts = if ep.is_none() { run.parts() } else { &[] };
-    for (before, p) in parts {
-        let eps = p.episodes.map_or(format!("{}+", before + 1), |n| {
-            format!("{}–{}", before + 1, before + n)
-        });
-        // as the episode list's rule calls it: "Part 2"
-        let name = run.part_name(p);
-        // "Part 2" wraps whole; a long name still wraps, just not before its last word
-        let name = match name.rsplit_once(' ') {
-            Some((head, last)) => format!("{head}\u{a0}{last}"),
-            None => name.to_string(),
-        };
-        lines.push(Line::styled(format!("Episodes\u{a0}{eps} are {name}"), DIM));
-        lines.extend(status(p));
-    }
-    if let Some(a) = &m.next_airing_episode
-        && let Some(left) = a.left(crate::anilist::now())
-    {
-        lines.push(Line::from(format!(
-            "Episode {} airs in {}",
-            a.episode,
-            duration(left)
-        )));
-    }
-    // an episode list says "on disk" on each of its rows
-    let local = app.local.get(&show.id).map_or(0, Vec::len);
-    if local > 0 && ep.is_none() {
-        lines.push(Line::from(format!("↓ {local} on disk")));
-    }
-    if let Some(s) = app.sources.get(show.id) {
-        let n = episodes(s.episodes.len());
-        // a wrong match keeps its title, so it stands out
-        let line = match same_title(&s.title, m) {
-            true => format!("ani-cli: {n}"),
-            false => format!("ani-cli: {} · {n}", s.title),
-        };
-        lines.push(Line::styled(line, DIM));
-    }
-    let mut about = "";
-    if let Some(ep) = ep
-        && let Some(i) = app.ep_about(show, ep)
-    {
-        lines.push("".into());
-        // its title and summary only once watched: they give things away, its date doesn't
-        let watched = app.progress(show).watched(ep);
-        let heading = match watched && !i.title.is_empty() {
-            true => format!("Episode {ep} · {}", i.title),
-            false => format!("Episode {ep}"),
-        };
-        lines.push(Line::styled(heading, Style::new().bold()));
-        if let Some(d) = i.aired.as_deref().filter(|d| !d.is_empty()) {
-            lines.push(Line::styled(format!("aired {}", day(d)), DIM));
-        }
-        if watched {
-            about = &i.about;
-        }
-    }
-    // the gap before the description is one row, also when nothing follows the genres
-    if lines.last().is_some_and(|l| l.width() == 0) {
-        lines.pop();
-    }
-    let head = Paragraph::new(lines).wrap(Wrap { trim: true });
-    let head_h = head.line_count(info.width) as u16;
-
-    // the episode's summary right under its title, then the description: beside the poster
-    // (and in the row under it) first, where the facts leave rows empty, then full width
-    let desc = m.description.as_deref().map(strip_html).unwrap_or_default();
-    let text = [(about, SOFT), (desc.as_str(), Style::new())];
-    let text: Vec<_> = text.into_iter().filter(|t| !t.0.is_empty()).collect();
-    let top = head_h + u16::from(about.is_empty());
-    let narrow = (rows + 1).saturating_sub(top) as usize;
-    let mut text = flow(&text, narrow, info.width, area.width);
-    // shortcut: rows end at u16::MAX, which no AniList description gets near even one column
-    // wide; page the text in parts if one ever does
-    text.truncate(usize::from((u16::MAX - area.y).saturating_sub(top)));
-    let end = match text.len() {
-        0 => head_h,
-        n => top + n as u16,
-    };
-
-    // drawn whole, then the rows that are read now go on screen: placeholder cells carry
-    // their own poster row, so a poster scrolled halfway shows its lower half
-    let page_h = end.max(rows);
-    let page_area = Rect::new(area.x, area.y, area.width, page_h.max(area.height));
-    let mut page = Buffer::empty(page_area);
-    // the cover's dominant color stands in while it loads
-    if !app.posters.draw(m.id, poster, &mut page) {
-        Block::new().bg(accent).render(poster, &mut page);
-    }
-    let head_area = Rect::new(info.x, info.y, info.width, head_h);
-    head.render(head_area, &mut page);
-    // only true RGB titles: a named color has no RGB value to fade back into
-    if let Color::Rgb(r, g, b) = accent {
-        glint(app, &mut page, head_area, (r, g, b));
-    }
-    for (i, line) in text.into_iter().enumerate() {
-        let column = if i < narrow { info } else { area };
-        let y = area.y + top + i as u16;
-        line.render(Rect::new(column.x, y, column.width, 1), &mut page);
-    }
-
-    // a page is the pane less one row, so the last line read stays on screen
-    let step = area.height.saturating_sub(1).max(1);
-    let max = page_h.saturating_sub(area.height);
-    let n = &mut app.scroll.1;
-    *n = (*n).min(max.div_ceil(step));
-    let off = (*n * step).min(max);
-    let buf = f.buffer_mut();
-    for pos in area.positions() {
-        buf[pos] = page[(pos.x, pos.y + off)].clone();
-    }
-    (off > 0, off < max)
-}
-
-/// Wraps paragraphs word by word like Paragraph does, the first `narrow` lines to `first`
-/// columns and the rest to `rest`, with a blank line between the parts of `text`. A word
-/// wider than its line is broken between characters (graphemes), so text without spaces
-/// (Japanese, a URL) is never cut.
-fn flow(text: &[(&str, Style)], narrow: usize, first: u16, rest: u16) -> Vec<Line<'static>> {
-    let width = |s: &str| Span::raw(s).width();
-    let room = |n: usize| usize::from(if n < narrow { first } else { rest.max(1) });
-    let mut out = Vec::new();
-    for (i, &(s, style)) in text.iter().enumerate() {
-        if i > 0 {
-            out.push(Line::default());
-        }
-        for para in s.lines() {
-            // the last narrow line is the row under the poster: a paragraph starting there
-            // would look indented, so it starts full width below it
-            if out.len() + 1 == narrow && !para.trim().is_empty() {
-                out.push(Line::default());
-            }
-            let mut line = String::new();
-            // no-break spaces stay inside a word, like in the facts
-            for word in para.split(' ').filter(|w| !w.is_empty()) {
-                if !line.is_empty() {
-                    if width(&line) + 1 + width(word) <= room(out.len()) {
-                        line.push(' ');
-                        line.push_str(word);
-                        continue;
-                    }
-                    out.push(Line::styled(std::mem::take(&mut line), style));
-                }
-                let word = Span::raw(word);
-                for g in word.styled_graphemes(style).map(|g| g.symbol) {
-                    if !line.is_empty() && width(&line) + width(g) > room(out.len()) {
-                        out.push(Line::styled(std::mem::take(&mut line), style));
-                    }
-                    // a narrow line too small for a wide character stays empty
-                    while line.is_empty() && out.len() < narrow && width(g) > room(out.len()) {
-                        out.push(Line::default());
-                    }
-                    line.push_str(g);
-                }
-            }
-            out.push(Line::styled(line, style));
-        }
-    }
-    out
-}
-
 fn footer(app: &App, f: &mut Frame, area: Rect) {
     let screen = app.stack.last().unwrap();
-    let enter = app.dl_verb();
+    let enter = app.enter_verb();
     // esc empties a typed filter (or a prefilled input) before it goes back
     let esc = if screen.menu.query.is_empty() {
         "back"
     } else {
         "clear"
     };
-    let mut keys = vec![("enter", enter)];
+    // none when enter does nothing (episodes another ani-hop has queued)
+    let mut keys: Vec<(&str, &str)> = enter.map(|v| ("enter", v)).into_iter().collect();
     // the main menu has nothing to go back to
     if app.stack.len() > 1 || !screen.menu.query.is_empty() {
         keys.push(("esc", esc));
@@ -1114,7 +775,10 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         keys.splice(0..0, [("tab", "mark"), ("^a", "all")]);
     }
     if matches!(&screen.view, View::Shows(list) if list.more_page().is_some()) {
-        let at = keys.iter().position(|k| k.0 == "enter").unwrap();
+        let at = keys
+            .iter()
+            .position(|k| k.0 == "enter")
+            .unwrap_or(keys.len());
         keys.insert(at, ("^f", "more"));
     }
     keys.push(("^c", "quit"));
@@ -1132,7 +796,7 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     // read once: the worker can take the last one off between two reads
     let dl = app.downloads.snapshot();
     let n = dl.pending;
-    let status = match (toast, &app.playing) {
+    let status = match (toast, app.playback.now()) {
         // shortcut: what's still underway is told apart by its "…"; give toasts a kind once a
         // finished one can end in "…"
         (Some((text, err, _)), _) => Line::styled(
@@ -1151,7 +815,7 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
             // how far the one downloading got first, so that's what 80 columns keep, then
             // which one it is and what's after it
             let head = match (&dl.now, dl.paused) {
-                (Some(d), true) => paused(d),
+                (Some(d), true) => crate::show_downloads::paused(d),
                 (Some(d), false) => format!("{} ↓ {}", spinner(app), d.text),
                 (None, true) => format!("‖ paused · {n} queued"),
                 (None, false) => format!("{} ↓ {n} queued", spinner(app)),
@@ -1183,66 +847,97 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(hints, hints_area);
 }
 
-/// `s` cut to `room` columns with "…", measured as drawn: CJK characters take two.
-fn fit(mut s: String, room: usize) -> String {
-    if Span::raw(s.as_str()).width() > room {
-        while Span::raw(s.as_str()).width() >= room && s.pop().is_some() {}
-        s.push('…');
+/// A row's label, a span per grapheme as drawn (joined emoji stay whole), with the filter's
+/// matches lit (`hits`, by grapheme, as the filter counts them). With `room`, a show's title too long for it
+/// keeps its end, as seasons and parts of one show differ there: "Attack on Titan Fi…Special 2".
+fn row_label(text: &str, hits: &[u32], plain: Style, room: Option<usize>) -> Vec<Span<'static>> {
+    let cut = room.and_then(|room| middle_cut(text, room));
+    let mut spans = Vec::new();
+    let (mut at, mut i) = (0, 0u32);
+    for g in Span::raw(text)
+        .styled_graphemes(Style::new())
+        .map(|g| g.symbol)
+    {
+        let hit = hits.binary_search(&i).is_ok();
+        let style = if hit {
+            Style::new().fg(MATCH).bold()
+        } else {
+            plain
+        };
+        match cut {
+            Some((head, tail)) if at >= head && at < tail => {
+                if at == head {
+                    spans.push(Span::styled("…", plain));
+                }
+            }
+            _ => spans.push(Span::styled(g.to_string(), style)),
+        }
+        (at, i) = (at + g.len(), i + 1);
     }
-    s
+    spans
 }
 
-fn hex(s: &str) -> Option<Color> {
+/// Where to cut `label` to fit `room` columns, keeping its start and its last two words (or
+/// its last one), where a season or part says which it is: (end of the start, start of the
+/// end) as byte offsets. None when it fits, or when that end takes over half the room.
+fn middle_cut(label: &str, room: usize) -> Option<(usize, usize)> {
+    let width = |s: &str| Span::raw(s).width();
+    if width(label) <= room {
+        return None;
+    }
+    let starts: Vec<usize> = label.match_indices(' ').map(|(i, _)| i + 1).collect();
+    let ends = [starts.iter().rev().nth(1), starts.last()];
+    let tail = *(ends.into_iter().flatten())
+        .filter(|&&t| !label[t..].trim().is_empty())
+        .find(|&&t| width(&label[t..]) <= room / 2)?;
+    let mut room = room - width(&label[tail..]) - 1;
+    // whole graphemes, as drawn: "❤️" is two characters and two columns
+    let mut head = 0;
+    for g in Span::raw(label)
+        .styled_graphemes(Style::new())
+        .map(|g| g.symbol)
+    {
+        let w = width(g);
+        if w > room {
+            break;
+        }
+        (room, head) = (room - w, head + g.len());
+    }
+    Some((label[..head].trim_end().len(), tail))
+}
+
+/// `label` cut in the middle to fit `room` (`middle_cut`), else at its end.
+fn fit_middle(label: &str, room: usize) -> String {
+    match middle_cut(label, room) {
+        Some((head, tail)) => format!("{}…{}", &label[..head], &label[tail..]),
+        None => fit(label.to_string(), room),
+    }
+}
+
+/// `s` cut to `room` columns with "…", measured as drawn: CJK characters take two.
+fn fit(s: String, room: usize) -> String {
+    let width = |s: &str| Span::raw(s).width();
+    if width(&s) <= room {
+        return s;
+    }
+    // whole graphemes, as drawn, and a column for the "…"
+    let (mut cut, mut used) = (String::new(), 0);
+    for g in Span::raw(s.as_str())
+        .styled_graphemes(Style::new())
+        .map(|g| g.symbol)
+    {
+        used += width(g);
+        if used >= room {
+            break;
+        }
+        cut.push_str(g);
+    }
+    cut + "…"
+}
+
+pub fn hex(s: &str) -> Option<Color> {
     let v = u32::from_str_radix(s.strip_prefix('#')?, 16).ok()?;
     Some(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
-}
-
-/// AniList enums like TV_SHORT or NOT_YET_RELEASED, for humans.
-fn pretty(s: &str) -> String {
-    match s {
-        "RELEASING" => "Airing".into(),
-        "NOT_YET_RELEASED" => "Upcoming".into(),
-        "TV_SHORT" => "TV Short".into(),
-        s if s.len() <= 3 => s.into(),
-        s => s[..1].to_string() + &s[1..].to_lowercase().replace('_', " "),
-    }
-}
-
-/// "74d 6h", "5h 3m", kept on one line.
-fn duration(secs: i64) -> String {
-    let (d, h, m) = (secs / 86400, secs % 86400 / 3600, secs % 3600 / 60);
-    if d > 0 {
-        format!("{d}d\u{a0}{h}h")
-    } else {
-        format!("{h}h\u{a0}{m}m")
-    }
-}
-
-fn strip_html(s: &str) -> String {
-    let s = s
-        .replace(['\r', '\n'], "")
-        .replace("<br>", "\n")
-        .replace("<br/>", "\n")
-        .replace("<br />", "\n");
-    let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            c if !in_tag => out.push(c),
-            _ => {}
-        }
-    }
-    while out.contains("\n\n\n") {
-        out = out.replace("\n\n\n", "\n\n");
-    }
-    out.replace("&amp;", "&")
-        .replace("&quot;", "\"")
-        .replace("&#039;", "'")
-        .replace("&mdash;", "—")
-        .trim()
-        .to_string()
 }
 
 #[cfg(test)]
@@ -1250,90 +945,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_source_with_the_shows_own_title_goes_without_it() {
-        let mut m = Media::default();
-        m.title.english = Some("Frieren: Beyond Journey’s End".into());
-        m.title.romaji = Some("Sousou no Frieren".into());
-        assert!(same_title("Frieren: Beyond Journey's End", &m)); // ’ and '
-        assert!(same_title("SOUSOU NO FRIEREN", &m));
-        assert!(!same_title("Aoki Hagane no Arpeggio: Ars Nova Cadenza", &m));
-        assert!(!same_title("Frieren: Beyond Journey's End Season 2", &m));
-        assert_eq!(episodes(1), "1\u{a0}episode");
-    }
-
-    #[test]
-    fn a_show_that_aired_since_its_list_was_cached_is_airing() {
-        let now = crate::anilist::now();
-        let show = |at: Option<i64>| Media {
-            format: Some("TV".into()),
-            status: Some("NOT_YET_RELEASED".into()),
-            next_airing_episode: at.map(|airing_at| crate::anilist::Airing {
-                episode: 1,
-                airing_at,
-            }),
-            ..Default::default()
-        };
-        let status = |m: Media| facts(&m)[0].to_string();
-        assert!(status(show(Some(now - 90))).ends_with("Airing"));
-        assert!(status(show(Some(now + 90))).ends_with("Upcoming"));
+    fn a_question_reads_in_full_before_its_answers() {
+        let q = "Mark episode 2 of Attack on Titan Final Season Special 2 as watched? \
+                 Unmarks 3–5 and moves it to Watching.";
+        // the screen's body: all but the header and the footer
+        let body = |w: u16, h: u16| Rect::new(0, 1, w, h - 2);
+        // too long beside the preview in a small terminal: it takes the whole width
+        let (menu, preview) = split(body(40, 12), Some((q, 2)));
+        assert_eq!((menu, preview), (body(40, 12), None));
+        assert_eq!(question_rows(q, 2, menu_inner(menu)), (4, true));
+        // beside the preview where it fits
+        let (menu, preview) = split(body(80, 24), Some((q, 2)));
+        assert!(preview.is_some() && question_rows(q, 2, menu_inner(menu)).1);
         assert!(
-            status(show(Some(0))).ends_with("Upcoming"),
-            "a cache from before 0.7"
+            split(body(40, 12), None).1.is_some(),
+            "other screens keep it"
         );
-        assert!(status(show(None)).ends_with("Upcoming"));
-    }
-
-    #[test]
-    fn writes_air_dates_out() {
-        assert_eq!(day("1999-12-15"), "15 Dec 1999");
-        assert_eq!(day("2026-01-03"), "3 Jan 2026");
-        assert_eq!(day("2026-13-03"), "2026-13-03");
-        assert_eq!(day("soon"), "soon");
-    }
-
-    #[test]
-    fn cleans_anilist_descriptions() {
-        assert_eq!(
-            strip_html("A <i>mage</i>.<br><br>\n<br>(Source: X)"),
-            "A mage.\n\n(Source: X)"
-        );
-        assert_eq!(pretty("NOT_YET_RELEASED"), "Upcoming");
-        assert_eq!(pretty("SPECIAL"), "Special");
-        assert_eq!(pretty("ONA"), "ONA");
-    }
-
-    #[test]
-    fn flows_around_the_poster() {
-        let text = |lines: Vec<Line>| lines.iter().map(Line::to_string).collect::<Vec<_>>();
-        // two lines beside the poster, then full width; paragraphs and parts keep a blank
-        let out = flow(
-            &[("aa bb cc dd ee\n\nff", SOFT), ("gg", DIM.into())],
-            2,
-            5,
-            8,
-        );
-        assert_eq!(
-            text(out.clone()),
-            ["aa bb", "cc dd", "ee", "", "ff", "", "gg"]
-        );
-        assert_eq!((out[0].style, out[6].style), (SOFT, DIM.into()));
-        // words wider than their line are broken, by width: ビデオ is 6 columns
-        let out = flow(&[("ビデオビデオ x", Style::new())], 2, 5, 4);
-        assert_eq!(text(out), ["ビデ", "オビ", "デオ", "x"]);
-        assert_eq!(
-            text(flow(&[("a\u{a0}b c", Style::new())], 0, 1, 3)),
-            ["a\u{a0}b", "c"]
-        );
-        assert!(flow(&[], 3, 5, 8).is_empty());
-        // a narrow line too small for a wide character is skipped; joined emoji stay whole
-        assert_eq!(text(flow(&[("ビデ", SOFT)], 2, 1, 4)), ["", "", "ビデ"]);
-        assert_eq!(text(flow(&[("a ビ", SOFT)], 3, 0, 4)), ["", "", "", "a ビ"]);
-        let family = "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}";
-        assert_eq!(text(flow(&[(family, SOFT)], 0, 9, 2)), [family]);
-        // no paragraph starts on the last narrow line, under the poster
-        assert_eq!(text(flow(&[("aa bb", SOFT)], 1, 2, 8)), ["", "aa bb"]);
-        let out = flow(&[("aa", SOFT), ("bb", SOFT)], 3, 5, 8);
-        assert_eq!(text(out), ["aa", "", "", "bb"]);
+        // and questions whose preview lists what they act on
+        assert!(!widens(&View::Confirm(Pending::Delete(Vec::new()))));
+        assert!(widens(&View::Confirm(Pending::Remove(Media::default()))));
     }
 
     #[test]
@@ -1359,5 +989,53 @@ mod tests {
         assert_eq!(fit("~/ビデオ/Anime".into(), 11), "~/ビデオ/A…");
         assert_eq!(fit("~/ビデオ/Anime".into(), 14), "~/ビデオ/Anime");
         assert_eq!(fit("on".into(), 0), "…");
+    }
+
+    #[test]
+    fn rows_draw_whole_graphemes() {
+        let family = "👩\u{200d}👩\u{200d}👧";
+        let title = family.repeat(8) + " Final Part 2";
+        let spans = row_label(&title, &[], Style::new(), Some(26));
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.ends_with("…Part 2") && Span::raw(text.as_str()).width() <= 26,
+            "{text}"
+        );
+        assert!(
+            spans.iter().any(|s| s.content == family),
+            "a family stays one"
+        );
+        // what the filter matches is what lights up: "A", not the family before it
+        let label = format!("{family} A");
+        let item = crate::menu::Item::new("k", label.as_str(), "");
+        let mut menu = crate::menu::Menu::new(vec![item], false);
+        menu.edit(|q| *q = "A".into());
+        let lit = row_label(&label, &menu.matches[0].1, Style::new(), None);
+        let lit: Vec<&str> = (lit.iter().filter(|s| s.style.fg == Some(MATCH)))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(lit, ["A"]);
+        // cut at the end, emoji stay whole too
+        assert_eq!(fit("❤️".repeat(30), 9), "❤️❤️❤️❤️…");
+    }
+
+    #[test]
+    fn long_titles_keep_their_season() {
+        let special = "Attack on Titan Final Season THE FINAL CHAPTERS Special 2";
+        assert_eq!(fit_middle(special, 26), "Attack on Titan…Special 2");
+        let part = "Attack on Titan Final Season Part 2";
+        assert_eq!(fit_middle(part, 26), "Attack on Titan Fin…Part 2");
+        assert_eq!(fit_middle("Frieren", 26), "Frieren");
+        // without spaces there's no season to keep: cut at the end
+        assert_eq!(fit_middle("ビデオビデオビデオビデオ", 9), "ビデオビ…");
+        // no room at all, or a trailing space, is no season either
+        assert_eq!(fit_middle("Title ", 0), "…");
+        // emoji are cut whole and measured as drawn
+        let hearts = "❤️".repeat(20) + " Final Part 2";
+        let cut = fit_middle(&hearts, 26);
+        assert!(
+            cut.ends_with("…Part 2") && Span::raw(cut.as_str()).width() <= 26,
+            "{cut}"
+        );
     }
 }

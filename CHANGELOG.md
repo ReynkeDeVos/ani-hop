@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.7.5 – 2026-10-27
+
+### Changed
+
+- Questions name what each answer does: "Keep" or "Delete", "Keep downloading" or "Stop", "Keep on list" or "Remove", "Stay" or "Quit", "Drop them" or "Resume", "Don't save" or "Save", instead of No and Yes.
+- A show title too long for its row keeps its season or part: "Attack on Titan Fi…Special 2", where four seasons all read "Attack on Titan Final Seas…" at 80 columns. The current show in the header is cut the same way and no longer runs into your name.
+- On a text field the footer says "enter search" or "enter save". On episodes another ani-hop has queued, where enter only says so, it leaves enter out.
+- At 80 columns the audio hint says "subtitled", "no subs", "dubbed" or "dub + subs", where it said "Japanese" with or without subtitles.
+- The help under text fields wraps cleanly at 80 columns.
+- The download folder is rescanned in the background, and the show on screen at once, so one on a NAS or a sleeping USB disk doesn't hold up opening a screen.
+- The code behind list changes, episode downloads, playing, the preview and list loading is reorganized into one part each, with tests through it. Running the tests no longer touches your own config or cache.
+
+### Fixed
+
+- After saving progress, Downloads showed the show's old progress again, and the next "Mark as watched" failed with "not saved · AniList has 6/12 now". A queued download also wrote back the progress from when it was queued.
+- Two ani-hops marking episodes at the same moment could set the progress back on AniList. Saves now go one at a time across ani-hops, and the later one says "not saved · AniList has 7/12 now".
+- Going offline, also in the middle of an episode, or starting before the Wi-Fi was up, emptied the download queue: every queued episode failed and was dropped. Downloads now pause and keep their queue: "Paused downloads · can't reach hianime.at · enter on a queued episode resumes them".
+- A save still running while you logged out and in as someone else changed the new login's screens.
+- Starting an episode again while its first player was still open could end the second start's pop-up when the first player closed.
+- A mistyped AniList client ID blocked logging in, with no way to enter another one. Enter on the empty token field now goes back to the client ID step.
+- A download that ended just as it was stopped could print "kill: No such process" over the screen.
+- A cache folder ani-hop can't write to stopped it with Rust's debug output. It says "ani-hop: can't write to ~/.cache/ani-hop: Permission denied" now.
+- A filter for how a title starts or ends with a capital letter, like `^Attack` or `Titan$`, found nothing unless it was the whole title. A word filter like `'Horizons` or `!Horizons` missed the word at the very end of a title or episode summary with an accent in it, like "Pokémon Horizons".
+- A question too long for a small terminal, like "Mark episode 6 of … as watched?" with what saving also changes, was cut after six lines. It now uses the lines it needs, and the whole width when it doesn't fit beside the preview.
+
 ## 0.7.0 – 2026-10-26
 
 ### Changed

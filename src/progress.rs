@@ -4,7 +4,8 @@
 //! sequels, its parts (Attack on Titan Season 3: 22 at ani-cli, 12 and 10 on AniList).
 
 use crate::ani::ep_num;
-use crate::anilist::Media;
+use crate::anilist::{Entry, Media};
+use crate::entries::Entries;
 
 /// The AniList sequels a show's provider entry runs on into, each with the episodes before it.
 pub type Parts = Vec<(u32, Media)>;
@@ -14,6 +15,8 @@ pub type Parts = Vec<(u32, Media)>;
 pub struct Progress<'a> {
     show: &'a Media,
     parts: &'a [(u32, Media)],
+    /// the newest Entries this session knows, over the ones the shows came with
+    entries: Option<&'a Entries>,
 }
 
 /// What marking an episode watched saves, as the question shows it and Yes saves it.
@@ -31,8 +34,40 @@ pub struct Mark {
 }
 
 impl<'a> Progress<'a> {
+    /// With the Entries `show` and `parts` came with.
     pub fn of(show: &'a Media, parts: &'a [(u32, Media)]) -> Self {
-        Progress { show, parts }
+        Progress {
+            show,
+            parts,
+            entries: None,
+        }
+    }
+
+    /// With the newest Entries `entries` knows.
+    pub fn with(show: &'a Media, parts: &'a [(u32, Media)], entries: &'a Entries) -> Self {
+        Progress {
+            show,
+            parts,
+            entries: Some(entries),
+        }
+    }
+
+    fn known(&self, m: &'a Media) -> Option<&'a Entry> {
+        match self.entries {
+            Some(all) => all.entry(m),
+            None => m.media_list_entry.as_ref(),
+        }
+    }
+
+    /// How many of `m`'s episodes AniList counts as watched.
+    fn count(&self, m: &'a Media) -> u32 {
+        self.known(m).map_or(0, |e| e.progress)
+    }
+
+    /// Up to its progress everything counts as watched.
+    fn watched_in(&self, m: &'a Media, ep: &str) -> bool {
+        let n = self.count(m);
+        n > 0 && ep_num(ep) <= n as f64
     }
 
     /// The parts, each with the episodes before it.
@@ -70,16 +105,16 @@ impl<'a> Progress<'a> {
     /// part's.
     pub fn watched(&self, ep: &str) -> bool {
         let (p, n) = self.entry(ep);
-        self.show.watched(ep) || p.watched(&n)
+        self.watched_in(self.show, ep) || self.watched_in(p, &n)
     }
 
     /// The episode after the last one watched. It goes on into a part once everything before
     /// it is, so rewatching the first part doesn't skip to the end of a finished second one.
     pub fn next(&self) -> u32 {
-        let mut next = self.show.progress() + 1;
+        let mut next = self.count(self.show) + 1;
         for (before, p) in self.parts {
             if next > *before {
-                next = next.max(before + p.progress() + 1);
+                next = next.max(before + self.count(p) + 1);
             }
         }
         next
@@ -106,12 +141,15 @@ impl<'a> Progress<'a> {
             true => String::new(),
             false => self.part_name(p).to_string(),
         };
+        let now = self.known(p);
+        let mut entry = p.clone();
+        entry.media_list_entry = now.cloned();
         Some(Mark {
-            entry: p.clone(),
+            entry,
             part,
-            was: p.progress(),
+            was: self.count(p),
             to,
-            status: status(p, to),
+            status: status(now, p.episodes, to),
         })
     }
 
@@ -138,12 +176,12 @@ impl Mark {
         }
     }
 
-    /// What Yes saves: "saves 3/12", "saves 1/10 to Part 2".
+    /// What Save saves: "3/12", "1/10 to Part 2".
     pub fn hint(&self) -> String {
         let total = self.entry.episodes.map_or("?".into(), |t| t.to_string());
         match self.part.as_str() {
-            "" => format!("saves {}/{total}", self.to),
-            part => format!("saves {}/{total} to {part}", self.to),
+            "" => format!("{}/{total}", self.to),
+            part => format!("{}/{total} to {part}", self.to),
         }
     }
 
@@ -163,10 +201,10 @@ impl Mark {
     }
 }
 
-/// The list an entry is on once its progress is `to`.
-fn status(m: &Media, to: u32) -> &'static str {
-    match m.media_list_entry.as_ref().map(|e| e.status.as_str()) {
-        _ if m.episodes == Some(to) => "COMPLETED",
+/// The list an entry is on once its progress is `to` of `episodes`.
+fn status(entry: Option<&Entry>, episodes: Option<u32>, to: u32) -> &'static str {
+    match entry.map(|e| e.status.as_str()) {
+        _ if episodes == Some(to) => "COMPLETED",
         Some("REPEATING") => "REPEATING",
         _ => "CURRENT",
     }
@@ -217,7 +255,7 @@ mod tests {
         assert_eq!(k.also(), "Adds it to Watching.");
         assert!(k.only_this());
         let k = mark(&watching(1, 12, 5), "6");
-        assert_eq!((k.also(), k.hint()), (String::new(), "saves 6/12".into()));
+        assert_eq!((k.also(), k.hint()), (String::new(), "6/12".into()));
         // the last one completes it, a rewatch stays one
         assert_eq!(mark(&watching(1, 12, 11), "12").status, "COMPLETED");
         let again = show(1, 12, Some((2, "REPEATING")));
@@ -268,7 +306,7 @@ mod tests {
             Some((2, 10, "Part 2".into())),
             "Part 2's last"
         );
-        assert_eq!(run.mark("16").unwrap().hint(), "saves 4/10 to Part 2");
+        assert_eq!(run.mark("16").unwrap().hint(), "4/10 to Part 2");
         // asked after playing only when it adds anything
         assert!(run.unwatched("15").is_none() && run.unwatched("12.5").is_none());
         assert_eq!(run.unwatched("16").map(|k| k.to), Some(4));

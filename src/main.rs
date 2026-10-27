@@ -3,23 +3,31 @@
 mod ani;
 mod anilist;
 mod downloads;
+mod entries;
 mod kitty;
 mod lists;
 mod menu;
+mod playback;
+mod preview;
 mod progress;
+mod show_downloads;
 mod source;
 mod ui;
 
-use anilist::{Client, Entry, EpInfo, Media};
+use anilist::{Client, EpInfo, Media};
 use downloads::{AniCli, Job, Queue};
+use entries::{Change, Entries, Stamp};
 use lists::{Feed, List};
 use menu::{Act, Item, Menu};
+use playback::{Playback, Start};
+use preview::Preview;
 use progress::{Mark, Parts, Progress};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers,
 };
 use ratatui::crossterm::execute;
+use show_downloads::{Action, ShowDownloads, which};
 use source::{Lookup, Source, Sources};
 use std::collections::HashMap;
 use std::collections::hash_map::Entry::Vacant;
@@ -27,6 +35,7 @@ use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -100,7 +109,15 @@ pub struct Screen {
     pub title: String,
     pub view: View,
     pub menu: Menu,
-    pub loading: bool,
+    /// waits on a background result other than a list's (Pick source's search)
+    waiting: bool,
+}
+
+impl Screen {
+    /// Something it shows is on its way.
+    pub fn loading(&self) -> bool {
+        self.waiting || matches!(&self.view, View::Shows(list) if list.loading())
+    }
 }
 
 enum Want {
@@ -110,96 +127,34 @@ enum Want {
 
 enum Msg {
     /// a list's refreshed shows
-    Shows(u64, Result<Vec<Media>, String>, lists::Ask),
+    Shows(u64, Stamp, Result<Vec<Media>, String>, lists::Ask),
     /// the downloaded shows as AniList has them now
-    Local(Result<Vec<Media>, String>),
+    Local(Stamp, Result<Vec<Media>, String>),
     /// the next page of a ranking
-    More(u64, Result<Vec<Media>, String>),
+    More(u64, Stamp, Result<Vec<Media>, String>),
     Hits(u64, Result<Vec<String>, String>),
     /// who's logged in, asked with this token
     Viewer(Option<String>, Result<(u64, String, bool), String>),
-    /// a prepared poster
-    Cover(kitty::Loaded),
     EpInfo(u64, HashMap<String, EpInfo>),
-    /// sequels of a show, looked up for its episode counts (App::parts_key), login and
-    /// LIST_CHANGES
-    Parts(u64, (u32, u32), Option<String>, u64, Result<Parts, String>),
+    /// sequels of a show, looked up for its episode counts (App::parts_key)
+    Parts(u64, (u32, u32), Stamp, Result<Parts, String>),
     /// a lookup's answer, with its ticket (Sources::ask)
     Resolved(Media, u64, Result<Source, String>),
-    Saved(Media, Result<Option<Entry>, String>),
-    /// the show taken off the list, or why not
-    Removed(Media, Result<(), String>),
-    /// progress not saved, as AniList's entry moved since the question was asked: (the
-    /// entry's media, the entry now)
-    Moved(Media, Option<Entry>),
-    /// (media, episode, what it waits on now; None = the player is up)
-    PlayStep(u64, String, Option<&'static str>),
-    Played(Media, String, Result<(), String>),
+    /// a change to the user's list, answered
+    Entry(entries::Done),
+    /// (Playback attempt, what it waits on now; None = the player is up)
+    PlayStep(u64, Option<&'static str>),
+    /// (Playback attempt, show, episode, how it ended)
+    Played(u64, Media, String, Result<(), String>),
+    /// what a rescan of the download folder found: the shows and their episodes
+    Scanned(Vec<(Media, OnDisk)>),
     /// an episode downloaded or failed: ("Show E3", result)
     DlDone(String, Result<(), String>),
     /// (version, update command) of a newer ani-hop
     Release(Option<(String, String)>),
 }
 
-/// The episode being started or watched.
-pub struct Playing {
-    pub id: u64,
-    pub ep: String,
-    pub title: String,
-    /// what it waits on, None once mpv shows it
-    pub step: Option<&'static str>,
-    /// when enter was pressed, for the pop-up
-    pub since: Instant,
-    pub color: Option<String>,
-}
-
-/// Where an episode stands with downloads.
-#[derive(PartialEq)]
-enum Dl {
-    Missing,
-    /// in this ani-hop's queue, maybe downloading right now
-    Queued,
-    OnDisk(PathBuf),
-    /// queued by another running ani-hop
-    Elsewhere,
-}
-
-/// One show's episodes that aren't missing.
-struct Downloads {
-    on_disk: Vec<(String, PathBuf)>,
-    queued: Vec<String>,
-    elsewhere: Vec<String>,
-}
-
-impl Downloads {
-    fn state(&self, ep: &str) -> Dl {
-        if let Some((_, p)) = self.on_disk.iter().find(|(e, _)| e == ep) {
-            Dl::OnDisk(p.clone())
-        } else if self.queued.iter().any(|e| e == ep) {
-            Dl::Queued
-        } else if self.elsewhere.iter().any(|e| e == ep) {
-            Dl::Elsewhere
-        } else {
-            Dl::Missing
-        }
-    }
-
-    /// `eps` sorted by what enter can do with them: download, stop, delete (with the file).
-    fn split(&self, eps: &[String]) -> (Vec<String>, Vec<String>, Vec<(String, PathBuf)>) {
-        let (mut get, mut stop, mut delete) = (Vec::new(), Vec::new(), Vec::new());
-        for ep in eps {
-            match self.state(ep) {
-                Dl::Missing => get.push(ep.clone()),
-                Dl::Queued => stop.push(ep.clone()),
-                Dl::OnDisk(p) => delete.push((ep.clone(), p)),
-                Dl::Elsewhere => {}
-            }
-        }
-        (get, stop, delete)
-    }
-}
-
-const SEARCHING: &str = "searching ani-cli";
+const PAUSED: &str = "Paused downloads · enter on a queued episode resumes them";
 
 pub struct App {
     pub stack: Vec<Screen>,
@@ -208,9 +163,10 @@ pub struct App {
     rx: Receiver<Msg>,
     client: Client,
     pub user: Option<(u64, String)>,
-    pub posters: kitty::Posters,
-    /// AniList list changes not answered yet
-    saves_pending: usize,
+    /// the show or episode in the right-hand pane: its poster, and how far it's read
+    pub preview: Preview,
+    /// the user's Entries, newest known, and the changes to them
+    pub entries: Entries,
     /// episode titles and summaries per show (empty while loading or when there are none)
     pub ep_info: HashMap<u64, HashMap<String, EpInfo>>,
     /// AniList sequels per show that its provider entry runs on into, each with the episodes
@@ -218,20 +174,24 @@ pub struct App {
     /// were looked up for
     parts: HashMap<u64, ((u32, u32), Parts)>,
     pub sources: Sources,
-    /// downloaded episodes per show, rescanned on refresh
-    pub local: HashMap<u64, Vec<(String, PathBuf)>>,
+    /// downloaded episodes per show, as the last rescan found them
+    pub local: HashMap<u64, OnDisk>,
+    /// the downloaded shows, as the last rescan found them (none before the first)
+    downloaded: Option<Vec<Media>>,
+    /// a rescan of the download folder is on its way, and (true) another was asked for since
+    scanning: Option<bool>,
+    /// shows rescanned on screen since the running rescan started, newer than what it finds:
+    /// each one if it's downloaded
+    synced: HashMap<u64, Option<Media>>,
+    /// Downloads opened: AniList is asked about its shows once the rescan has them
+    ask_local: bool,
     /// episodes per show other running ani-hops have queued, rescanned on refresh
     elsewhere: HashMap<u64, Vec<String>>,
     resolving: HashMap<u64, Option<Want>>,
     pub downloads: Queue,
-    pub playing: Option<Playing>,
+    pub playback: Playback,
     pub toast: Option<(String, bool, Instant)>,
     pub started: Instant,
-    /// media whose title glint plays, and since when
-    pub glint: (u64, Instant),
-    /// the show and episode in the preview, and how many pages down it's read; another
-    /// starts at its top
-    pub scroll: (Option<(u64, Option<String>)>, u16),
     pub missing: Vec<(&'static str, &'static str, &'static str)>,
     /// the installed ani-cli's version, when it's older than ani::TESTED_ANI_CLI
     pub old_ani_cli: Option<String>,
@@ -263,7 +223,13 @@ fn main() -> std::io::Result<()> {
             std::process::exit(2);
         }
     }
-    ani::setup()?;
+    if let Err(e) = ani::setup() {
+        eprintln!(
+            "ani-hop: can't write to {}: {e}",
+            ani::tilde(&ani::cache_dir())
+        );
+        std::process::exit(1);
+    }
     kitty::init();
     let mut terminal = ratatui::init();
     execute!(std::io::stdout(), EnableBracketedPaste)?;
@@ -282,13 +248,13 @@ fn main() -> std::io::Result<()> {
     let res = (|| -> std::io::Result<()> {
         let mut dirty = true;
         while !app.quit {
-            let (fx, glint) = (ui::effects_running(&app), app.glint.1);
+            let (fx, glint) = (ui::effects_running(&app), app.preview.glint());
             if dirty || app.animating() {
                 terminal.draw(|f| ui::render(&mut app, f))?;
             }
             // one more frame after an effect ends (or starts in a slow frame), so it never
             // freezes mid-sweep
-            dirty = fx || app.glint.1 != glint;
+            dirty = fx || app.preview.glint() != glint;
             // ~60 fps while an effect plays, otherwise just often enough for spinners
             let fps = if ui::effects_running(&app) { 16 } else { 80 };
             let mut wait = Duration::from_millis(fps);
@@ -304,13 +270,14 @@ fn main() -> std::io::Result<()> {
                 app.on_msg(msg);
                 dirty = true;
             }
-            if app.posters.check(Instant::now()) {
+            let (shown, off) = app.preview.tick(Instant::now());
+            if off {
                 app.toast(
                     "This terminal didn't take the posters, showing colors instead",
                     true,
                 );
-                dirty = true;
             }
+            dirty |= shown || off;
             if let Some(cmd) = app.external.take() {
                 execute!(std::io::stdout(), DisableBracketedPaste)?;
                 ratatui::restore();
@@ -323,7 +290,7 @@ fn main() -> std::io::Result<()> {
         }
         Ok(())
     })();
-    app.posters.forget();
+    app.preview.forget();
     kitty::shutdown();
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
@@ -459,6 +426,7 @@ impl App {
             anilist::ENGLISH_TITLES.store(*english, Ordering::Relaxed);
         }
         let client = Client { token };
+        let entries = Entries::new(Arc::new(client.clone()));
         let done = tx.clone();
         let downloads = Queue::start(
             ani::cache_dir().join("queue"),
@@ -474,19 +442,21 @@ impl App {
             rx,
             client,
             user: user.map(|(id, name, _)| (id, name)),
-            posters: kitty::Posters::new(kitty::Tty, kitty::supported()),
-            saves_pending: 0,
+            preview: Preview::new(kitty::Posters::new(kitty::Tty, kitty::supported())),
+            entries,
             ep_info: HashMap::new(),
             parts: HashMap::new(),
             sources: Sources::load(),
             local: HashMap::new(),
+            downloaded: None,
+            scanning: None,
+            synced: HashMap::new(),
+            ask_local: false,
             elsewhere: HashMap::new(),
             resolving: HashMap::new(),
-            playing: None,
+            playback: Playback::new(Arc::new(playback::Mpv)),
             toast: None,
             started: Instant::now(),
-            glint: (0, Instant::now()),
-            scroll: (None, 0),
             missing: ani::missing_deps(),
             old_ani_cli: ani::old_ani_cli(),
             release: None,
@@ -494,12 +464,10 @@ impl App {
             parked: None,
             quit: false,
         };
-        app.scan_local();
         app.push("ani-hop", View::Main);
         let welcomed = ani::config_dir().join("welcomed");
         let first = !welcomed.exists();
-        // ani-skip is optional (and Homebrew has none), so it alone doesn't bring this up
-        let needed = app.missing.iter().any(|d| d.0 != "ani-skip");
+        let needed = app.missing.iter().any(|d| !ani::optional(d.0));
         if first || needed || app.old_ani_cli.is_some() {
             let _ = fs::create_dir_all(ani::config_dir());
             let _ = fs::write(&welcomed, "");
@@ -527,12 +495,8 @@ impl App {
     fn after_install(&mut self) {
         self.missing = ani::missing_deps();
         self.old_ani_cli = ani::old_ani_cli();
-        // ani-skip is optional and Homebrew has none, so it's no reason for an error
-        let names: Vec<&str> = self
-            .missing
-            .iter()
-            .map(|d| d.0)
-            .filter(|&n| n != "ani-skip")
+        let names: Vec<&str> = (self.missing.iter().map(|d| d.0))
+            .filter(|&n| !ani::optional(n))
             .collect();
         match (names.is_empty(), &self.old_ani_cli) {
             (false, _) => self.toast(format!("Still missing: {}", names.join(", ")), true),
@@ -552,6 +516,7 @@ impl App {
         let _ = fs::remove_file(token_path());
         let _ = fs::remove_file(user_path());
         (self.client.token, self.user) = (None, None);
+        self.entries.login(Arc::new(self.client.clone()));
         self.parts.clear(); // they carry this login's progress
     }
 
@@ -565,6 +530,22 @@ impl App {
         self.stack.last_mut().unwrap()
     }
 
+    /// A download of `m`'s `eps` (None: every episode not watched), with the newest Entries
+    /// known: they pick the episodes not watched, and a first download's Show folder starts
+    /// with them.
+    fn job(&self, mut m: Media, eps: Option<Vec<String>>) -> Job {
+        self.entries.remember(&m);
+        m.media_list_entry = self.entries.entry(&m).cloned();
+        let mut parts = self.parts(&m).to_vec();
+        for (_, p) in &mut parts {
+            p.media_list_entry = self.entries.entry(p).cloned();
+        }
+        let lookup = self.sources.lookup(m.id);
+        let mut job = Job::new(m, eps);
+        (job.parts, job.lookup) = (parts, lookup);
+        job
+    }
+
     /// Queues a download, saved first so quitting early doesn't lose it; false (and says
     /// why) when that can't be saved.
     fn download(&mut self, job: Job) -> bool {
@@ -573,32 +554,6 @@ impl App {
             self.toast(format!("Not queued · {e}"), true);
         }
         res.is_ok()
-    }
-
-    /// The episode downloading, or paused, when ffmpeg has it, which can't go on from what it
-    /// got: "Episode 3", or "Show E3" when `m`, the show on screen, isn't its show.
-    fn restarts(&self, m: &Media) -> Option<String> {
-        let n = self.downloads.snapshot().now.filter(|n| !n.resumes)?;
-        Some(match n.id == m.id {
-            true => format!("Episode {}", n.ep),
-            false => n.label,
-        })
-    }
-
-    /// Whether episode `ep` of `m` is the one downloading, not paused.
-    fn downloading(&self, m: &Media, ep: &str) -> bool {
-        let s = self.downloads.snapshot();
-        !s.paused && s.now.is_some_and(|n| n.id == m.id && n.ep == ep)
-    }
-
-    /// Whether enter on `stop` (queued episodes of `m`) is about pausing or resuming them all:
-    /// on the one downloading, or with downloads paused, on any queued one.
-    fn holds(&self, m: &Media, stop: &[String]) -> bool {
-        let s = self.downloads.snapshot();
-        match s.paused {
-            true => !stop.is_empty(),
-            false => s.now.is_some_and(|n| n.id == m.id && stop.contains(&n.ep)),
-        }
     }
 
     /// Takes episodes of `m` out of the queue. The one downloading stops, and the worker
@@ -615,11 +570,13 @@ impl App {
     /// Marked ones in different states, and the one downloading (pause or stop), ask which
     /// first; `chosen` is that answer.
     fn dl_act(&mut self, m: Media, eps: Vec<String>, chosen: Option<&str>) {
-        let (get, stop, delete) = self.downloads(&m).split(&eps);
-        let hold = self.holds(&m, &stop);
-        let action = match (chosen, get.is_empty(), stop.is_empty(), delete.is_empty()) {
-            (Some(a), ..) => a,
-            (None, ..) if hold => {
+        let dl = self.show_downloads(&m);
+        let action = dl.action(&eps, chosen);
+        // asks when that deletes what they got, so no stray enter or → can
+        let stop_asks = matches!(&action, Action::Stop(stop) if !dl.deletes(stop).is_empty());
+        match &action {
+            Action::Nothing(why) if !why.is_empty() => return self.toast(*why, false),
+            Action::Choose => {
                 let title = match eps.as_slice() {
                     [one] => format!("Episode {one}"),
                     _ => plural(eps.len(), "episode"),
@@ -627,102 +584,77 @@ impl App {
                 self.push(title, View::DlChoice(m, eps));
                 return;
             }
-            (None, false, true, true) => "download",
-            (None, true, false, true) => "stop",
-            (None, true, true, false) => "delete",
-            (None, true, true, true) => {
-                let it = if eps.len() == 1 { "it" } else { "them" };
-                return self.toast(format!("Another ani-hop has {it} queued"), false);
-            }
-            (None, ..) => {
-                self.push(plural(eps.len(), "episode"), View::DlChoice(m, eps));
+            Action::Delete(files) => {
+                let names: Vec<String> = files.iter().map(|f| f.0.clone()).collect();
+                let paths = files.iter().map(|f| f.1.clone()).collect();
+                let title = format!("Delete {}?", which(&names));
+                self.push(title, View::Confirm(Pending::Delete(paths)));
                 return;
             }
-        };
-        if action == "delete" && !delete.is_empty() {
-            let (names, paths): (Vec<String>, Vec<PathBuf>) = delete.into_iter().unzip();
-            let title = format!("Delete {}?", which(&names));
-            self.push(title, View::Confirm(Pending::Delete(paths)));
-            return;
-        }
-        // ffmpeg can't go on from what it got, so pausing loses that, and asks like stopping
-        if action == "pause"
-            && let Some(which) = self.restarts(&m)
-            && let Some(ep) = self.downloads.snapshot().now.map(|n| n.ep)
-        {
-            let title = format!("Pause downloads? {which} starts over when resumed");
-            self.push(title, View::Confirm(Pending::Pause(m, ep)));
-            return;
-        }
-        // asks when that deletes what they got, so no stray enter or → can
-        if action == "stop" && !ani::parts(&ani::folder(&m), &stop).is_empty() {
-            let title = format!("Stop downloading {}?", which(&stop));
-            self.push(title, View::Confirm(Pending::Stop(m, stop)));
-            return;
+            // ffmpeg can't go on from what it got, so pausing loses that, and asks like stopping
+            Action::Pause(ep, Some(which)) => {
+                let title = format!("Pause downloads? {which} starts over when resumed");
+                self.push(title, View::Confirm(Pending::Pause(m, ep.clone())));
+                return;
+            }
+            Action::Stop(stop) if stop_asks => {
+                let title = format!("Stop downloading {}?", which(stop));
+                self.push(title, View::Confirm(Pending::Stop(m, stop.clone())));
+                return;
+            }
+            _ => {}
         }
         if chosen.is_some() {
             self.pop(1); // back on the list, which shows what changed
         }
-        // the question may be older than the states it was about
-        if action == "download" && !get.is_empty() {
-            let lookup = self.sources.lookup(m.id);
-            // paused with something held, not just a pause left over from an emptied queue
-            let s = self.downloads.snapshot();
-            let going = match s.paused && s.pending > 0 {
-                true => " · resuming downloads",
-                false => "",
-            };
-            let queued = format!("Queued {}{going}", which(&get));
-            let mut job = Job::new(m, Some(get));
-            job.lookup = lookup;
-            if self.download(job) {
-                self.toast(queued, false);
+        match action {
+            Action::Download(get) => {
+                // paused with something held, not just a pause left over from an emptied queue
+                let s = self.downloads.snapshot();
+                let going = match s.paused && s.pending > 0 {
+                    true => " · resuming downloads",
+                    false => "",
+                };
+                let queued = format!("Queued {}{going}", which(&get));
+                if self.download(self.job(m, Some(get))) {
+                    self.toast(queued, false);
+                }
             }
-        } else if action == "stop" && !stop.is_empty() {
-            self.toast(format!("Stopped downloading {}", which(&stop)), false);
-            self.stop(&m, &stop);
-        } else if action == "pause" && hold && !self.downloads.snapshot().paused {
-            // the one it was offered for (holds: now); one that started since may be ffmpeg's,
-            // whose pause asks first
-            let ep = self.downloads.snapshot().now.map(|n| n.ep);
-            if self
-                .downloads
-                .pause(m.id, ep.as_deref().unwrap_or_default())
-            {
-                self.toast(
-                    "Paused downloads · enter on a queued episode resumes them",
-                    false,
-                );
+            Action::Stop(stop) => {
+                self.toast(format!("Stopped downloading {}", which(&stop)), false);
+                self.stop(&m, &stop);
             }
-        } else if action == "resume" && self.downloads.snapshot().paused {
-            self.downloads.resume();
-            self.toast("Resuming downloads", false);
+            // the one it was offered for; one that started since may be ffmpeg's, whose pause
+            // asks first
+            Action::Pause(ep, None) => {
+                if self.downloads.pause(m.id, &ep) {
+                    self.toast(PAUSED, false);
+                }
+            }
+            Action::Resume => {
+                self.downloads.resume();
+                self.toast("Resuming downloads", false);
+            }
+            _ => {}
         }
         self.top().menu.marked.clear();
         self.refresh();
     }
 
-    /// What enter does on the Downloads list, for the footer.
-    pub fn dl_verb(&self) -> &'static str {
+    /// What enter does on the screen on top, for the footer: none when nothing.
+    pub fn enter_verb(&self) -> Option<&'static str> {
         let screen = self.stack.last().unwrap();
         let m = match &screen.view {
             View::Episodes(m, EpMode::Download) => m,
-            View::Episodes(_, EpMode::Play) => return "play",
-            _ => return "select",
+            View::Episodes(_, EpMode::Play) => return Some("play"),
+            View::Input(Input::Search | Input::SourceQuery(_)) => return Some("search"),
+            View::Input(_) => return Some("save"),
+            _ => return Some("select"),
         };
         let eps: Vec<String> = (screen.menu.selection().iter())
             .map(|&i| screen.menu.items[i].key.clone())
             .collect();
-        let (get, stop, delete) = self.downloads(m).split(&eps);
-        match (get.is_empty(), stop.is_empty(), delete.is_empty()) {
-            _ if self.holds(m, &stop) && self.downloads.snapshot().paused => "resume…",
-            _ if self.holds(m, &stop) => "pause…",
-            (false, true, true) => "download",
-            (true, false, true) => "stop",
-            (true, true, false) => "delete",
-            (true, true, true) => "select",
-            _ => "choose",
-        }
+        self.show_downloads(m).verb(&eps)
     }
 
     fn spawn(&self, f: impl FnOnce() -> Msg + Send + 'static) {
@@ -735,8 +667,12 @@ impl App {
     }
 
     fn push(&mut self, title: impl Into<String>, view: View) -> u64 {
+        // episode titles load while the show is open, so its episode list has them right away
+        if let View::Show(m) | View::Episodes(m, _) = &view {
+            self.want_episodes(m);
+        }
         let multi = matches!(view, View::Shows(..) | View::Episodes(_, EpMode::Download));
-        self.scan_local();
+        self.scan_local(shown(&view));
         let menu = Menu::new(self.items(&view), multi);
         self.next_id += 1;
         self.stack.push(Screen {
@@ -744,7 +680,7 @@ impl App {
             title: title.into(),
             view,
             menu,
-            loading: false,
+            waiting: false,
         });
         self.next_id
     }
@@ -761,11 +697,10 @@ impl App {
         let cache = cache.map(|k| lists::cache(&k));
         let (list, ask) = List::open(feed, cache, std::time::SystemTime::now());
         let id = self.push(title, View::Shows(list));
-        let Some(ask) = ask else {
-            return;
-        };
-        self.top().loading = true;
-        self.spawn(move || Msg::Shows(id, f(), ask));
+        if let Some(ask) = ask {
+            let stamp = self.entries.stamp();
+            self.spawn(move || Msg::Shows(id, stamp, f(), ask));
+        }
     }
 
     fn pop(&mut self, n: usize) {
@@ -785,13 +720,21 @@ impl App {
         self.refresh();
     }
 
-    /// Rebuilds the visible menu from current state (keeps query and cursor).
+    /// Rescans what's downloaded and rebuilds the visible menu (keeps query and cursor).
     fn refresh(&mut self) {
-        self.scan_local();
+        let m = shown(&self.stack.last().unwrap().view).cloned();
+        self.scan_local(m.as_ref());
+        self.rebuild();
+    }
+
+    /// Rebuilds the visible menu from current state (keeps query and cursor).
+    fn rebuild(&mut self) {
+        let downloaded = self.downloaded.clone();
         if let View::Shows(list) = &mut self.top().view
             && list.is_local()
+            && let Some(shows) = downloaded
         {
-            list.shows = ani::local_shows().into_iter().map(|(m, _)| m).collect();
+            list.scanned(shows);
         }
         let items = self.items(&self.stack.last().unwrap().view);
         // a chooser whose action under the cursor went (the episode finished, say), or a pause
@@ -802,7 +745,7 @@ impl App {
             View::DlChoice(..) => {
                 (top.menu.current()).is_some_and(|c| !items.iter().any(|i| i.key == c.key))
             }
-            View::Confirm(Pending::Pause(m, ep)) => !self.downloading(m, ep),
+            View::Confirm(Pending::Pause(m, ep)) => !self.show_downloads(m).downloading(ep),
             _ => false,
         };
         if stale {
@@ -811,30 +754,45 @@ impl App {
         self.top().menu.set_items(items);
     }
 
-    fn scan_local(&mut self) {
-        self.local = ani::local_shows()
-            .into_iter()
-            .map(|(m, p)| (m.id, ani::local_episodes(&p)))
-            .collect();
+    /// Rescans what's downloaded: `m`'s folder at once, so what was just done to it shows,
+    /// and every show folder in the background, as the download folder may be on a slow disk
+    /// (a NAS, a USB disk asleep). Other ani-hops' queues are in the cache, read at once.
+    fn scan_local(&mut self, m: Option<&Media>) {
         self.elsewhere = self.downloads.elsewhere();
+        if let Some(m) = m {
+            let dir = ani::folder(m);
+            match ani::local_episodes(&dir) {
+                eps if eps.is_empty() => _ = self.local.remove(&m.id),
+                eps => _ = self.local.insert(m.id, eps),
+            }
+            self.synced.insert(m.id, ani::ours(&dir).then(|| m.clone()));
+        }
+        match &mut self.scanning {
+            Some(again) => *again = true,
+            None => {
+                self.scanning = Some(false);
+                self.synced.clear(); // what this rescan finds is newer
+                self.spawn(|| {
+                    let shows = ani::local_shows().into_iter();
+                    Msg::Scanned(shows.map(|(m, p)| (m, ani::local_episodes(&p))).collect())
+                });
+            }
+        }
     }
 
-    /// Where `m`'s episodes stand, as of the last rescan and the queue now.
-    fn downloads(&self, m: &Media) -> Downloads {
+    /// Where `m`'s episodes stand with downloads, as of the last rescan and the queue now.
+    pub fn show_downloads<'a>(&self, m: &'a Media) -> ShowDownloads<'a> {
         let on_disk = self.local.get(&m.id).cloned().unwrap_or_default();
         let queued = (self.downloads).queued(m, self.sources.get(m.id), &on_disk);
         let elsewhere = self.elsewhere.get(&m.id).cloned().unwrap_or_default();
-        Downloads {
-            on_disk,
-            queued,
-            elsewhere,
-        }
+        let queue = self.downloads.snapshot();
+        ShowDownloads::of(m, on_disk, queued, elsewhere, queue)
     }
 
     /// Something on screen changes without input (spinner, progress, fading toast).
     fn animating(&self) -> bool {
         ui::effects_running(self)
-            || self.stack.last().unwrap().loading
+            || self.stack.last().unwrap().loading()
             || self.downloads.snapshot().pending > 0 && !self.downloads.snapshot().paused
             || self
                 .toast
@@ -842,17 +800,9 @@ impl App {
                 .is_some_and(|t| t.2.elapsed().as_secs() < 5)
     }
 
-    /// Starts loading a show's poster at the size of the last layout; `urgent` is the one on
-    /// screen.
-    pub fn want_cover(&mut self, m: &Media, urgent: bool) {
-        if let Some(load) = self.posters.want(m, urgent) {
-            self.spawn(move || Msg::Cover(load.run()));
-        }
-    }
-
     /// Episode titles and summaries, once a session per show, and the sequels the provider
     /// runs on into once it lists more episodes than AniList.
-    pub fn want_episodes(&mut self, m: &Media) {
+    fn want_episodes(&mut self, m: &Media) {
         // ani.zip and AniList know shows by AniList id only
         if !m.on_anilist() {
             return;
@@ -874,11 +824,10 @@ impl App {
         };
         if self.parts.get(&m.id).is_none_or(|p| p.0 != key) {
             self.parts.insert(m.id, (key, Vec::new()));
-            let (m, c) = (m.clone(), self.client.clone());
-            let asked = (c.token.clone(), lists::changes());
+            let (m, c, stamp) = (m.clone(), self.client.clone(), self.entries.stamp());
             self.spawn(move || {
                 let parts = c.parts(&m, key.0);
-                Msg::Parts(m.id, key, asked.0, asked.1, parts)
+                Msg::Parts(m.id, key, stamp, parts)
             });
         }
     }
@@ -900,7 +849,7 @@ impl App {
 
     /// `m`'s episodes as AniList counts them, with the parts known so far.
     pub fn progress<'a>(&'a self, m: &'a Media) -> Progress<'a> {
-        Progress::of(m, self.parts(m))
+        self.entries.progress(m, self.parts(m))
     }
 
     /// AniList says none of `m` is out, and ani-cli has no source for it, known, picked by
@@ -938,7 +887,7 @@ impl App {
                 if self.user.is_some() {
                     v.extend(LISTS[2..].iter().map(list));
                 }
-                let local = self.local.len();
+                let local = self.downloaded.as_ref().map_or(0, Vec::len);
                 let shows = if local > 0 {
                     plural(local, "show")
                 } else {
@@ -962,11 +911,7 @@ impl App {
                     "Skip openings/endings",
                     if ani::skip_on() { "on" } else { "off" },
                 ),
-                Item::new(
-                    "audio",
-                    "Default audio…",
-                    ani::audio_label(ani::audio(None)),
-                ),
+                audio_item("Default audio…", ani::audio(None)),
                 Item::new(
                     "folder",
                     "Download folder…",
@@ -1003,10 +948,10 @@ impl App {
                         if let Some(n) = self.local.get(&m.id).map(Vec::len).filter(|n| *n > 0) {
                             hint.push(format!("↓ {n}"));
                         }
-                        if m.media_list_entry.is_some() {
+                        if let Some(e) = self.entries.entry(m) {
                             hint.push(format!(
                                 "{}/{}",
-                                m.progress(),
+                                e.progress,
                                 m.episodes.map_or("?".into(), |e| e.to_string())
                             ));
                         } else if let Some(e) = m.episodes {
@@ -1026,13 +971,13 @@ impl App {
                 v
             }
             View::Show(m) => {
-                let dl = self.downloads(m);
+                let dl = self.show_downloads(m);
                 let src = self.sources.get(m.id);
                 let (next, released) = (self.progress(m).next(), self.progress(m).released());
                 let mut v = Vec::new();
                 if released.is_none_or(|r| next <= r) {
                     let verb = if next > 1 { "Continue with" } else { "Play" };
-                    let on_disk = (dl.on_disk.iter()).any(|(e, _)| ani::ep_num(e) == next as f64);
+                    let on_disk = (dl.on_disk().iter()).any(|(e, _)| ani::ep_num(e) == next as f64);
                     v.push(Item::new(
                         "next",
                         format!("▶  {verb} episode {next}"),
@@ -1046,34 +991,16 @@ impl App {
                     None => String::new(),
                 };
                 v.push(Item::new("play", "≡  Episodes…", avail));
-                let mut state = Vec::new();
-                if !dl.queued.is_empty() {
-                    let how = match self.downloads.snapshot().paused {
-                        true => "paused",
-                        false => "queued",
-                    };
-                    state.push(format!("{} {how}", dl.queued.len()));
-                }
-                if !dl.on_disk.is_empty() {
-                    state.push(format!("{} on disk", dl.on_disk.len()));
-                }
-                v.push(Item::new("download", "↓  Downloads…", state.join(" · ")));
+                v.push(Item::new("download", "↓  Downloads…", dl.summary()));
                 if self.user.is_some() && m.on_anilist() {
-                    let status = m
-                        .media_list_entry
-                        .as_ref()
-                        .map(|e| list_label(&e.status))
-                        .unwrap_or("not on list");
+                    let entry = self.entries.entry(m);
+                    let status = entry.map_or("not on list", |e| list_label(&e.status));
                     v.push(Item::new("status", "●  List status…", status));
                     let total = m.episodes.map_or("?".into(), |t| t.to_string());
-                    let progress = format!("{}/{total}", m.progress());
+                    let progress = format!("{}/{total}", entry.map_or(0, |e| e.progress));
                     v.push(Item::new("watched", "✓  Watched up to…", progress));
                 }
-                v.push(Item::new(
-                    "audio",
-                    "♪  Audio…",
-                    ani::audio_label(ani::audio(Some(m.id))),
-                ));
+                v.push(audio_item("♪  Audio…", ani::audio(Some(m.id))));
                 v.push(Item::new(
                     "source",
                     "⇄  Change source…",
@@ -1085,84 +1012,30 @@ impl App {
                 v
             }
             View::Episodes(m, mode) => {
-                let dl = self.downloads(m);
+                let dl = self.show_downloads(m);
                 let run = self.progress(m);
                 // what a watched episode is called and about; nothing that spoils the rest
                 let item = |key: &str, ep: &str, hint: String| {
                     let mut it = Item::new(key, format!("Episode {ep}"), hint);
                     it.done = run.watched(ep);
-                    if let Some(i) = self.ep_about(m, ep).filter(|_| it.done) {
-                        if !i.title.is_empty() {
-                            it.label = format!("{} · {}", it.label, i.title);
+                    if let Some((title, about)) = self.ep_about(m, ep).map(|i| i.told(it.done)) {
+                        if !title.is_empty() {
+                            it.label = format!("{} · {title}", it.label);
                         }
-                        it.about = i.about.clone();
+                        it.about = about.to_string();
                     }
                     it.group = run.group(ep).to_string();
                     it
                 };
-                // also what the provider no longer lists, so it can still be played or deleted
-                let mut eps: Vec<String> = self
-                    .sources
-                    .get(m.id)
-                    .map(|s| s.episodes.clone())
-                    .unwrap_or_default();
-                let more = (dl.on_disk.iter().map(|(e, _)| e)).chain(&dl.queued);
-                let more: Vec<String> = more.filter(|e| !eps.contains(e)).cloned().collect();
-                eps.extend(more);
-                eps.sort_by(|a, b| ani::ep_num(a).total_cmp(&ani::ep_num(b)));
-                eps.dedup();
-                // the one downloading shows its progress in place of "queued" (ui.rs)
-                let hint = |ep: &str| match (dl.state(ep), mode) {
-                    (Dl::OnDisk(p), EpMode::Download) => format!("on disk · {}", megabytes([&p])),
-                    (Dl::OnDisk(_), _) => "on disk".into(),
-                    (Dl::Queued, _) => "queued".into(),
-                    (Dl::Elsewhere, _) => "queued in another ani-hop".into(),
-                    (Dl::Missing, _) => String::new(),
-                };
-                eps.iter().map(|ep| item(ep, ep, hint(ep))).collect()
+                let listed = self.sources.get(m.id).map_or(&[][..], |s| &s.episodes);
+                let sizes = *mode == EpMode::Download;
+                (dl.episodes(listed).iter())
+                    .map(|ep| item(ep, ep, dl.hint(ep, sizes)))
+                    .collect()
             }
-            View::DlChoice(m, eps) => {
-                let (get, stop, delete) = self.downloads(m).split(eps);
-                let mut v = Vec::new();
-                // under the cursor, so → twice only pauses, and → twice again resumes
-                if self.holds(m, &stop) {
-                    let over = self.restarts(m).map_or("", |_| "from the start");
-                    v.push(match self.downloads.snapshot().paused {
-                        true => Item::new("resume", "▶  Resume downloads", over),
-                        false => Item::new("pause", "‖  Pause downloads", ""),
-                    });
-                }
-                if !get.is_empty() {
-                    let label = format!("↓  Download {}", which(&get));
-                    v.push(Item::new("download", label, ""));
-                }
-                if !stop.is_empty() {
-                    // the title says which when it's one
-                    let which = if eps.len() == 1 {
-                        String::new()
-                    } else {
-                        format!(" {}", which(&stop))
-                    };
-                    let label = format!("■  Stop downloading{which}");
-                    v.push(Item::new(
-                        "stop",
-                        label,
-                        deletes(&ani::parts(&ani::folder(m), &stop)),
-                    ));
-                }
-                if !delete.is_empty() {
-                    let size = megabytes(delete.iter().map(|(_, p)| p));
-                    let names: Vec<String> = delete.into_iter().map(|(e, _)| e).collect();
-                    v.push(Item::new(
-                        "delete",
-                        format!("✗  Delete {}", which(&names)),
-                        size,
-                    ));
-                }
-                v
-            }
+            View::DlChoice(m, eps) => self.show_downloads(m).choices(eps),
             View::Status(m) => {
-                let cur = m.media_list_entry.as_ref().map(|e| e.status.as_str());
+                let cur = self.entries.entry(m).map(|e| e.status.as_str());
                 let mut v: Vec<Item> = LISTS
                     .iter()
                     .map(|(s, l)| Item::new(*s, *l, if cur == Some(s) { "current" } else { "" }))
@@ -1181,7 +1054,7 @@ impl App {
                 let (cur, default) = (ani::audio(id), ani::audio(None));
                 ani::AUDIO
                     .iter()
-                    .map(|(k, label)| {
+                    .map(|(k, label, _)| {
                         let mut hint = Vec::new();
                         if *k == cur {
                             hint.push("current");
@@ -1206,7 +1079,8 @@ impl App {
                 // only what's out downloads; the preview says which isn't
                 let out: Vec<&Media> = list.iter().filter(|m| !self.upcoming(m)).collect();
                 // as the downloader decides: episodes past each show's progress
-                let which = if out.iter().any(|m| m.progress() > 0) {
+                let started = |m: &&Media| self.entries.entry(m).is_some_and(|e| e.progress > 0);
+                let which = if out.iter().any(started) {
                     "unwatched"
                 } else {
                     "all"
@@ -1228,33 +1102,42 @@ impl App {
                 }
                 v
             }
-            // No discards what was downloaded so far; esc asks again next start
-            View::Confirm(Pending::Resume(..)) => vec![
-                Item::new("no", "No", "deletes partial files"),
-                Item::new("yes", "Yes", ""),
-            ],
-            // what it saves, as that can be the entry's last (the second half of a special)
-            // or a part's
-            View::Confirm(Pending::Progress(mark)) => {
+            // the safe answer first, both named by what they do, with what that changes
+            View::Confirm(p) => {
+                let (no, yes, no_hint, yes_hint) = match p {
+                    Pending::Delete(_) => ("Keep", "Delete", "", String::new()),
+                    Pending::Stop(m, eps) => {
+                        let parts = self.show_downloads(m).deletes(eps);
+                        let hint = show_downloads::deletes_hint(&parts);
+                        ("Keep downloading", "Stop", "", hint)
+                    }
+                    Pending::Pause(..) => ("Keep going", "Pause", "", String::new()),
+                    Pending::Remove(_) => ("Keep on list", "Remove", "", String::new()),
+                    // what it saves, as that can be the entry's last (the second half of a
+                    // special) or a part's
+                    Pending::Progress(mark) => ("Don't save", "Save", "", mark.hint()),
+                    Pending::Quit => {
+                        // when it asks about downloads, which it doesn't while they're paused
+                        let s = self.downloads.snapshot();
+                        let hint = match s.pending > 0 && !s.paused {
+                            true => "downloads kept for next start",
+                            false => "",
+                        };
+                        ("Stay", "Quit", "", hint.into())
+                    }
+                    // dropping them deletes what they got; esc asks again next start
+                    Pending::Resume(..) => (
+                        "Drop them",
+                        "Resume",
+                        "deletes partial files",
+                        String::new(),
+                    ),
+                };
                 vec![
-                    Item::new("no", "No", ""),
-                    Item::new("yes", "Yes", mark.hint()),
+                    Item::new("no", no, no_hint),
+                    Item::new("yes", yes, yes_hint),
                 ]
             }
-            View::Confirm(Pending::Stop(m, eps)) => {
-                let hint = deletes(&ani::parts(&ani::folder(m), eps));
-                vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
-            }
-            View::Confirm(Pending::Quit) => {
-                // when it asks about downloads, which it doesn't while they're paused
-                let s = self.downloads.snapshot();
-                let hint = match s.pending > 0 && !s.paused {
-                    true => "kept for next start",
-                    false => "",
-                };
-                vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
-            }
-            View::Confirm(_) => vec![Item::new("no", "No", ""), Item::new("yes", "Yes", "")],
             View::Input(_) => Vec::new(),
         }
     }
@@ -1276,12 +1159,7 @@ impl App {
         if k.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(k.code, KeyCode::Up | KeyCode::Down)
         {
-            let n = &mut self.scroll.1;
-            *n = match k.code {
-                KeyCode::Up => n.saturating_sub(1),
-                _ => n.saturating_add(1),
-            };
-            return;
+            return self.preview.scroll(k.code == KeyCode::Down);
         }
         match self.top().menu.key(k) {
             Some(Act::Accept) => self.accept(),
@@ -1294,14 +1172,15 @@ impl App {
         // paused, nothing runs, and the queue keeps them for the next start
         let s = self.downloads.snapshot();
         let downloads = if s.paused { 0 } else { s.pending };
-        let busy = downloads > 0 || self.saves_pending > 0;
+        let saves = self.entries.pending();
+        let busy = downloads > 0 || saves > 0;
         if busy && !matches!(self.top().view, View::Confirm(Pending::Quit)) {
             let mut left = Vec::new();
             if downloads > 0 {
                 left.push(plural(downloads, "download"));
             }
-            if self.saves_pending > 0 {
-                left.push(plural(self.saves_pending, "AniList save"));
+            if saves > 0 {
+                left.push(plural(saves, "AniList save"));
             }
             self.push(
                 format!("{} still running, quit anyway?", left.join(" and ")),
@@ -1396,7 +1275,7 @@ impl App {
                 self.pop(1);
             }
             View::Status(m) => {
-                let (m, c) = (m.clone(), self.client.clone());
+                let m = m.clone();
                 // AniList can't undo it, so a stray enter or → mustn't
                 if key == "remove" {
                     let title = format!(
@@ -1407,8 +1286,8 @@ impl App {
                     return self.top().menu.select_key("no");
                 }
                 self.toast(format!("Saving {}…", m.name()), false);
-                self.saves_pending += 1;
-                self.spawn(move || Msg::Saved(m.clone(), c.save(m.id, Some(&key), None).map(Some)));
+                let work = self.entries.begin(Change::Status(m, key));
+                self.spawn(move || Msg::Entry(work.run()));
             }
             View::Sources(m, q, hits) => {
                 let i: usize = key.parse().unwrap();
@@ -1427,10 +1306,7 @@ impl App {
                     let list: Vec<Media> = list.into_iter().filter(|m| !self.upcoming(m)).collect();
                     let shows = plural(list.len(), "show");
                     for m in list {
-                        let mut job = Job::new(m, None);
-                        job.parts = self.parts(&job.media).to_vec();
-                        job.lookup = self.sources.lookup(job.media.id);
-                        if !self.download(job) {
+                        if !self.download(self.job(m, None)) {
                             return;
                         }
                     }
@@ -1506,10 +1382,7 @@ impl App {
                         // start over unasked. Checked where it runs: its messages may not be
                         // here yet.
                         if self.downloads.pause(m.id, ep) {
-                            self.toast(
-                                "Paused downloads · enter on a queued episode resumes them",
-                                false,
-                            );
+                            self.toast(PAUSED, false);
                         }
                         self.pop(1);
                         if matches!(self.top().view, View::DlChoice(..)) {
@@ -1518,7 +1391,7 @@ impl App {
                     }
                     Pending::Stop(m, eps) => {
                         // what finished or was stopped meanwhile stays as it is
-                        let (m, (_, stop, _)) = (m.clone(), self.downloads(m).split(eps));
+                        let (m, stop) = (m.clone(), self.show_downloads(m).still_queued(eps));
                         if !stop.is_empty() {
                             self.toast(format!("Stopped downloading {}", which(&stop)), false);
                             self.stop(&m, &stop);
@@ -1530,28 +1403,19 @@ impl App {
                         self.top().menu.marked.clear();
                     }
                     Pending::Remove(m) => {
-                        let (m, c) = (m.clone(), self.client.clone());
+                        let m = m.clone();
                         self.pop(1);
-                        let Some(entry) = m.media_list_entry.as_ref().map(|e| e.id) else {
+                        let Some(entry) = self.entries.entry(&m).map(|e| e.id) else {
                             return;
                         };
                         self.toast(format!("Removing {}…", m.name()), false);
-                        self.saves_pending += 1;
-                        self.spawn(move || Msg::Removed(m, c.remove(entry)));
+                        let work = self.entries.begin(Change::Remove(m, entry));
+                        self.spawn(move || Msg::Entry(work.run()));
                     }
                     Pending::Progress(k) => {
-                        let (k, c) = (k.clone(), self.client.clone());
-                        self.saves_pending += 1;
-                        // the question showed `was`; Yes mustn't undo a save it didn't know of
-                        // (an old copy: a cached list, the episode's start, a late lookup)
-                        self.spawn(move || {
-                            let m = k.entry;
-                            match c.save_progress(m.id, k.status, k.was, k.to) {
-                                Ok(Ok(entry)) => Msg::Saved(m, Ok(Some(entry))),
-                                Ok(Err(now)) => Msg::Moved(m, now),
-                                Err(e) => Msg::Saved(m, Err(e)),
-                            }
-                        });
+                        // saved only while AniList still has the progress the question showed
+                        let work = self.entries.begin(Change::Progress(k.clone()));
+                        self.spawn(move || Msg::Entry(work.run()));
                         self.pop(1);
                     }
                 }
@@ -1563,15 +1427,14 @@ impl App {
     /// Fetches the next page of the ranking on top, as "More…" and ^f do.
     fn more(&mut self) {
         let screen = self.top();
-        let (id, refreshing) = (screen.id, screen.loading);
+        let id = screen.id;
         let View::Shows(list) = &mut screen.view else {
             return;
         };
-        match list.more(refreshing) {
+        match list.more() {
             Ok(Some((sort, page))) => {
-                self.top().loading = true;
-                let c = self.client.clone();
-                self.spawn(move || Msg::More(id, c.browse(&sort, None, page)));
+                let (c, stamp) = (self.client.clone(), self.entries.stamp());
+                self.spawn(move || Msg::More(id, stamp, c.browse(&sort, None, page)));
             }
             Ok(None) => {}
             Err(why) => self.toast(why, false),
@@ -1599,22 +1462,14 @@ impl App {
                 self.top().menu.paste(&ani::tilde(&ani::download_root()));
             }
             "downloads" => {
-                let list: Vec<Media> = ani::local_shows().into_iter().map(|(m, _)| m).collect();
-                // saved when downloaded, maybe weeks ago: their progress is AniList's now
-                let ids: Vec<u64> = (list.iter().filter(|m| m.on_anilist()))
-                    .map(|m| m.id)
-                    .collect();
-                if !ids.is_empty() {
-                    self.spawn(move || Msg::Local(c.shows(&ids)));
-                }
-                self.push("Downloads", View::Shows(List::local(list)));
+                // as the last rescan found them; the one opening it starts fills it in
+                let list = List::local(self.downloaded.clone());
+                self.push("Downloads", View::Shows(list));
+                self.ask_local = true;
             }
             "login" => match client_id() {
                 Some(id) => self.start_auth(&id),
-                None => {
-                    open_url("https://anilist.co/settings/developer");
-                    self.push("AniList setup", View::Input(Input::ClientId));
-                }
+                None => self.ask_client_id(),
             },
             "skip" => {
                 let on = !ani::skip_on();
@@ -1646,6 +1501,13 @@ impl App {
         }
     }
 
+    /// The one-time setup of an AniList API client of the user's own; a saved client ID stays
+    /// until another one is entered.
+    fn ask_client_id(&mut self) {
+        open_url("https://anilist.co/settings/developer");
+        self.push("AniList setup", View::Input(Input::ClientId));
+    }
+
     fn start_auth(&mut self, client_id: &str) {
         open_url(&format!(
             "https://anilist.co/api/v2/oauth/authorize?client_id={client_id}&response_type=token"
@@ -1654,10 +1516,15 @@ impl App {
     }
 
     fn submit(&mut self, input: Input, text: String) {
-        if text.is_empty() && !matches!(input, Input::DownloadDir) {
+        if text.is_empty() && !matches!(input, Input::DownloadDir | Input::Token) {
             return;
         }
         match input {
+            // a mistyped client ID would fail every login: enter it again
+            Input::Token if text.is_empty() => {
+                self.pop(1);
+                self.ask_client_id();
+            }
             Input::Search => {
                 let c = self.client.clone();
                 let title = text.clone();
@@ -1686,6 +1553,7 @@ impl App {
                     return self.toast(e.to_string(), true);
                 }
                 self.client.token = Some(token);
+                self.entries.login(Arc::new(self.client.clone()));
                 self.parts.clear();
                 let c = self.client.clone();
                 self.spawn(move || Msg::Viewer(c.token.clone(), c.viewer()));
@@ -1701,7 +1569,7 @@ impl App {
             },
             Input::SourceQuery(m) => {
                 let id = self.push("Pick source", View::Sources(m, text.clone(), Vec::new()));
-                self.top().loading = true;
+                self.top().waiting = true;
                 self.spawn(move || Msg::Hits(id, source::search(&text).map(|r| r.0)));
             }
         }
@@ -1729,7 +1597,8 @@ impl App {
             "play" => self.resolve(&m, Some(Want::Episodes(EpMode::Play))),
             // what's on disk can be deleted before ani-cli answers, or without it
             "download"
-                if self.sources.get(m.id).is_none() && !self.downloads(&m).on_disk.is_empty() =>
+                if self.sources.get(m.id).is_none()
+                    && !self.show_downloads(&m).on_disk().is_empty() =>
             {
                 self.resolve(&m, None);
                 self.fulfill(m, Want::Episodes(EpMode::Download));
@@ -1819,68 +1688,46 @@ impl App {
     }
 
     fn play(&mut self, m: Media, ep: String) {
-        // a second enter would open a second player
-        if let Some(p) = &self.playing
-            && p.step.is_some()
-        {
-            return self.toast(format!("Still starting {}…", p.title), false);
-        }
-        let local = ani::local_episodes(&ani::folder(&m))
+        let file = ani::local_episodes(&ani::folder(&m))
             .into_iter()
             .find(|(e, _)| *e == ep);
-        let lookup = self.sources.lookup(m.id);
-        let step = match (&local, &lookup) {
-            (Some(_), _) => "opening the player",
-            (None, Lookup::Resolve) => SEARCHING,
-            (_, Lookup::Check(_)) => "checking the source",
-            _ => "fetching the stream",
-        };
-        self.playing = Some(Playing {
-            id: m.id,
-            ep: ep.clone(),
-            // the number first: a long title loses its end, not the episode
-            title: format!("Episode {ep} · {}", m.name()),
-            step: Some(step),
-            since: Instant::now(),
-            color: m.cover_image.color.clone(),
-        });
-        if local.is_none() && matches!(lookup, Lookup::Resolve) {
-            return self.resolve(&m, Some(Want::Play(ep)));
+        let (lookup, audio) = (self.sources.lookup(m.id), ani::audio(Some(m.id)));
+        match (self.playback).start(&m, &ep, file.map(|f| f.1), lookup, audio) {
+            Start::Busy(title) => self.toast(format!("Still starting {title}…"), false),
+            Start::Lookup => self.resolve(&m, Some(Want::Play(ep))),
+            Start::Run(run) => {
+                let (tx, attempt) = (self.tx.clone(), run.attempt);
+                self.spawn(move || {
+                    let res = run.run(&|step| _ = tx.send(Msg::PlayStep(attempt, step)));
+                    Msg::Played(attempt, m, ep, res)
+                });
+            }
         }
-        let (tx, id, e) = (self.tx.clone(), m.id, ep.clone());
-        let step = move |s| _ = tx.send(Msg::PlayStep(id, e.clone(), s));
-        let audio = ani::audio(Some(m.id));
-        self.spawn(move || {
-            let stream = |s: &Source| match ani::stream(s, &ep, audio, || step(None)) {
-                // dubs come later or not at all, the subtitled one is the next best
-                Err(e) if ani::dub(audio) && e.contains("dub") => {
-                    step(Some("no dub yet, fetching it with subtitles"));
-                    ani::stream(s, &ep, "sub", || step(None))
-                }
-                res => res,
-            };
-            let res = match (&local, lookup) {
-                (Some((_, file)), _) => ani::play_file(&m, &ep, file, || step(None)),
-                (_, Lookup::Ready(src)) => stream(&src),
-                (_, lookup) => lookup.run(&m).and_then(|s| {
-                    step(Some("fetching the stream"));
-                    stream(&s)
-                }),
-            };
-            Msg::Played(m, ep, res)
-        });
     }
 
-    /// Fills a screen that waited on a background result. On failure it goes away, unless
-    /// it already shows something (cached entries stay usable offline).
-    fn fill<T>(&mut self, id: u64, res: Result<T, String>, set: impl FnOnce(&mut View, T)) {
+    /// Shows AniList sent for a read asked at `stamp`, carrying the newest Entries known. An
+    /// earlier login's answer comes back as an error without words: nothing to show or say.
+    fn observed(
+        &mut self,
+        stamp: Stamp,
+        mut res: Result<Vec<Media>, String>,
+    ) -> Result<Vec<Media>, String> {
+        match self.entries.observe(stamp, res.iter_mut().flatten()) {
+            true => res,
+            false => Err(String::new()),
+        }
+    }
+
+    /// Hands a background result to the screen that waited on it, through `set`. On failure
+    /// the screen goes away, unless it already shows something (cached entries stay usable
+    /// offline), and says why.
+    fn fill(&mut self, id: u64, set: impl FnOnce(&mut View) -> Result<(), String>) {
         let Some(pos) = self.stack.iter().position(|s| s.id == id) else {
             return;
         };
-        self.stack[pos].loading = false;
-        match res {
-            Ok(data) => {
-                set(&mut self.stack[pos].view, data);
+        self.stack[pos].waiting = false;
+        match set(&mut self.stack[pos].view) {
+            Ok(()) => {
                 let items = self.items(&self.stack[pos].view);
                 self.stack[pos].menu.set_items(items);
             }
@@ -1888,81 +1735,60 @@ impl App {
                 if self.stack[pos].menu.items.is_empty() {
                     self.stack.truncate(pos);
                 }
-                self.toast(e, true);
-            }
-        }
-    }
-
-    fn update_media(&mut self, id: u64, entry: Option<Entry>) {
-        for s in &mut self.stack {
-            let media: Vec<&mut Media> = match &mut s.view {
-                View::Show(m)
-                | View::Episodes(m, _)
-                | View::DlChoice(m, _)
-                | View::Status(m)
-                | View::Sources(m, ..)
-                | View::Audio(Some(m))
-                | View::Input(Input::SourceQuery(m)) => vec![m],
-                View::Shows(l) => l.shows.iter_mut().collect(),
-                View::Bulk(l) => l.iter_mut().collect(),
-                _ => Vec::new(),
-            };
-            for m in media {
-                if m.id == id {
-                    m.media_list_entry = entry.clone();
+                // none for an earlier login's answer
+                if !e.is_empty() {
+                    self.toast(e, true);
                 }
-            }
-        }
-        for (_, p) in self.parts.values_mut().flat_map(|p| &mut p.1) {
-            if p.id == id {
-                p.media_list_entry = entry.clone();
             }
         }
     }
 
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Shows(id, res, ask) => {
+            Msg::Shows(id, stamp, res, ask) => {
+                let res = self.observed(stamp, res);
                 let fallback = res
                     .as_ref()
                     .is_ok_and(|l| l.iter().any(|m| !m.on_anilist()))
                     && self.stack.iter().any(|s| s.id == id);
-                self.fill(id, res, |v, shows| {
-                    if let View::Shows(list) = v {
-                        list.refreshed(ask, shows);
-                    }
+                self.fill(id, |v| match v {
+                    View::Shows(list) => list.refreshed(ask, res),
+                    _ => Ok(()),
                 });
+                // a show's page on top shows their Entries too, the newest now
+                self.rebuild();
                 if fallback {
                     self.toast("AniList search failed, showing ani-cli's matches", true);
                 }
             }
-            // offline is when downloads are watched: no error for that
-            Msg::Local(Ok(fresh)) => {
-                ani::refresh_shows(&fresh);
-                self.refresh();
-            }
-            Msg::Local(Err(_)) => {}
-            Msg::More(id, res) => {
-                let screen = self.stack.iter_mut().find(|s| s.id == id);
-                if let Some(View::Shows(list)) = screen.map(|s| &mut s.view) {
-                    list.fetched();
+            Msg::Local(stamp, res) => {
+                // offline is when downloads are watched: no error for that
+                if let Ok(fresh) = self.observed(stamp, res) {
+                    ani::refresh_shows(&fresh);
+                    self.refresh();
                 }
+            }
+            Msg::More(id, stamp, res) => {
+                let res = self.observed(stamp, res);
                 let mut first = None; // Some(None): the page brought nothing new
-                self.fill(id, res, |v, more| {
+                self.fill(id, |v| {
                     if let View::Shows(list) = v {
-                        first = Some(list.more_came(more));
+                        first = Some(list.more_came(res)?);
                     }
+                    Ok(())
                 });
                 match (first, self.stack.iter_mut().find(|s| s.id == id)) {
                     (Some(Some(key)), Some(s)) => s.menu.select_key(&key),
                     (Some(None), Some(_)) => self.toast("No more shows", false),
                     _ => {}
                 }
+                self.rebuild();
             }
-            Msg::Hits(id, res) => self.fill(id, res, |v, hits| {
+            Msg::Hits(id, res) => self.fill(id, |v| {
                 if let View::Sources(_, _, h) = v {
-                    *h = hits;
+                    *h = res?;
                 }
+                Ok(())
             }),
             // asked before logging out or in again: about another login
             Msg::Viewer(token, _) if token != self.client.token => {}
@@ -2006,35 +1832,29 @@ impl App {
                 }
             }
             // without them, the provider's episodes stay the show's own
-            Msg::Parts(id, key, token, changes, parts) => {
-                // looked up for other episode counts or login: their progress is stale
+            Msg::Parts(id, key, stamp, parts) => {
+                // looked up for other episode counts, or an earlier login
                 let wanted = self.parts.get(&id).is_some_and(|p| p.0 == key);
-                if !wanted || token != self.client.token {
+                let mut parts = parts.unwrap_or_default();
+                if !wanted
+                    || !self
+                        .entries
+                        .observe(stamp, parts.iter_mut().map(|p| &mut p.1))
+                {
                     return;
                 }
-                // and from before a save, which they may undo: asked again while it's shown
-                if lists::changes() != changes {
-                    self.parts.remove(&id);
-                    return;
-                }
-                let parts = parts.unwrap_or_default();
                 for (_, p) in &parts {
                     self.want_episodes(p);
                 }
                 self.parts.insert(id, (key, parts));
                 self.refresh();
             }
-            Msg::Cover(loaded) => self.posters.loaded(loaded),
             Msg::Resolved(m, ticket, res) => {
                 // a lookup from before the source was changed by hand
                 if !self.sources.answer(m.id, ticket, &res) {
                     return;
                 }
-                let want = self.resolving.remove(&m.id).flatten();
-                // the wait is over either way; playing it starts anew below
-                let waited = self
-                    .playing
-                    .take_if(|p| p.id == m.id && p.step == Some(SEARCHING));
+                let (id, want) = (m.id, self.resolving.remove(&m.id).flatten());
                 let here = matches!(&self.top().view, View::Show(s) | View::Episodes(s, _) if s.id == m.id);
                 match res {
                     Ok(_) => {
@@ -2059,70 +1879,24 @@ impl App {
                     }
                     Err(_) => {}
                 }
-                // same pop-up, it doesn't pop in a second time
-                if let (Some(w), Some(p)) = (waited, &mut self.playing)
-                    && p.id == w.id
-                {
-                    p.since = w.since;
+                // a play that waited on it and didn't start again (failed, or the page was left)
+                self.playback.give_up(id);
+                self.refresh();
+            }
+            Msg::Entry(done) => {
+                let Some(n) = self.entries.finish(done) else {
+                    return; // an earlier login's
+                };
+                self.toast(n.text, n.error);
+                // its list status question is answered, not another show's
+                if matches!(&self.top().view, View::Status(s) if Some(s.id) == n.closes) {
+                    self.stack.pop();
                 }
                 self.refresh();
             }
-            Msg::Saved(m, res) => {
-                self.saves_pending -= 1;
-                match res {
-                    Ok(entry) => {
-                        let text = match &entry {
-                            Some(e) => {
-                                let total = m.episodes.map_or("?".into(), |t| t.to_string());
-                                let list = list_label(&e.status);
-                                format!("Saved {} · {list} · {}/{total}", m.name(), e.progress)
-                            }
-                            None => format!("Removed {} from your list", m.name()),
-                        };
-                        self.toast(text, false);
-                        self.update_media(m.id, entry);
-                        lists::changed();
-                        // its list status question is answered, not another show's
-                        if matches!(&self.top().view, View::Status(s) if s.id == m.id) {
-                            self.stack.pop();
-                        }
-                        self.refresh();
-                    }
-                    Err(e) => self.toast(format!("{} not saved · {e}", m.name()), true),
-                }
-            }
-            Msg::Removed(m, Ok(())) => self.on_msg(Msg::Saved(m, Ok(None))),
-            Msg::Removed(m, Err(e)) => {
-                self.saves_pending -= 1;
-                self.toast(format!("{} not removed · {e}", m.name()), true);
-            }
-            Msg::Moved(m, entry) => {
-                self.saves_pending -= 1;
-                let total = m.episodes.map_or("?".into(), |t| t.to_string());
-                let now = entry.as_ref().map_or(0, |e| e.progress);
-                let why = format!("AniList has {now}/{total} now, try again");
-                self.toast(format!("{} not saved · {why}", m.name()), true);
-                // what's on screen was old: AniList's entry, and lists that refresh
-                self.update_media(m.id, entry);
-                lists::changed();
-                self.refresh();
-            }
-            Msg::PlayStep(id, ep, step) => {
-                if let Some(p) = &mut self.playing
-                    && p.id == id
-                    && p.ep == ep
-                {
-                    p.step = step;
-                }
-            }
-            Msg::Played(m, ep, res) => {
-                if self
-                    .playing
-                    .as_ref()
-                    .is_some_and(|p| p.id == m.id && p.ep == ep)
-                {
-                    self.playing = None;
-                }
+            Msg::PlayStep(attempt, step) => self.playback.step(attempt, step),
+            Msg::Played(attempt, m, ep, res) => {
+                self.playback.ended(attempt);
                 // not watched yet, as far as the show or the part it's in goes
                 let mark = self.progress(&m).unwatched(&ep);
                 match res {
@@ -2134,15 +1908,82 @@ impl App {
                     Ok(()) => {}
                 }
             }
+            Msg::Scanned(found) => {
+                self.entries.catch_up();
+                let again = self.scanning.take() == Some(true);
+                let shows;
+                (self.local, shows) = rescanned(found, &self.synced, &self.local);
+                // saved when downloaded, maybe weeks ago: their progress is AniList's now
+                let ids: Vec<u64> = (shows.iter().filter(|m| m.on_anilist()))
+                    .map(|m| m.id)
+                    .collect();
+                if self.ask_local && !ids.is_empty() {
+                    self.ask_local = false;
+                    let (c, stamp) = (self.client.clone(), self.entries.stamp());
+                    self.spawn(move || Msg::Local(stamp, c.shows(&ids)));
+                }
+                self.downloaded = Some(shows);
+                self.rebuild();
+                // and the one asked for meanwhile, for the rest
+                if again {
+                    self.scan_local(None);
+                }
+            }
             Msg::DlDone(label, res) => {
                 match res {
                     Ok(()) => self.toast(format!("Downloaded {label}"), false),
+                    // the queue paused and kept it
+                    Err(e) if ani::unreachable(&e) => self.toast(
+                        format!("Paused downloads · {e} · enter on a queued episode resumes them"),
+                        true,
+                    ),
                     Err(e) => self.toast(format!("{label}: {e}"), true),
                 }
                 self.refresh();
             }
             Msg::Release(v) => self.release = v,
         }
+    }
+}
+
+/// The row for choosing audio, saying the one now: shorter where the row is narrow.
+fn audio_item(label: &str, audio: &str) -> Item {
+    let mut it = Item::new("audio", label, ani::audio_label(audio));
+    it.short = ani::audio_short(audio).into();
+    it
+}
+
+/// A show's downloaded episodes, as (episode, file).
+type OnDisk = Vec<(String, PathBuf)>;
+
+/// Episodes on disk per show, and the downloaded shows, by name, as a rescan `found` them,
+/// but the shows `synced` on screen since it started as the screen found them (`local`):
+/// their episodes, and whether they're downloaded at all.
+fn rescanned(
+    found: Vec<(Media, OnDisk)>,
+    synced: &HashMap<u64, Option<Media>>,
+    local: &HashMap<u64, OnDisk>,
+) -> (HashMap<u64, OnDisk>, Vec<Media>) {
+    let (mut shows, mut eps): (Vec<Media>, HashMap<_, _>) = (found.into_iter())
+        .map(|(m, e)| (m.clone(), (m.id, e)))
+        .unzip();
+    for (id, show) in synced {
+        shows.retain(|m| m.id != *id);
+        shows.extend(show.clone());
+        match local.get(id) {
+            Some(e) => _ = eps.insert(*id, e.clone()),
+            None => _ = eps.remove(id),
+        }
+    }
+    shows.sort_by(|a, b| a.name().cmp(b.name()));
+    (eps, shows)
+}
+
+/// The show a screen is about, whose downloads it shows.
+fn shown(view: &View) -> Option<&Media> {
+    match view {
+        View::Show(m) | View::Episodes(m, _) | View::DlChoice(m, _) => Some(m),
+        _ => None,
     }
 }
 
@@ -2157,42 +1998,6 @@ fn no_match(m: &Media) -> &'static str {
 
 pub fn plural(n: usize, word: &str) -> String {
     format!("{n} {word}{}", if n == 1 { "" } else { "s" })
-}
-
-/// "episode 3", or "4 episodes".
-fn which(eps: &[String]) -> String {
-    match eps {
-        [one] => format!("episode {one}"),
-        _ => plural(eps.len(), "episode"),
-    }
-}
-
-/// What stopping deletes, as "deletes 230 MB", or nothing when nothing's there.
-fn deletes(parts: &[PathBuf]) -> String {
-    match parts {
-        [] => String::new(),
-        _ => format!("deletes {}", megabytes(parts)),
-    }
-}
-
-/// How far a download got, from its last progress line ("45.3% of ~ 529MiB at …", "93% · 26:16
-/// of 28:13"), for when it's paused and the rest of that line is stale.
-pub fn got_so_far(text: &str) -> Option<String> {
-    let pct: f64 = text
-        .split_whitespace()
-        .next()?
-        .strip_suffix('%')?
-        .parse()
-        .ok()?;
-    Some(format!("{}%", pct as u32))
-}
-
-/// Size of files on disk, as "910 MB".
-fn megabytes<'a>(files: impl IntoIterator<Item = &'a PathBuf>) -> String {
-    let bytes: u64 = (files.into_iter())
-        .map(|p| fs::metadata(p).map_or(0, |m| m.len()))
-        .sum();
-    format!("{} MB", bytes >> 20)
 }
 
 pub fn list_label(status: &str) -> &'static str {
@@ -2221,6 +2026,28 @@ pub fn in_child(name: &str, env: &[(&str, std::ffi::OsString)]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rescan_keeps_what_the_screen_found_since() {
+        use std::path::PathBuf;
+        let show = |id, name: &str| {
+            let mut m = super::Media {
+                id,
+                ..Default::default()
+            };
+            m.title.romaji = Some(name.into());
+            m
+        };
+        let eps = |e: &str| vec![(e.to_string(), PathBuf::from(format!("{e}.mp4")))];
+        // it found A, deleted on screen since, and C; not B, downloaded on screen since
+        let found = vec![(show(1, "A"), eps("1")), (show(3, "C"), eps("1"))];
+        let synced = super::HashMap::from([(1, None), (2, Some(show(2, "B")))]);
+        let local = super::HashMap::from([(2, eps("4"))]);
+        let (now, shows) = super::rescanned(found, &synced, &local);
+        let names: Vec<&str> = shows.iter().map(|m| m.name()).collect();
+        assert_eq!(names, ["B", "C"]);
+        assert!(!now.contains_key(&1) && now[&2] == eps("4") && now.contains_key(&3));
+    }
+
     #[test]
     fn token_from_url_or_bare() {
         assert_eq!(
@@ -2264,34 +2091,5 @@ mod tests {
             other
         );
         assert!(!just.contains('—') && !other.contains('—'));
-    }
-
-    #[test]
-    fn a_paused_download_says_how_far_it_got() {
-        assert_eq!(
-            super::got_so_far("45.3% of ~ 529.62MiB at 4.9MiB/s ETA 01:23").as_deref(),
-            Some("45%")
-        );
-        assert_eq!(
-            super::got_so_far("93% · 26:16 of 28:13").as_deref(),
-            Some("93%")
-        );
-        assert_eq!(super::got_so_far("26:16 so far"), None);
-        assert_eq!(super::got_so_far("starting"), None);
-    }
-
-    #[test]
-    fn episodes_get_what_their_download_state_allows() {
-        let s = |v: &[&str]| v.iter().map(|e| e.to_string()).collect::<Vec<_>>();
-        let file = std::path::PathBuf::from("A Episode 1.mp4");
-        let dl = super::Downloads {
-            on_disk: vec![("1".into(), file.clone())],
-            queued: s(&["1", "2"]),
-            elsewhere: s(&["3"]),
-        };
-        // a finished file wins over a queue entry still naming it
-        let (get, stop, delete) = dl.split(&s(&["1", "2", "3", "4"]));
-        assert_eq!((get, stop), (s(&["4"]), s(&["2"])));
-        assert_eq!(delete, [("1".to_string(), file.clone())]);
     }
 }

@@ -5,7 +5,7 @@
 //! writes the menu to a file. That way the provider scraping stays ani-cli's business and
 //! keeps working after `ani-cli -U`.
 
-use crate::anilist::Media;
+use crate::anilist::{Entry, Media};
 use crate::source::Source;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -60,7 +60,16 @@ rm -f "$log"
 [ $ok = 0 ] && mv -f "$out.part" "$out"
 "#;
 
+/// A test outside `in_child`: it gets a home of its own, so no test run touches the user's
+/// config, cache or downloads.
+fn testing() -> bool {
+    cfg!(test) && std::env::var_os("ANIHOP_CHILD").is_none()
+}
+
 pub fn home() -> PathBuf {
+    if testing() {
+        return std::env::temp_dir().join(format!("ani-hop-test-{}", std::process::id()));
+    }
     std::env::home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
@@ -68,7 +77,7 @@ pub fn home() -> PathBuf {
 fn xdg(var: &str, fallback: &str) -> PathBuf {
     std::env::var_os(var)
         .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
+        .filter(|p| p.is_absolute() && !testing())
         .unwrap_or_else(|| home().join(fallback))
 }
 
@@ -196,6 +205,11 @@ pub fn have(bin: &str) -> bool {
 pub fn deps() -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
     DEPS.into_iter()
         .filter(|d| !(cfg!(target_os = "macos") && d.0 == "xdg-open"))
+}
+
+/// A tool ani-hop works without, just plainer: ani-skip (which Homebrew doesn't have).
+pub fn optional(bin: &str) -> bool {
+    bin == "ani-skip"
 }
 
 pub fn missing_deps() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -415,32 +429,51 @@ pub fn plain(query: &str) -> &str {
     query.trim_start_matches('-')
 }
 
-/// ani-cli prints its errors with colors and line clears.
+/// What the system says, through ffmpeg or yt-dlp, when there's no connection: ani-cli got the
+/// episode's links, then the network went.
+const NO_NETWORK: [&str; 4] = [
+    "Network is unreachable",
+    "No route to host",
+    "Temporary failure in name resolution",
+    "nodename nor servname provided", // macOS
+];
+
+/// ani-cli's error, without the colors and line clears it prints it with. A connection error
+/// wins over what failed after it: ani-cli goes on past a server page it couldn't fetch and
+/// ends with "No sources found for dub!", and ani-hop's ffmpeg with "parts of it failed".
 pub fn last_error(stderr: &[u8]) -> String {
-    let s = String::from_utf8_lossy(stderr);
-    let line = s
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("ani-cli failed");
-    let mut out = String::new();
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => while chars.next().is_some_and(|c| !c.is_ascii_alphabetic()) {},
-            '\r' => out.clear(),
-            c => out.push(c),
+    let plain = |line: &str| {
+        let mut out = String::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\x1b' => while chars.next().is_some_and(|c| !c.is_ascii_alphabetic()) {},
+                '\r' => out.clear(),
+                c => out.push(c),
+            }
         }
-    }
-    let out = out.trim();
-    // "Connection error: could not fetch https://hianime.at/search?keyword=… (no HTTP res…"
-    match out.split_once("could not fetch ") {
-        Some((_, url)) => {
-            let host = url.split("://").nth(1).and_then(|u| u.split('/').next());
+        out.trim().to_string()
+    };
+    let s = String::from_utf8_lossy(stderr);
+    let lines: Vec<String> = s.lines().map(plain).filter(|l| !l.is_empty()).collect();
+    // "Connection error: could not fetch https://hianime.at/search?keyword=… (no HTTP res…",
+    // "[tcp @ 0x55d0] Connection to tcp://vault-12.owocdn.top:443 failed: Network is unreac…"
+    let offline =
+        |l: &&String| l.contains("could not fetch ") || NO_NETWORK.iter().any(|n| l.contains(n));
+    match lines.iter().find(offline) {
+        Some(l) => {
+            let host = l
+                .split_once("://")
+                .and_then(|(_, u)| u.split(['/', ':', ' ']).next());
             format!("can't reach {}", host.unwrap_or("its site"))
         }
-        None => out.to_string(),
+        None => lines.last().map_or("ani-cli failed".into(), String::clone),
     }
+}
+
+/// Whether `last_error` says ani-cli's site couldn't be reached: offline, worth another try.
+pub fn unreachable(error: &str) -> bool {
+    error.starts_with("can't reach ")
 }
 
 /// Feeds the child's output lines to `line` (also the ones redrawn with \r) until it
@@ -492,13 +525,14 @@ fn audio_path() -> PathBuf {
     config_dir().join("audio.json")
 }
 
-/// What a show plays with, as (key, label). The provider has Japanese and English audio,
-/// both with English subtitles, which mpv shows or keeps hidden (v switches).
-pub const AUDIO: [(&str, &str); 4] = [
-    ("raw", "Japanese · no subtitles"),
-    ("sub", "Japanese · English subtitles"),
-    ("dub", "English dub"),
-    ("dub+sub", "English dub · English subtitles"),
+/// What a show plays with, as (key, label, the label for a narrow row). The provider has
+/// Japanese and English audio, both with English subtitles, which mpv shows or keeps hidden
+/// (v switches).
+pub const AUDIO: [(&str, &str, &str); 4] = [
+    ("raw", "Japanese · no subtitles", "no subs"),
+    ("sub", "Japanese · English subtitles", "subtitled"),
+    ("dub", "English dub", "dubbed"),
+    ("dub+sub", "English dub · English subtitles", "dub + subs"),
 ];
 
 /// Audio chosen per AniList id and for "all" shows, as AUDIO keys.
@@ -527,6 +561,11 @@ fn audio_in(all: &HashMap<String, String>, id: Option<u64>) -> &'static str {
 
 pub fn audio_label(audio: &str) -> &'static str {
     AUDIO.iter().find(|a| a.0 == audio).map_or("", |a| a.1)
+}
+
+/// The audio's label for a row too narrow for `audio_label`, which says the same.
+pub fn audio_short(audio: &str) -> &'static str {
+    AUDIO.iter().find(|a| a.0 == audio).map_or("", |a| a.2)
 }
 
 pub fn dub(audio: &str) -> bool {
@@ -641,37 +680,30 @@ struct Downloaded {
 /// By show folder.
 type Index = std::collections::BTreeMap<PathBuf, Downloaded>;
 
-#[cfg(not(test))]
 fn index_path() -> PathBuf {
     config_dir().join("downloads.json")
 }
 
-#[cfg(test)]
-fn index_path() -> PathBuf {
-    std::env::temp_dir().join("ani-hop-test-index.json")
-}
-
 /// One lock file per download folder ever downloaded into; they stay, as one deleted
 /// could let a download and a removal both think they hold it.
-#[cfg(not(test))]
 fn holds_dir() -> PathBuf {
     cache_dir().join("folders")
-}
-
-#[cfg(test)]
-fn holds_dir() -> PathBuf {
-    std::env::temp_dir().join("ani-hop-test-folders")
 }
 
 /// A download folder held by a download into it, from making the folder until the download
 /// is done: it isn't dropped meanwhile, also while still empty. Several may hold one.
 pub struct Hold(#[allow(dead_code)] fs::File);
 
+/// FNV-1a, for ids and lock names that are saved or shared with other ani-hops: std's hasher
+/// may change between Rust releases.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    (bytes.iter()).fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ *b as u64).wrapping_mul(0x100_0000_01b3)
+    })
+}
+
 fn hold_file(dir: &Path) -> std::io::Result<fs::File> {
-    let hash = (dir.as_os_str().as_encoded_bytes().iter())
-        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-            (h ^ *b as u64).wrapping_mul(0x100_0000_01b3)
-        });
+    let hash = fnv1a(dir.as_os_str().as_encoded_bytes());
     fs::create_dir_all(holds_dir())?;
     fs::File::create(holds_dir().join(format!("{hash:016x}.lock")))
 }
@@ -722,10 +754,10 @@ pub fn folder(m: &Media) -> PathBuf {
 /// Two AniList shows with one name (a remake) don't share a folder: the second one's name
 /// gets its AniList id. One ani-cli found shares it with the AniList show of its name.
 fn folder_in(root: &Path, all: Index, m: &Media) -> PathBuf {
-    if let Some((_, p)) = shows_in(root, all.clone())
-        .into_iter()
-        .find(|(s, _)| s.id == m.id)
-    {
+    // only this show's folders are looked at: another's on a disk asleep mustn't hold it up
+    let mine = (all.iter()).filter(|(_, d)| d.media.id == m.id);
+    let mine: Index = mine.map(|(p, d)| (p.clone(), d.clone())).collect();
+    if let Some((_, p)) = shows_in(root, mine).into_iter().next() {
         return p;
     }
     let name = m.name().replace('/', "∕");
@@ -751,10 +783,96 @@ pub fn refresh_shows(fresh: &[Media]) {
     });
 }
 
+/// The user's AniList Entries as last read or saved, by show, each with when (`tick`): what
+/// the Downloads list shows, also offline in a later session.
+pub type Learnt = HashMap<u64, (Option<Entry>, u64)>;
+
+fn learnt_path() -> PathBuf {
+    cache_dir().join("entries.json")
+}
+
+/// The Entries kept (`learn`), by any ani-hop.
+pub fn learnt() -> Learnt {
+    read_json(&learnt_path())
+}
+
+/// Keeps `entries` as AniList had them at `at` (`tick`), for the shows downloaded, unless
+/// newer ones are kept: a save, of this ani-hop or another, a list read before or after it,
+/// in any order. Other shows aren't kept, so an old save of one can't outlast a fresher list
+/// once it's downloaded. `queued`: a download of them was just queued, which keeps them too,
+/// with what this session knew of them, so only over older ones.
+pub fn learn(entries: impl IntoIterator<Item = (u64, Option<Entry>)>, at: u64, queued: bool) {
+    let path = learnt_path();
+    let edit = || -> std::io::Result<()> {
+        fs::create_dir_all(cache_dir())?;
+        let lock = fs::File::create(path.with_extension("lock"))?;
+        lock.lock()?;
+        let mut all: Learnt = read_json(&path);
+        seen(&all);
+        let downloaded: std::collections::HashSet<u64> =
+            index().values().map(|d| d.media.id).collect();
+        let mut changed = false;
+        for (id, entry) in entries {
+            let kept = all.get(&id).map(|k| k.1);
+            let ours = queued || kept.is_some() || downloaded.contains(&id);
+            let newer = kept.is_none_or(|t| t < at || t == at && !queued);
+            if ours && newer {
+                all.insert(id, (entry, at));
+                changed = true;
+            }
+        }
+        if changed {
+            write_json(&path, &all)?;
+        }
+        Ok(())
+    };
+    let _ = edit();
+}
+
+/// The last `tick`.
+static CLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// Now, as one number that orders AniList's Entries (`learn`): ms since 1970, but always past
+/// every tick before it in this ani-hop and every one kept, by any ani-hop, also before this
+/// one started, so a clock set back or two reads in one ms still come in order. A save's,
+/// taken in its turn (`entries::turn`), comes after every save before it.
+/// shortcut: reads another ani-hop still has out aren't seen, so with the clock set back while
+/// two run, a read the other asked for before a save here can still be kept over the save;
+/// a counter file every tick takes in turn if that ever shows up.
+pub fn tick() -> u64 {
+    seen(&learnt());
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    let mut last = CLOCK.load(Ordering::SeqCst);
+    loop {
+        let next = now.max(last.saturating_add(1));
+        match CLOCK.compare_exchange_weak(last, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return next,
+            Err(now_last) => last = now_last,
+        }
+    }
+}
+
+/// Ticks from here on come after everything kept.
+fn seen(all: &Learnt) {
+    CLOCK.fetch_max(
+        all.values().map(|k| k.1).max().unwrap_or(0),
+        Ordering::SeqCst,
+    );
+}
+
 /// Downloaded shows and their folders, by name: also those downloaded before the download
-/// folder changed, which stay where they are.
+/// folder changed, which stay where they are. Each with its Entry as last learnt.
 pub fn local_shows() -> Vec<(Media, PathBuf)> {
-    shows_in(&download_root(), index())
+    let learnt = learnt();
+    let mut shows = shows_in(&download_root(), index());
+    for (m, _) in &mut shows {
+        if let Some((entry, _)) = learnt.get(&m.id) {
+            m.media_list_entry = entry.clone();
+        }
+    }
+    shows
 }
 
 /// A show in two folders (downloaded again after the download folder changed, before 0.7)
@@ -955,7 +1073,12 @@ pub fn prepare_in(root: &Path, m: &Media) -> Result<(PathBuf, Hold), String> {
         made = held.map_err(|e| e.to_string()).map(|hold| {
             let d = all.entry(dir.clone()).or_default();
             if replaces(m, &d.media) {
+                // the show's Entry stays the index's: a queued job's is from when it was queued
+                let kept = (d.media.id == m.id).then(|| d.media.media_list_entry.take());
                 d.media = m.clone();
+                if let Some(entry) = kept {
+                    d.media.media_list_entry = entry;
+                }
             }
             (dir, hold)
         });
@@ -1126,10 +1249,55 @@ mod tests {
     use super::*;
 
     #[test]
+    fn keeps_the_newest_entries_of_downloaded_or_queued_shows() {
+        let at = |progress| {
+            let status = "CURRENT".into();
+            Some(Entry {
+                id: 1,
+                status,
+                progress,
+            })
+        };
+        let (queued, other) = (71_001, 71_002);
+        learn([(other, at(6))], 10, false);
+        learn([(queued, at(5))], 10, true);
+        learn([(queued, at(4))], 9, false);
+        let kept = || {
+            let kept: Learnt = read_json(&learnt_path());
+            (
+                kept.contains_key(&other),
+                kept[&queued].0.as_ref().map(|e| e.progress),
+            )
+        };
+        assert_eq!(kept(), (false, Some(5)), "the newest, of shows queued");
+        // queuing again keeps what this session knew only over older ones: another ani-hop may
+        // have saved at the same moment since
+        learn([(queued, at(6))], 11, false);
+        learn([(queued, at(5))], 11, true);
+        assert_eq!(kept().1, Some(6));
+    }
+
+    #[test]
+    fn tests_never_touch_the_real_home() {
+        let tmp = std::env::temp_dir();
+        assert!(home().starts_with(&tmp) && config_dir().starts_with(&tmp));
+        assert!(cache_dir().starts_with(&tmp) && index_path().starts_with(&tmp));
+    }
+
+    #[test]
     fn says_which_site_ani_cli_cant_reach() {
         let err = b"\x1b[2K\x1b[1;31mConnection error: could not fetch https://hianime.at/search?keyword=x (no HTTP response; curl exit 7)\x1b[0m\n";
         assert_eq!(last_error(err), "can't reach hianime.at");
         assert_eq!(last_error(b"No results found!\n"), "No results found!");
+        // a server page it couldn't fetch, then no stream: offline, not a missing dub
+        let later = b"\x1b[1;31mConnection error: could not fetch https://hianime.at/ajax/x (no HTTP response; curl exit 6)\x1b[0m\nNo sources found for dub!\n\x1b[0m\n";
+        assert_eq!(last_error(later), "can't reach hianime.at");
+        assert!(unreachable(&last_error(later)) && !unreachable("No results found!"));
+        // the network went once ani-cli had the episode's links: ffmpeg's or yt-dlp's words
+        let cut = b"[tcp @ 0x55d0] Connection to tcp://vault-12.owocdn.top:443 failed: Network is unreachable\n[in#0 @ 0x55d1] Error opening input: Network is unreachable\nparts of it failed to download\n";
+        assert_eq!(last_error(cut), "can't reach vault-12.owocdn.top");
+        let dns = b"ERROR: Unable to download webpage: <urlopen error [Errno -3] Temporary failure in name resolution>\n";
+        assert_eq!(last_error(dns), "can't reach its site");
     }
 
     #[test]

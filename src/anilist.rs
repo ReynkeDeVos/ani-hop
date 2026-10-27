@@ -124,12 +124,10 @@ const ANI_CLI_ONLY: u64 = 1 << 63;
 impl Media {
     /// A show found through ani-cli alone. The id hashes the search and the entry, not the
     /// shown name, so the same pick has it again next time and a provider's own "X (2)" can't
-    /// take a numbered one's (FNV-1a: std's hasher may change between releases).
+    /// take a numbered one's.
     pub fn from_ani_cli(name: &str, at: crate::source::Source) -> Media {
         let key = format!("{}\n{}\n{}", at.query, at.title, at.nth);
-        let hash = (key.bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-            (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
-        });
+        let hash = crate::ani::fnv1a(key.as_bytes());
         Media {
             id: ANI_CLI_ONLY | hash,
             title: Title {
@@ -153,15 +151,6 @@ impl Media {
             romaji.or(english)
         };
         pick.unwrap_or("?")
-    }
-
-    pub fn progress(&self) -> u32 {
-        self.media_list_entry.as_ref().map_or(0, |e| e.progress)
-    }
-
-    /// Up to the AniList progress everything counts as watched.
-    pub fn watched(&self, ep: &str) -> bool {
-        self.progress() > 0 && crate::ani::ep_num(ep) <= self.progress() as f64
     }
 
     /// Episodes that are out right now (None = unknown, 0 before the first one airs). A list
@@ -232,6 +221,17 @@ pub struct EpInfo {
     pub aired: Option<String>,
 }
 
+impl EpInfo {
+    /// Its title and summary once it's watched; before, they'd give things away (its air date
+    /// doesn't).
+    pub fn told(&self, watched: bool) -> (&str, &str) {
+        match watched {
+            true => (&self.title, &self.about),
+            false => ("", ""),
+        }
+    }
+}
+
 /// Titles and summaries of every episode, from ani.zip (keyed by AniList id, one request a
 /// show, served from Cloudflare's cache) as AniList has none per episode.
 pub fn episodes(id: u64) -> Result<HashMap<String, EpInfo>, String> {
@@ -261,9 +261,6 @@ fn episode_info(v: &Value) -> HashMap<String, EpInfo> {
     })
     .collect()
 }
-
-/// Changes to the user's list go out one at a time, in the order they were made.
-static SAVES: Mutex<()> = Mutex::new(());
 
 /// Until when AniList asked us to hold off; every API call waits for it.
 static PAUSED_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
@@ -430,38 +427,17 @@ impl Client {
         let first = |id| Ok(episodes(id)?.get("1").and_then(|e| e.number));
         follow_sequels(m, last, |id| self.sequel(id), first)
     }
+}
 
-    pub fn save(
-        &self,
-        media: u64,
-        status: Option<&str>,
-        progress: Option<u32>,
-    ) -> Result<Entry, String> {
-        let _turn = SAVES.lock().unwrap_or_else(|e| e.into_inner());
-        self.write(media, status, progress)
-    }
-
-    /// Saves progress `to` unless AniList's progress isn't `was` anymore, what the question
-    /// showed; then nothing, and the entry as it is now. Other saves wait, so none slips between.
-    pub fn save_progress(
-        &self,
-        media: u64,
-        status: &str,
-        was: u32,
-        to: u32,
-    ) -> Result<Result<Entry, Option<Entry>>, String> {
-        let _turn = SAVES.lock().unwrap_or_else(|e| e.into_inner());
+/// The user's list, written one change at a time by entries.rs.
+impl crate::entries::AniList for Client {
+    fn entry(&self, media: u64) -> Result<Option<Entry>, String> {
         let q = "query($id: Int) { Media(id: $id) { mediaListEntry { id status progress } } }";
         let mut d = self.gql(q, json!({ "id": media }))?;
-        let now: Option<Entry> = serde_json::from_value(d["Media"]["mediaListEntry"].take())
-            .map_err(|e| e.to_string())?;
-        match now.as_ref().map_or(0, |e| e.progress) == was {
-            true => self.write(media, Some(status), Some(to)).map(Ok),
-            false => Ok(Err(now)),
-        }
+        serde_json::from_value(d["Media"]["mediaListEntry"].take()).map_err(|e| e.to_string())
     }
 
-    fn write(
+    fn save(
         &self,
         media: u64,
         status: Option<&str>,
@@ -481,8 +457,7 @@ impl Client {
         serde_json::from_value(d["SaveMediaListEntry"].clone()).map_err(|e| e.to_string())
     }
 
-    pub fn remove(&self, entry: u64) -> Result<(), String> {
-        let _turn = SAVES.lock().unwrap_or_else(|e| e.into_inner());
+    fn remove(&self, entry: u64) -> Result<(), String> {
         let q = "mutation($id: Int) { DeleteMediaListEntry(id: $id) { deleted } }";
         self.gql(q, json!({ "id": entry })).map(|_| ())
     }

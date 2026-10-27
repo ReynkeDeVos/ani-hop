@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -459,8 +459,17 @@ impl Queue {
             Ok(s) => s,
             Err(e) => {
                 let mut st = self.lock();
-                st.jobs.retain(|j| j.id != job.id);
-                let _ = self.save(&mut st);
+                // stopped while it was looked up: nothing to pause or say
+                if !st.jobs.iter().any(|j| j.id == job.id) {
+                    return true;
+                }
+                // offline: it stays queued, and downloads wait as after a pause
+                if ani::unreachable(&e) {
+                    st.paused = true;
+                } else {
+                    st.jobs.retain(|j| j.id != job.id);
+                    let _ = self.save(&mut st);
+                }
                 drop(st);
                 done(m.name().to_string(), Err(e));
                 return true;
@@ -512,6 +521,14 @@ impl Queue {
             st.now.take_if(|n| n.id == m.id && n.ep == ep);
             // gone from the job already: stopped (and maybe queued again since, which stays)
             let had = mine(&st);
+            // offline: it stays queued, keeping what it got, and downloads wait as after a pause
+            if had && res.as_ref().is_err_and(|e| ani::unreachable(e)) {
+                st.paused = true;
+                drop(st);
+                drop(_claim);
+                done(label, res);
+                return true;
+            }
             // done with it, also where another job of the show has it
             for j in st.jobs.iter_mut().filter(|j| had && j.media.id == m.id) {
                 if let Some(e) = &mut j.eps {
@@ -630,10 +647,7 @@ impl Queue {
     }
 
     fn try_claim(&self, dir: &Path, ep: &str) -> Result<Option<EpisodeLock>, String> {
-        let key = format!("{}\n{ep}", dir.display());
-        let hash = (key.bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-            (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
-        });
+        let hash = ani::fnv1a(format!("{}\n{ep}", dir.display()).as_bytes());
         let locks = self.0.dir.join("locks");
         fs::create_dir_all(&locks).map_err(|e| e.to_string())?;
         let path = locks.join(format!("{hash:016x}.lock"));
@@ -710,16 +724,19 @@ fn read_queue(path: &Path) -> Vec<Job> {
 /// Ends an ani-cli download and what it runs.
 fn kill(pid: u32) {
     let pid = pid.to_string();
+    // without stderr: one that just ended would print "No such process" over the screen
+    let quiet = |cmd: &str, args: &[&str]| {
+        let _ = Command::new(cmd).args(args).stderr(Stdio::null()).status();
+    };
     // The ani-cli shell first: it holds the signal until yt-dlp is gone and then exits.
     // Signalled after yt-dlp, it falls back to ffmpeg and keeps downloading after we quit.
-    let _ = Command::new("kill").args(["-TERM", &pid]).status();
-    let _ = Command::new("pkill").args(["-TERM", "-P", &pid]).status();
+    quiet("kill", &["-TERM", &pid]);
+    quiet("pkill", &["-TERM", "-P", &pid]);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::process::Stdio;
     use std::sync::mpsc::Receiver;
     use std::time::{Duration, Instant};
 
@@ -736,9 +753,15 @@ mod tests {
         fn prepare(&self, m: &Media) -> Result<(PathBuf, ani::Hold), String> {
             ani::prepare_in(&self.root, m)
         }
-        fn resolve(&self, _: &Media, lookup: Lookup, _: bool) -> Result<Source, String> {
+        fn resolve(&self, m: &Media, lookup: Lookup, _: bool) -> Result<Source, String> {
             match lookup {
                 Lookup::Ready(s) | Lookup::Check(s) => Ok(s),
+                Lookup::Resolve if self.script == OFFLINE => Err("can't reach hianime.at".into()),
+                // a lookup that takes a moment, then can't reach the provider
+                Lookup::Resolve if m.name() == "Unreachable" => {
+                    thread::sleep(Duration::from_millis(300));
+                    Err("can't reach hianime.at".into())
+                }
                 Lookup::Resolve => Ok(source()),
             }
         }
@@ -758,6 +781,10 @@ mod tests {
 
     const QUICK: &str =
         "printf '[download]  50.0%% of ~ 1.00MiB at 1.00MiB/s ETA 00:01\\n'; printf x > \"$OUT\"";
+    /// what ani-cli says without a connection; a show to look up fails the same way
+    const OFFLINE: &str = "echo 'Connection error: could not fetch https://hianime.at/x (no HTTP response; curl exit 6)' >&2; exit 1";
+    /// what ani-hop's ffmpeg says when the connection goes mid-episode
+    const CUT_OFF: &str = "echo '[tcp @ 0x55d0] Connection to tcp://vault-12.owocdn.top:443 failed: Network is unreachable' >&2; echo 'parts of it failed to download' >&2; exit 1";
     /// writes a piece and waits to be stopped, unless it was stopped before: then it finishes
     const SLOW: &str = "if [ -e \"$OUT.again\" ]; then printf x > \"$OUT\"; exit; fi; : > \"$OUT.again\"; printf '[download]  10.0%% of ~ 1.00MiB at 1.00MiB/s ETA 00:09\\n'; : > \"$OUT.part\"; exec sleep 30";
 
@@ -1025,6 +1052,65 @@ mod tests {
         q.quit();
         wait("stopped", || q.lock().running.is_none());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_show_stopped_while_looked_up_doesnt_pause_the_next() {
+        let dir = temp("cancelled");
+        let (q, done) = queue(&dir, "a", QUICK);
+        let mut slow = job(&["1"]);
+        slow.media.id += 1;
+        slow.media.title.romaji = Some("Unreachable".into());
+        slow.lookup = Lookup::Resolve;
+        q.enqueue(slow.clone()).unwrap();
+        thread::sleep(Duration::from_millis(50)); // being looked up
+        q.stop(&slow.media, &["1".into()], None, &[]).unwrap();
+        q.enqueue(job(&["2"])).unwrap();
+        let (label, res) = done.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            (label.as_str(), res),
+            ("Show E2", Ok(())),
+            "nothing of the stopped one"
+        );
+        assert!(!q.snapshot().paused);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn going_offline_pauses_downloads_and_keeps_them() {
+        // the show can't be looked up, its episode can't be fetched, or the connection goes
+        // while ffmpeg downloads it
+        for (name, lookup, script, said) in [
+            ("offline-lookup", Lookup::Resolve, OFFLINE, "hianime.at"),
+            (
+                "offline-episode",
+                Lookup::Ready(source()),
+                OFFLINE,
+                "hianime.at",
+            ),
+            (
+                "offline-ffmpeg",
+                Lookup::Ready(source()),
+                CUT_OFF,
+                "vault-12.owocdn.top",
+            ),
+        ] {
+            let dir = temp(name);
+            let (q, done) = queue(&dir, "a", script);
+            let mut j = job(&["1", "2"]);
+            j.lookup = lookup;
+            q.enqueue(j).unwrap();
+            let (_, res) = done.recv_timeout(Duration::from_secs(10)).unwrap();
+            assert_eq!(res, Err(format!("can't reach {said}")));
+            wait("paused", || q.snapshot().paused);
+            let quiet = done.recv_timeout(Duration::from_millis(300));
+            assert!(quiet.is_err(), "{name}: one error, then it waits");
+            assert_eq!(q.snapshot().pending, 2, "{name}: nothing dropped");
+            let saved = read_queue(&q.file());
+            assert_eq!(saved[0].eps.as_deref(), Some(&["1".into(), "2".into()][..]));
+            q.quit();
+            fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     #[test]

@@ -25,6 +25,8 @@ pub struct List {
     pub shows: Vec<Media>,
     feed: Feed,
     cache: Option<PathBuf>,
+    /// its refresh is on its way
+    refreshing: bool,
 }
 
 /// A refresh on its way, and the list changes there were when it was asked for.
@@ -65,13 +67,20 @@ fn outdate(path: &PathBuf) {
 }
 
 impl List {
-    /// The download folder's shows.
-    pub fn local(shows: Vec<Media>) -> List {
+    /// The download folder's shows, as its last rescan found them; before the first one,
+    /// loading until `scanned` brings them.
+    pub fn local(shows: Option<Vec<Media>>) -> List {
         List {
-            shows,
+            refreshing: shows.is_none(),
+            shows: shows.unwrap_or_default(),
             feed: Feed::Local,
             cache: None,
         }
+    }
+
+    /// What a rescan of the download folder found.
+    pub fn scanned(&mut self, shows: Vec<Media>) {
+        (self.shows, self.refreshing) = (shows, false);
     }
 
     /// A list as its cache has it at `now`, and the refresh to ask for unless that's fresh
@@ -97,61 +106,68 @@ impl List {
             }
         }
         let ask = (!fresh).then(|| Ask(changes()));
-        (List { shows, feed, cache }, ask)
+        let refreshing = ask.is_some();
+        let list = List {
+            shows,
+            feed,
+            cache,
+            refreshing,
+        };
+        (list, ask)
     }
 
-    /// Takes a refresh's shows, and caches them: as they were when asked for, or not as
-    /// fresh when the user's list changed meanwhile. Only for a list still open: a closed
-    /// one's late answer would overwrite what a newer one cached, its pages from More… too.
-    pub fn refreshed(&mut self, ask: Ask, shows: Vec<Media>) {
+    /// Takes a refresh's answer: its shows, cached as they were when asked for, or not as
+    /// fresh when the user's list changed meanwhile. A failed one keeps what's shown (the
+    /// cache, usable offline) and says why. Only for a list still open: a closed one's late
+    /// answer would overwrite what a newer one cached, its pages from More… too.
+    pub fn refreshed(&mut self, ask: Ask, res: Result<Vec<Media>, String>) -> Result<(), String> {
+        self.refreshing = false;
+        let shows = res?;
         if let Feed::Pages(_, next, _) = &mut self.feed {
             *next = (shows.len() >= PER_PAGE).then_some(2);
         }
         self.shows = shows;
-        let Some(path) = &self.cache else {
-            return;
-        };
-        let _ = ani::write_json(path, &(&self.shows, self.more_page()));
-        if changes() != ask.0 {
-            outdate(path);
+        if let Some(path) = &self.cache {
+            let _ = ani::write_json(path, &(&self.shows, self.more_page()));
+            if changes() != ask.0 {
+                outdate(path);
+            }
         }
+        Ok(())
     }
 
     /// The next page to fetch for "More…": (its sort, its number), none while one is on its
     /// way, or why there's none. One page at a time; the first one's refresh would drop
     /// what comes after it.
-    pub fn more(&mut self, refreshing: bool) -> Result<Option<(String, u32)>, &'static str> {
+    pub fn more(&mut self) -> Result<Option<(String, u32)>, &'static str> {
         let Feed::Pages(sort, next, fetching) = &mut self.feed else {
             return Ok(None);
         };
         let Some(page) = *next else {
             return Err("No more shows");
         };
-        match (refreshing, *fetching) {
-            (true, true) => Ok(None),
-            (true, false) => Err("Still refreshing the first page…"),
-            _ => {
+        match (*fetching, self.refreshing) {
+            (true, _) => Ok(None),
+            (false, true) => Err("Still refreshing the first page…"),
+            (false, false) => {
                 *fetching = true;
                 Ok(Some((sort.clone(), page)))
             }
         }
     }
 
-    /// A page "More…" asked for came, or didn't: the next one can be asked for.
-    pub fn fetched(&mut self) {
-        if let Feed::Pages(_, _, fetching) = &mut self.feed {
-            *fetching = false;
-        }
-    }
-
-    /// Adds the next page's shows; rankings shift between requests, so a show may come round
-    /// again and is left out. The first one new, if any. Cached with every page, while the
-    /// first page's age stays the cache's, so loading more never keeps that page longer
-    /// than an hour.
-    pub fn more_came(&mut self, more: Vec<Media>) -> Option<String> {
-        if let Feed::Pages(_, next, _) = &mut self.feed {
-            *next = next.filter(|_| more.len() >= PER_PAGE).map(|n| n + 1);
-        }
+    /// Takes the page "More…" asked for: its shows (rankings shift between requests, so a
+    /// show may come round again and is left out) and the first one new, if any. A failed one
+    /// adds nothing and can be asked for again. Cached with every page, while the first
+    /// page's age stays the cache's, so loading more never keeps that page longer than an
+    /// hour.
+    pub fn more_came(&mut self, res: Result<Vec<Media>, String>) -> Result<Option<String>, String> {
+        let Feed::Pages(_, next, fetching) = &mut self.feed else {
+            return Ok(None);
+        };
+        *fetching = false;
+        let more = res?;
+        *next = next.filter(|_| more.len() >= PER_PAGE).map(|n| n + 1);
         let more: Vec<Media> = (more.into_iter())
             .filter(|m| self.shows.iter().all(|o| o.id != m.id))
             .collect();
@@ -165,7 +181,7 @@ impl List {
                 let _ = file.and_then(|f| f.set_modified(t));
             }
         }
-        self.shows.get(start).map(|m| m.id.to_string())
+        Ok(self.shows.get(start).map(|m| m.id.to_string()))
     }
 
     /// The page "More…" fetches next, for a ranking that has one.
@@ -188,6 +204,11 @@ impl List {
     /// A ranking whose next page is on its way.
     pub fn fetching(&self) -> bool {
         matches!(self.feed, Feed::Pages(_, _, true))
+    }
+
+    /// Its refresh or its next page is on its way.
+    pub fn loading(&self) -> bool {
+        self.refreshing || self.fetching()
     }
 
     pub fn paged(&self) -> bool {
@@ -253,15 +274,23 @@ mod tests {
         let dir = temp("more");
         let path = dir.join("0-TRENDING_DESC.json");
         let (mut list, ask) = List::open(trending(), Some(path.clone()), SystemTime::now());
-        assert_eq!(list.more(true), Err("Still refreshing the first page…"));
-        list.refreshed(ask.unwrap(), shows(0..50));
+        assert!(list.loading());
+        assert_eq!(list.more(), Err("Still refreshing the first page…"));
+        list.refreshed(ask.unwrap(), Ok(shows(0..50))).unwrap();
+        assert!(!list.loading());
         let first = written(&path);
-        assert_eq!(list.more(false), Ok(Some(("TRENDING_DESC".into(), 2))));
-        assert_eq!(list.more(true), Ok(None), "on its way");
-        list.fetched();
+        let page = |n| Ok(Some(("TRENDING_DESC".to_string(), n)));
+        assert_eq!(list.more(), page(2));
+        assert_eq!(list.more(), Ok(None), "on its way");
+        assert!(list.loading());
         // the ranking shifted: 45 to 49 come round again
-        assert_eq!(list.more_came(shows(45..95)).as_deref(), Some("50"));
+        assert_eq!(list.more_came(Ok(shows(45..95))), Ok(Some("50".into())));
         assert_eq!((list.shows.len(), list.more_page()), (95, Some(3)));
+        // a page that fails adds nothing and can be asked for again
+        assert_eq!(list.more(), page(3));
+        assert_eq!(list.more_came(Err("offline".into())), Err("offline".into()));
+        assert!(!list.loading() && list.shows.len() == 95);
+        assert_eq!(list.more(), page(3));
         assert_eq!(
             written(&path),
             first,
@@ -270,9 +299,9 @@ mod tests {
         let (again, ask) = List::open(trending(), Some(path.clone()), first);
         assert!(ask.is_none() && again.shows.len() == 95 && again.more_page() == Some(3));
         // a short page is the last
-        assert_eq!(list.more_came(shows(95..96)).as_deref(), Some("95"));
-        assert_eq!(list.more(false), Err("No more shows"));
-        assert_eq!(list.more_came(shows(0..3)), None, "nothing new");
+        assert_eq!(list.more_came(Ok(shows(95..96))), Ok(Some("95".into())));
+        assert_eq!(list.more(), Err("No more shows"));
+        assert_eq!(list.more_came(Ok(shows(0..3))), Ok(None), "nothing new");
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -283,12 +312,28 @@ mod tests {
         let (mut list, ask) = List::open(Feed::Whole, Some(path.clone()), SystemTime::now());
         // what changed() does besides outdating the real cache
         CHANGES.fetch_add(1, Ordering::Relaxed);
-        list.refreshed(ask.unwrap(), shows(0..3));
+        list.refreshed(ask.unwrap(), Ok(shows(0..3))).unwrap();
         assert_eq!(list.shows.len(), 3, "shown");
         assert_eq!(written(&path), UNIX_EPOCH, "but asked for again next time");
-        let (mut list, ask) = List::open(Feed::Whole, Some(path.clone()), SystemTime::now());
-        list.refreshed(ask.unwrap(), shows(0..2));
-        assert!(written(&path) > UNIX_EPOCH);
+        // fresh when no list changed meanwhile, which other tests do at any time
+        let fresh = (0..20).any(|_| {
+            // a try that lost its race may have left a fresh cache, which asks for nothing
+            let _ = fs::remove_file(&path);
+            let (mut list, ask) = List::open(Feed::Whole, Some(path.clone()), SystemTime::now());
+            let asked = changes();
+            list.refreshed(ask.unwrap(), Ok(shows(0..2))).unwrap();
+            changes() == asked && written(&path) > UNIX_EPOCH
+        });
+        assert!(fresh);
+        // a refresh that fails keeps the cache on screen, offline too
+        let (mut list, ask) = List::open(
+            Feed::Whole,
+            Some(path.clone()),
+            UNIX_EPOCH + Duration::from_secs(1 << 40),
+        );
+        assert!(list.loading() && list.shows.len() == 2);
+        assert!(list.refreshed(ask.unwrap(), Err("offline".into())).is_err());
+        assert!(!list.loading() && list.shows.len() == 2);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -39,6 +39,12 @@ Finding a show's source by searching its titles and matching them to the provide
 A source the user chose by hand with Change source, used from then on.
 _Avoid_: override
 
+## Playing
+
+**Playback attempt**:
+One start of an episode, from enter until its player closes: a downloaded file, or a stream from the show's source.
+_Avoid_: playback session
+
 ## Downloads
 
 **Download queue**:
@@ -52,6 +58,9 @@ The queues of ani-hops that are gone, which the next start resumes or drops.
 
 **Show folder**:
 The folder one show's episodes download into, inside the download folder of the time.
+
+**Show downloads**:
+Where a show's episodes stand with downloads (on disk, queued, queued by another ani-hop, downloading or paused), and what enter does with the ones picked.
 
 ## Screen
 
