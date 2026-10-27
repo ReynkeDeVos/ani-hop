@@ -39,13 +39,18 @@ impl Item {
     }
 }
 
-/// `s` as the matcher reads it: one char per grapheme, its first, so where it matched counts
-/// graphemes as a row draws them. nucleo's own `Utf32Str::new` falls back to counting bytes
-/// when every grapheme starts with an ASCII char, as in a decomposed "é".
-/// Always chars, and a space after them, around two bugs in nucleo-matcher 0.3.1: an ASCII
-/// haystack fails a case-sensitive ^, $ or ^…$ unless the needle is all of it, and a char
-/// haystack never has a substring (', !) found at its very end. ^, $ and words skip the space.
-fn haystack<'a>(s: &'a str, buf: &'a mut Vec<char>) -> Utf32Str<'a> {
+/// `s` as the matcher reads it for an atom of `kind`: one char per grapheme, its first, so
+/// where it matched counts graphemes as a row draws them. nucleo's own `Utf32Str::new` falls
+/// back to counting bytes when every grapheme starts with an ASCII char, as in a decomposed
+/// "é". Around three bugs in nucleo-matcher 0.3.1: ASCII text stays bytes, as chars score a
+/// one-letter atom by the wrong neighbour, but is chars for ^, $ and ^…$, which compare all of
+/// the bytes when case-sensitive; and chars get one more that nothing matches for ' and !,
+/// which never find a substring that ends them.
+fn haystack<'a>(s: &'a str, kind: AtomKind, buf: &'a mut Vec<char>) -> Utf32Str<'a> {
+    let exact = matches!(kind, AtomKind::Exact | AtomKind::Prefix | AtomKind::Postfix);
+    if s.is_ascii() && !exact {
+        return Utf32Str::Ascii(s.as_bytes());
+    }
     buf.clear();
     match s.is_ascii() {
         true => buf.extend(s.chars()),
@@ -55,7 +60,9 @@ fn haystack<'a>(s: &'a str, buf: &'a mut Vec<char>) -> Utf32Str<'a> {
             buf.extend(graphemes.filter_map(|g| g.symbol.chars().next()));
         }
     }
-    buf.push(' ');
+    if matches!(kind, AtomKind::Substring) {
+        buf.push('\u{FFFF}'); // a noncharacter: no query has it
+    }
     Utf32Str::Unicode(buf)
 }
 
@@ -132,10 +139,13 @@ impl Menu {
         let mut scored: Vec<(usize, u32, Vec<u32>)> = Vec::new();
         for (i, item) in self.items.iter().enumerate() {
             let mut idx = Vec::new();
-            let hay = haystack(&item.label, &mut buf);
-            let label = pattern.indices(hay, &mut self.matcher, &mut idx);
+            // as `Pattern::indices`, with each atom's own haystack
+            let label = pattern.atoms.iter().try_fold(0, |score, atom| {
+                let hay = haystack(&item.label, atom.kind, &mut buf);
+                Some(score + atom.indices(hay, &mut self.matcher, &mut idx)? as u32)
+            });
             let about = || {
-                let hay = haystack(&item.about, &mut buf);
+                let hay = haystack(&item.about, AtomKind::Substring, &mut buf);
                 words.score(hay, &mut self.matcher).map(|_| 0) // after every label match
             };
             if let Some(score) = label.or_else(about) {
@@ -310,6 +320,44 @@ mod tests {
         // what an episode is about, by its last word
         m.items[2].about = "A town where everyone sleeps".into();
         assert_eq!(found(&mut m, "sleeps"), ["Other"]);
+    }
+
+    #[test]
+    fn plain_titles_score_as_nucleo_scores_them() {
+        let labels = ["Plain Axx", "ba a"];
+        let mut m = Menu::new(
+            labels.iter().map(|l| Item::new(*l, *l, "")).collect(),
+            false,
+        );
+        m.edit(|q| *q = "a".into());
+        let found: Vec<(&str, &[u32])> = (m.matches.iter())
+            .map(|(i, idx)| (m.items[*i].label.as_str(), idx.as_slice()))
+            .collect();
+        let ascii = |s: &str| {
+            let pattern = Pattern::parse("a", CaseMatching::Smart, Normalization::Smart);
+            let hay = Utf32Str::Ascii(s.as_bytes());
+            pattern
+                .score(hay, &mut Matcher::new(Config::DEFAULT))
+                .unwrap()
+        };
+        let mut order = labels;
+        order.sort_by_key(|l| std::cmp::Reverse(ascii(l)));
+        assert_eq!(found.iter().map(|f| f.0).collect::<Vec<_>>(), order);
+        // the a after a space lights up, not the one inside a word
+        assert!(found.contains(&("ba a", &[3][..])));
+    }
+
+    #[test]
+    fn nothing_matches_past_the_end() {
+        let labels = ["Solo", "Sólo"];
+        let mut m = Menu::new(
+            labels.iter().map(|l| Item::new(*l, *l, "")).collect(),
+            false,
+        );
+        for q in ["Solo\\ ", "Solo\\ $", "'Solo\\ ", "'Sólo\\ ", "Sólo\\ $"] {
+            m.edit(|query| *query = q.into());
+            assert!(m.matches.is_empty(), "{q}");
+        }
     }
 
     #[test]
