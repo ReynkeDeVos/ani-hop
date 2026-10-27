@@ -530,6 +530,7 @@ impl App {
     /// known: they pick the episodes not watched, and a first download's Show folder starts
     /// with them.
     fn job(&self, mut m: Media, eps: Option<Vec<String>>) -> Job {
+        self.entries.remember(&m);
         m.media_list_entry = self.entries.entry(&m).cloned();
         let mut parts = self.parts(&m).to_vec();
         for (_, p) in &mut parts {
@@ -1755,6 +1756,8 @@ impl App {
                 // offline is when downloads are watched: no error for that
                 if let Ok(fresh) = self.observed(stamp, res) {
                     ani::refresh_shows(&fresh);
+                    let entries = fresh.iter().map(|m| (m.id, m.media_list_entry.clone()));
+                    ani::learn(entries, stamp.sent);
                     self.refresh();
                 }
             }
@@ -1876,9 +1879,6 @@ impl App {
                 let Some(n) = self.entries.finish(done) else {
                     return; // an earlier login's
                 };
-                if let Some((id, entry)) = n.saved {
-                    self.downloads.saved(id, entry);
-                }
                 self.toast(n.text, n.error);
                 // its list status question is answered, not another show's
                 if matches!(&self.top().view, View::Status(s) if Some(s.id) == n.closes) {

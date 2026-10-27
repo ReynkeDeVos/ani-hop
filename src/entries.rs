@@ -57,6 +57,8 @@ struct Known {
     at: u64,
     /// when it was written, among this ani-hop's writes; 0 when AniList sent it
     ran: u64,
+    /// when AniList had it (ms since 1970), for what's kept for the Downloads list
+    time: u64,
 }
 
 pub struct Entries {
@@ -72,6 +74,8 @@ pub struct Entries {
 pub struct Stamp {
     login: u64,
     changes: u64,
+    /// when the read was asked for, ms since 1970
+    pub sent: u64,
 }
 
 /// A write, to run in the background once.
@@ -85,6 +89,8 @@ pub struct Work {
 pub struct Done {
     login: u64,
     ran: u64,
+    /// when AniList answered, ms since 1970
+    time: u64,
     change: Change,
     res: Result<Answer, String>,
 }
@@ -102,8 +108,6 @@ pub struct Notice {
     pub error: bool,
     /// the show whose List status question it answers
     pub closes: Option<u64>,
-    /// the show whose Entry the write left as AniList has it now, and that Entry
-    pub saved: Option<(u64, Option<Entry>)>,
 }
 
 impl Entries {
@@ -139,6 +143,7 @@ impl Entries {
         Stamp {
             login: self.login,
             changes: lists::changes(),
+            sent: ani::now_ms(),
         }
     }
 
@@ -160,9 +165,14 @@ impl Entries {
                 // a write that ran before the last one taken in stays older than that one
                 known => {
                     let ran = known.map_or(0, |k| k.ran);
-                    let entry = m.media_list_entry.clone();
-                    let at = stamp.changes;
-                    self.known.insert(m.id, Known { entry, at, ran });
+                    let (entry, at, time) = (m.media_list_entry.clone(), stamp.changes, stamp.sent);
+                    let k = Known {
+                        entry,
+                        at,
+                        ran,
+                        time,
+                    };
+                    self.known.insert(m.id, k);
                 }
             }
         }
@@ -189,7 +199,7 @@ impl Entries {
         let m = done.change.show();
         let name = m.name();
         let total = m.episodes.map_or("?".into(), |t| t.to_string());
-        let (entry, mut notice) = match done.res {
+        let (entry, notice) = match done.res {
             Err(e) => {
                 let not = match done.change {
                     Change::Remove(..) => "not removed",
@@ -218,15 +228,23 @@ impl Entries {
         // unless a write that ran after this one answered first
         if !self.known.get(&m.id).is_some_and(|k| k.ran > done.ran) {
             lists::changed();
-            notice.saved = Some((m.id, entry.clone()));
             let k = Known {
                 entry,
                 at: lists::changes(),
                 ran: done.ran,
+                time: done.time,
             };
             self.known.insert(m.id, k);
         }
         Some(notice)
+    }
+
+    /// Keeps `m`'s Entry as this session knows it for the Downloads list, as a download of it
+    /// is queued: a show's first one starts its Show folder with it.
+    pub fn remember(&self, m: &Media) {
+        if let Some(k) = self.known.get(&m.id) {
+            ani::learn([(m.id, k.entry.clone())], k.time);
+        }
     }
 
     /// Another login, or none: what was known was the old login's, and its writes still out
@@ -243,16 +261,15 @@ fn notice(text: String, error: bool, closes: Option<u64>) -> Notice {
         text,
         error,
         closes,
-        saved: None,
     }
 }
 
 impl Work {
-    /// Blocks on AniList, in turn with every ani-hop's writes, and puts AniList's Entry in
-    /// the Downloads index before the next one's turn.
+    /// Blocks on AniList, in turn with every ani-hop's writes, and keeps AniList's Entry for
+    /// the Downloads list before the next one's turn.
     pub fn run(self) -> Done {
         static RAN: AtomicU64 = AtomicU64::new(1);
-        let mut ran = 0;
+        let (mut ran, mut time) = (0, 0);
         let res = turn().and_then(|_turn| {
             ran = RAN.fetch_add(1, Ordering::Relaxed);
             let saved = |e| Answer::Saved(Some(e));
@@ -272,12 +289,14 @@ impl Work {
                 },
             }?;
             let (Answer::Saved(entry) | Answer::Moved(entry)) = &answer;
-            let _ = ani::update_entry(self.change.show().id, entry);
+            time = ani::now_ms();
+            ani::learn([(self.change.show().id, entry.clone())], time);
             Ok(answer)
         });
         Done {
             login: self.login,
             ran,
+            time,
             change: self.change,
             res,
         }
@@ -464,6 +483,35 @@ mod tests {
         assert!(entries.observe(entries.stamp(), [&mut fresh]));
         entries.finish(first).unwrap();
         assert_eq!(entries.entry(&copy).unwrap().status, "DROPPED");
+    }
+
+    #[test]
+    fn the_downloads_list_shows_the_newest_entry_whoever_kept_it() {
+        // a show's first download, queued at 5
+        let copy = watching(70_008, 5);
+        let root = ani::home().join("entries-newest");
+        let (dir, hold) = ani::prepare_in(&root, &copy).unwrap();
+        let (fake, mut entries) = anilist(&copy, false);
+        let shown = || {
+            let show = ani::local_shows().into_iter().find(|s| s.0.id == copy.id);
+            show.unwrap().0.media_list_entry.unwrap().progress
+        };
+        // Downloads asked AniList at 5, the save to 6 ran, then the refresh came in
+        let asked = entries.stamp();
+        thread::sleep(Duration::from_millis(2));
+        let k = entries.progress(&copy, &[]).mark("6").unwrap();
+        let done = entries.begin(Change::Progress(k)).run();
+        ani::learn([(copy.id, copy.media_list_entry.clone())], asked.sent);
+        assert_eq!(shown(), 6, "the refresh was older than the save");
+        entries.finish(done).unwrap();
+        // AniList's website moved it on to 9, a list showed that, then an episode got queued
+        fake.save(copy.id, None, Some(9)).unwrap();
+        let mut seen = watching(70_008, 9);
+        assert!(entries.observe(entries.stamp(), [&mut seen]));
+        entries.remember(&copy);
+        assert_eq!(shown(), 9);
+        drop(hold);
+        let _ = ani::delete_show(&dir);
     }
 
     #[test]

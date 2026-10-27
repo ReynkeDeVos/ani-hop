@@ -7,7 +7,7 @@
 //! an episode is still wanted and starting it.
 
 use crate::ani;
-use crate::anilist::{Entry, Media};
+use crate::anilist::Media;
 use crate::progress::{Parts, Progress};
 use crate::source::{Lookup, Source};
 use serde::{Deserialize, Serialize};
@@ -155,8 +155,6 @@ struct State {
     paused: bool,
     /// quitting stopped downloads for good
     quit: bool,
-    /// AniList's Entry of a show after a save, by show (`saved`)
-    saved: HashMap<u64, Option<Entry>>,
 }
 
 struct Shared {
@@ -323,13 +321,6 @@ impl Queue {
             kill(r.pid);
         }
         true
-    }
-
-    /// AniList's Entry of show `id` after a save. A show's first download starts its Show
-    /// folder with it, not with the Entry its job was queued with, which still picks its
-    /// episodes.
-    pub fn saved(&self, id: u64, entry: Option<Entry>) {
-        self.lock().saved.insert(id, entry);
     }
 
     /// Lets downloads go on after `pause`.
@@ -601,11 +592,7 @@ impl Queue {
             // under the lock, so stopping another episode can't drop the folder in between;
             // also for an episode already there, so a folder found through ani-cli gets the
             // AniList show
-            let mut show = m.clone();
-            if let Some(entry) = st.saved.get(&m.id) {
-                show.media_list_entry = entry.clone();
-            }
-            let (dir, hold) = self.0.fetch.prepare(&show)?;
+            let (dir, hold) = self.0.fetch.prepare(m)?;
             // another ani-hop may have queued it too before either saw the other's queue
             let mut held = (self.claim(&dir, ep)?).ok_or("another ani-hop is downloading it")?;
             held.folder = Some(hold);
@@ -1062,39 +1049,6 @@ mod tests {
         assert_eq!(kept[0].eps.as_deref(), Some(&["2".to_string()][..]));
         q.quit();
         wait("stopped", || q.lock().running.is_none());
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_first_download_starts_its_folder_with_the_entry_saved_since_it_was_queued() {
-        let dir = temp("saved");
-        let (q, done) = queue(&dir, "a", QUICK);
-        let at = |progress| {
-            let status = "CURRENT".into();
-            Some(Entry {
-                id: 9,
-                status,
-                progress,
-            })
-        };
-        let mut j = job(&["1"]);
-        j.media.media_list_entry = at(5);
-        q.saved(ID.get(), at(6));
-        q.enqueue(j).unwrap();
-        assert!(
-            done.recv_timeout(Duration::from_secs(10))
-                .unwrap()
-                .1
-                .is_ok()
-        );
-        let shows = ani::local_shows().into_iter();
-        let indexed = shows
-            .filter(|s| s.0.id == ID.get())
-            .map(|s| s.0.media_list_entry);
-        assert_eq!(
-            indexed.map(|e| e.unwrap().progress).collect::<Vec<_>>(),
-            [6]
-        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

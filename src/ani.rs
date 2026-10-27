@@ -773,22 +773,52 @@ pub fn refresh_shows(fresh: &[Media]) {
     });
 }
 
-/// Puts AniList's Entry of show `id` on its downloaded copies, which the Downloads list shows.
-pub fn update_entry(id: u64, entry: &Option<Entry>) -> std::io::Result<()> {
-    if !index().values().any(|d| d.media.id == id) {
-        return Ok(()); // not downloaded: no index to make
-    }
-    edit_index(|all| {
-        for d in all.values_mut().filter(|d| d.media.id == id) {
-            d.media.media_list_entry = entry.clone();
+/// The user's AniList Entries as last read or saved, by show, each with when (ms since 1970):
+/// what the Downloads list shows, also offline in a later session.
+type Learnt = HashMap<u64, (Option<Entry>, u64)>;
+
+fn learnt_path() -> PathBuf {
+    cache_dir().join("entries.json")
+}
+
+/// Keeps `entries` as AniList had them at `at` (ms since 1970), unless newer ones are kept:
+/// a save, of this ani-hop or another, or a refresh asked for before it, in any order.
+/// shortcut: ordered by the wall clock, which a clock set back can fool until the next save.
+pub fn learn(entries: impl IntoIterator<Item = (u64, Option<Entry>)>, at: u64) {
+    let path = learnt_path();
+    let edit = || -> std::io::Result<()> {
+        fs::create_dir_all(cache_dir())?;
+        let lock = fs::File::create(path.with_extension("lock"))?;
+        lock.lock()?;
+        let mut all: Learnt = read_json(&path);
+        for (id, entry) in entries {
+            if all.get(&id).is_none_or(|k| k.1 <= at) {
+                all.insert(id, (entry, at));
+            }
         }
-    })
+        write_json(&path, &all)
+    };
+    let _ = edit();
+}
+
+/// Milliseconds since 1970, for `learn`.
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Downloaded shows and their folders, by name: also those downloaded before the download
-/// folder changed, which stay where they are.
+/// folder changed, which stay where they are. Each with its Entry as last learnt.
 pub fn local_shows() -> Vec<(Media, PathBuf)> {
-    shows_in(&download_root(), index())
+    let learnt: Learnt = read_json(&learnt_path());
+    let mut shows = shows_in(&download_root(), index());
+    for (m, _) in &mut shows {
+        if let Some((entry, _)) = learnt.get(&m.id) {
+            m.media_list_entry = entry.clone();
+        }
+    }
+    shows
 }
 
 /// A show in two folders (downloaded again after the download folder changed, before 0.7)
