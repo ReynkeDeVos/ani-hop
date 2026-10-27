@@ -808,18 +808,17 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
 }
 
 /// A row's label, a span per grapheme as drawn (joined emoji stay whole), with the filter's
-/// matched characters (`hits`, by character) lit. With `room`, a show's title too long for it
+/// matches lit (`hits`, by grapheme, as the filter counts them). With `room`, a show's title too long for it
 /// keeps its end, as seasons and parts of one show differ there: "Attack on Titan Fi…Special 2".
 fn row_label(text: &str, hits: &[u32], plain: Style, room: Option<usize>) -> Vec<Span<'static>> {
     let cut = room.and_then(|room| middle_cut(text, room));
     let mut spans = Vec::new();
-    let (mut at, mut ci) = (0, 0u32);
+    let (mut at, mut i) = (0, 0u32);
     for g in Span::raw(text)
         .styled_graphemes(Style::new())
         .map(|g| g.symbol)
     {
-        let n = g.chars().count() as u32;
-        let hit = (ci..ci + n).any(|c| hits.binary_search(&c).is_ok());
+        let hit = hits.binary_search(&i).is_ok();
         let style = if hit {
             Style::new().fg(MATCH).bold()
         } else {
@@ -833,7 +832,7 @@ fn row_label(text: &str, hits: &[u32], plain: Style, room: Option<usize>) -> Vec
             }
             _ => spans.push(Span::styled(g.to_string(), style)),
         }
-        (at, ci) = (at + g.len(), ci + n);
+        (at, i) = (at + g.len(), i + 1);
     }
     spans
 }
@@ -876,12 +875,24 @@ fn fit_middle(label: &str, room: usize) -> String {
 }
 
 /// `s` cut to `room` columns with "…", measured as drawn: CJK characters take two.
-fn fit(mut s: String, room: usize) -> String {
-    if Span::raw(s.as_str()).width() > room {
-        while Span::raw(s.as_str()).width() >= room && s.pop().is_some() {}
-        s.push('…');
+fn fit(s: String, room: usize) -> String {
+    let width = |s: &str| Span::raw(s).width();
+    if width(&s) <= room {
+        return s;
     }
-    s
+    // whole graphemes, as drawn, and a column for the "…"
+    let (mut cut, mut used) = (String::new(), 0);
+    for g in Span::raw(s.as_str())
+        .styled_graphemes(Style::new())
+        .map(|g| g.symbol)
+    {
+        used += width(g);
+        if used >= room {
+            break;
+        }
+        cut.push_str(g);
+    }
+    cut + "…"
 }
 
 pub fn hex(s: &str) -> Option<Color> {
@@ -932,10 +943,18 @@ mod tests {
             spans.iter().any(|s| s.content == family),
             "a family stays one"
         );
-        // the filter's hits count characters: the family's second one lights the whole family
-        let lit = row_label(&format!("{family}a"), &[2], Style::new(), None);
-        assert_eq!(lit[0].style.fg, Some(MATCH));
-        assert_eq!(lit[1].style.fg, None);
+        // what the filter matches is what lights up: "A", not the family before it
+        let label = format!("{family} A");
+        let item = crate::menu::Item::new("k", label.as_str(), "");
+        let mut menu = crate::menu::Menu::new(vec![item], false);
+        menu.edit(|q| *q = "A".into());
+        let lit = row_label(&label, &menu.matches[0].1, Style::new(), None);
+        let lit: Vec<&str> = (lit.iter().filter(|s| s.style.fg == Some(MATCH)))
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert_eq!(lit, ["A"]);
+        // cut at the end, emoji stay whole too
+        assert_eq!(fit("❤️".repeat(30), 9), "❤️❤️❤️❤️…");
     }
 
     #[test]

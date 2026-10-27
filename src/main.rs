@@ -1720,7 +1720,7 @@ impl App {
             .iter()
             .flatten()
             .map(|m| (m.id, m.media_list_entry.clone()));
-        ani::learn(shows, stamp.sent, false);
+        ani::learn(shows, stamp.read(), false);
         res
     }
 
@@ -1761,6 +1761,8 @@ impl App {
                     View::Shows(list) => list.refreshed(ask, res),
                     _ => Ok(()),
                 });
+                // a show's page on top shows their Entries too, the newest now
+                self.rebuild();
                 if fallback {
                     self.toast("AniList search failed, showing ani-cli's matches", true);
                 }
@@ -1786,6 +1788,7 @@ impl App {
                     (Some(None), Some(_)) => self.toast("No more shows", false),
                     _ => {}
                 }
+                self.rebuild();
             }
             Msg::Hits(id, res) => self.fill(id, |v| {
                 if let View::Sources(_, _, h) = v {

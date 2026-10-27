@@ -53,12 +53,17 @@ impl Change {
 struct Known {
     /// None: not on the list
     entry: Option<Entry>,
-    /// the list changes there were when it was asked for or saved (lists::changes)
-    at: u64,
-    /// when it was written, among this ani-hop's writes; 0 when AniList sent it
+    /// when AniList had it (`when`)
+    when: u64,
+    /// when it was written, among this ani-hop's writes in the same ms; 0 when AniList sent it
     ran: u64,
-    /// when AniList had it (ms since 1970), for what's kept for the Downloads list
-    time: u64,
+}
+
+/// When AniList had an Entry, as one number that orders them all, here and in what's kept
+/// for the Downloads list: ms since 1970, doubled, and one more for a save, which wins over a
+/// read asked for in the same ms (that read may not have seen it).
+fn when(ms: u64, saved: bool) -> u64 {
+    ms * 2 + u64::from(saved)
 }
 
 pub struct Entries {
@@ -69,13 +74,19 @@ pub struct Entries {
     pending: usize,
 }
 
-/// When a read was asked for: what it brings is older than what was saved after it.
+/// When a read was asked for: what it brings is older than what was saved or read after it.
 #[derive(Clone, Copy)]
 pub struct Stamp {
     login: u64,
-    changes: u64,
-    /// when the read was asked for, ms since 1970
-    pub sent: u64,
+    /// ms since 1970
+    sent: u64,
+}
+
+impl Stamp {
+    /// When AniList had what the read brings, as `when` orders it.
+    pub fn read(&self) -> u64 {
+        when(self.sent, false)
+    }
 }
 
 /// A write, to run in the background once.
@@ -89,8 +100,8 @@ pub struct Work {
 pub struct Done {
     login: u64,
     ran: u64,
-    /// when AniList answered, ms since 1970
-    time: u64,
+    /// when AniList answered (`when`)
+    when: u64,
     change: Change,
     res: Result<Answer, String>,
 }
@@ -142,7 +153,6 @@ impl Entries {
     pub fn stamp(&self) -> Stamp {
         Stamp {
             login: self.login,
-            changes: lists::changes(),
             sent: ani::now_ms(),
         }
     }
@@ -159,18 +169,17 @@ impl Entries {
         if stamp.login != self.login {
             return false;
         }
+        let read = stamp.read();
         for m in shows.into_iter().filter(|m| m.on_anilist()) {
             match self.known.get(&m.id) {
-                Some(k) if k.at > stamp.changes => m.media_list_entry = k.entry.clone(),
-                // a write that ran before the last one taken in stays older than that one
-                known => {
-                    let ran = known.map_or(0, |k| k.ran);
-                    let (entry, at, time) = (m.media_list_entry.clone(), stamp.changes, stamp.sent);
+                // a save after the read was asked for, or a read asked for after it
+                Some(k) if k.when > read => m.media_list_entry = k.entry.clone(),
+                _ => {
+                    let entry = m.media_list_entry.clone();
                     let k = Known {
                         entry,
-                        at,
-                        ran,
-                        time,
+                        when: read,
+                        ran: 0,
                     };
                     self.known.insert(m.id, k);
                 }
@@ -225,14 +234,15 @@ impl Entries {
                 (entry, notice(text, true, None))
             }
         };
-        // unless a write that ran after this one answered first
-        if !self.known.get(&m.id).is_some_and(|k| k.ran > done.ran) {
-            lists::changed();
+        lists::changed();
+        // unless what's known is newer: a write that ran after this one, or a read asked for
+        // after it answered
+        let newer = |k: &Known| (k.when, k.ran) > (done.when, done.ran);
+        if !self.known.get(&m.id).is_some_and(newer) {
             let k = Known {
                 entry,
-                at: lists::changes(),
+                when: done.when,
                 ran: done.ran,
-                time: done.time,
             };
             self.known.insert(m.id, k);
         }
@@ -243,7 +253,7 @@ impl Entries {
     /// is queued: a show's first one starts its Show folder with it.
     pub fn remember(&self, m: &Media) {
         if let Some(k) = self.known.get(&m.id) {
-            ani::learn([(m.id, k.entry.clone())], k.time, true);
+            ani::learn([(m.id, k.entry.clone())], k.when, true);
         }
     }
 
@@ -269,7 +279,7 @@ impl Work {
     /// the Downloads list before the next one's turn.
     pub fn run(self) -> Done {
         static RAN: AtomicU64 = AtomicU64::new(1);
-        let (mut ran, mut time) = (0, 0);
+        let (mut ran, mut answered) = (0, 0);
         let res = turn().and_then(|_turn| {
             ran = RAN.fetch_add(1, Ordering::Relaxed);
             let saved = |e| Answer::Saved(Some(e));
@@ -289,14 +299,14 @@ impl Work {
                 },
             }?;
             let (Answer::Saved(entry) | Answer::Moved(entry)) = &answer;
-            time = ani::now_ms();
-            ani::learn([(self.change.show().id, entry.clone())], time, false);
+            answered = when(ani::now_ms(), true);
+            ani::learn([(self.change.show().id, entry.clone())], answered, false);
             Ok(answer)
         });
         Done {
             login: self.login,
             ran,
-            time,
+            when: answered,
             change: self.change,
             res,
         }
@@ -503,7 +513,7 @@ mod tests {
         let done = entries.begin(Change::Progress(k)).run();
         ani::learn(
             [(copy.id, copy.media_list_entry.clone())],
-            asked.sent,
+            asked.read(),
             false,
         );
         assert_eq!(shown(), 6, "the refresh was older than the save");
@@ -516,6 +526,30 @@ mod tests {
         assert_eq!(shown(), 9);
         drop(hold);
         let _ = ani::delete_show(&dir);
+    }
+
+    #[test]
+    fn the_newest_of_reads_and_saves_wins_in_any_order() {
+        let copy = watching(70_009, 5);
+        let (fake, mut entries) = anilist(&copy, false);
+        let at = |progress| watching(70_009, progress);
+        // two reads asked for one after the other, answered the other way round
+        let older = entries.stamp();
+        thread::sleep(Duration::from_millis(2));
+        assert!(entries.observe(entries.stamp(), [&mut at(9)]));
+        assert!(entries.observe(older, [&mut at(6)]));
+        assert_eq!(entries.progress(&copy, &[]).mark("10").unwrap().was, 9);
+        // a save answered, a read asked for after it saw AniList's website move on, then the
+        // save's answer came in
+        fake.save(copy.id, None, Some(9)).unwrap();
+        let k = entries.progress(&copy, &[]).mark("10").unwrap();
+        let done = entries.begin(Change::Progress(k)).run();
+        thread::sleep(Duration::from_millis(2));
+        assert!(entries.observe(entries.stamp(), [&mut at(12)]));
+        entries.finish(done).unwrap();
+        assert_eq!(entries.entry(&copy).unwrap().progress, 12);
+        // a read asked for in the ms a save answered may not have seen it: the save wins
+        assert!(when(7, false) < when(7, true) && when(7, true) < when(8, false));
     }
 
     #[test]
