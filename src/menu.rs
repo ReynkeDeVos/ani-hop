@@ -3,6 +3,8 @@
 use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::Style;
+use ratatui::text::Span;
 use ratatui::widgets::ListState;
 use std::collections::BTreeSet;
 
@@ -35,6 +37,20 @@ impl Item {
             short: String::new(),
         }
     }
+}
+
+/// `s` as the matcher reads it: one char per grapheme, its first, so where it matched counts
+/// graphemes as a row draws them. nucleo's own `Utf32Str::new` falls back to counting bytes
+/// when every grapheme starts with an ASCII char, as in a decomposed "é".
+fn haystack<'a>(s: &'a str, buf: &'a mut Vec<char>) -> Utf32Str<'a> {
+    if s.is_ascii() {
+        return Utf32Str::Ascii(s.as_bytes());
+    }
+    buf.clear();
+    let span = Span::raw(s);
+    let graphemes = span.styled_graphemes(Style::new());
+    buf.extend(graphemes.filter_map(|g| g.symbol.chars().next()));
+    Utf32Str::Unicode(buf)
 }
 
 pub enum Act {
@@ -110,10 +126,10 @@ impl Menu {
         let mut scored: Vec<(usize, u32, Vec<u32>)> = Vec::new();
         for (i, item) in self.items.iter().enumerate() {
             let mut idx = Vec::new();
-            let hay = Utf32Str::new(&item.label, &mut buf);
+            let hay = haystack(&item.label, &mut buf);
             let label = pattern.indices(hay, &mut self.matcher, &mut idx);
             let about = || {
-                let hay = Utf32Str::new(&item.about, &mut buf);
+                let hay = haystack(&item.about, &mut buf);
                 words.score(hay, &mut self.matcher).map(|_| 0) // after every label match
             };
             if let Some(score) = label.or_else(about) {
@@ -255,6 +271,15 @@ mod tests {
         items.extend(["Frieren", "Attack on Titan", "Fire Force"].map(|l| Item::new(l, l, "")));
         m.set_items(items);
         assert_eq!(m.selection(), [1, 2, 3]);
+    }
+
+    #[test]
+    fn matches_count_graphemes_as_rows_draw_them() {
+        // a decomposed "é" (e and an accent) is one grapheme
+        let label = "Cafe\u{301} Axx";
+        let mut m = Menu::new(vec![Item::new("k", label, "")], false);
+        m.edit(|q| *q = "A".into());
+        assert_eq!(m.matches[0].1, [5]);
     }
 
     #[test]
