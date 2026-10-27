@@ -1909,7 +1909,7 @@ impl App {
                 }
             }
             Msg::Scanned(found) => {
-                self.entries.catch_up(found.iter().map(|(m, _)| m));
+                self.entries.catch_up();
                 let again = self.scanning.take() == Some(true);
                 let shows;
                 (self.local, shows) = rescanned(found, &self.synced, &self.local);
