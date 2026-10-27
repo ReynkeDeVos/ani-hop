@@ -309,9 +309,14 @@ mod tests {
         list.refreshed(ask.unwrap(), Ok(shows(0..3))).unwrap();
         assert_eq!(list.shows.len(), 3, "shown");
         assert_eq!(written(&path), UNIX_EPOCH, "but asked for again next time");
-        let (mut list, ask) = List::open(Feed::Whole, Some(path.clone()), SystemTime::now());
-        list.refreshed(ask.unwrap(), Ok(shows(0..2))).unwrap();
-        assert!(written(&path) > UNIX_EPOCH);
+        // fresh when no list changed meanwhile, which other tests do at any time
+        let fresh = (0..20).any(|_| {
+            let (mut list, ask) = List::open(Feed::Whole, Some(path.clone()), SystemTime::now());
+            let asked = changes();
+            list.refreshed(ask.unwrap(), Ok(shows(0..2))).unwrap();
+            changes() == asked && written(&path) > UNIX_EPOCH
+        });
+        assert!(fresh);
         // a refresh that fails keeps the cache on screen, offline too
         let (mut list, ask) = List::open(
             Feed::Whole,

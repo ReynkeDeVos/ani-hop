@@ -180,6 +180,8 @@ pub struct App {
     downloaded: Option<Vec<Media>>,
     /// a rescan of the download folder is on its way, and (true) another was asked for since
     scanning: Option<bool>,
+    /// Downloads opened: AniList is asked about its shows once the rescan has them
+    ask_local: bool,
     /// episodes per show other running ani-hops have queued, rescanned on refresh
     elsewhere: HashMap<u64, Vec<String>>,
     resolving: HashMap<u64, Option<Want>>,
@@ -445,6 +447,7 @@ impl App {
             local: HashMap::new(),
             downloaded: None,
             scanning: None,
+            ask_local: false,
             elsewhere: HashMap::new(),
             resolving: HashMap::new(),
             playback: Playback::new(Arc::new(playback::Mpv)),
@@ -523,6 +526,21 @@ impl App {
         self.stack.last_mut().unwrap()
     }
 
+    /// A download of `m`'s `eps` (None: every episode not watched), with the newest Entries
+    /// known: they pick the episodes not watched, and a first download's Show folder starts
+    /// with them.
+    fn job(&self, mut m: Media, eps: Option<Vec<String>>) -> Job {
+        m.media_list_entry = self.entries.entry(&m).cloned();
+        let mut parts = self.parts(&m).to_vec();
+        for (_, p) in &mut parts {
+            p.media_list_entry = self.entries.entry(p).cloned();
+        }
+        let lookup = self.sources.lookup(m.id);
+        let mut job = Job::new(m, eps);
+        (job.parts, job.lookup) = (parts, lookup);
+        job
+    }
+
     /// Queues a download, saved first so quitting early doesn't lose it; false (and says
     /// why) when that can't be saved.
     fn download(&mut self, job: Job) -> bool {
@@ -586,7 +604,6 @@ impl App {
         }
         match action {
             Action::Download(get) => {
-                let lookup = self.sources.lookup(m.id);
                 // paused with something held, not just a pause left over from an emptied queue
                 let s = self.downloads.snapshot();
                 let going = match s.paused && s.pending > 0 {
@@ -594,9 +611,7 @@ impl App {
                     false => "",
                 };
                 let queued = format!("Queued {}{going}", which(&get));
-                let mut job = Job::new(m, Some(get));
-                job.lookup = lookup;
-                if self.download(job) {
+                if self.download(self.job(m, Some(get))) {
                     self.toast(queued, false);
                 }
             }
@@ -1283,10 +1298,7 @@ impl App {
                     let list: Vec<Media> = list.into_iter().filter(|m| !self.upcoming(m)).collect();
                     let shows = plural(list.len(), "show");
                     for m in list {
-                        let mut job = Job::new(m, None);
-                        job.parts = self.parts(&job.media).to_vec();
-                        job.lookup = self.sources.lookup(job.media.id);
-                        if !self.download(job) {
+                        if !self.download(self.job(m, None)) {
                             return;
                         }
                     }
@@ -1442,17 +1454,10 @@ impl App {
                 self.top().menu.paste(&ani::tilde(&ani::download_root()));
             }
             "downloads" => {
-                let list: Vec<Media> = ani::local_shows().into_iter().map(|(m, _)| m).collect();
-                self.downloaded = Some(list.clone());
-                // saved when downloaded, maybe weeks ago: their progress is AniList's now
-                let ids: Vec<u64> = (list.iter().filter(|m| m.on_anilist()))
-                    .map(|m| m.id)
-                    .collect();
-                if !ids.is_empty() {
-                    let stamp = self.entries.stamp();
-                    self.spawn(move || Msg::Local(stamp, c.shows(&ids)));
-                }
+                // as the last rescan found them; the one opening it starts fills it in
+                let list = self.downloaded.clone().unwrap_or_default();
                 self.push("Downloads", View::Shows(List::local(list)));
+                self.ask_local = true;
             }
             "login" => match client_id() {
                 Some(id) => self.start_auth(&id),
@@ -1871,6 +1876,9 @@ impl App {
                 let Some(n) = self.entries.finish(done) else {
                     return; // an earlier login's
                 };
+                if let Some((id, entry)) = n.saved {
+                    self.downloads.saved(id, entry);
+                }
                 self.toast(n.text, n.error);
                 // its list status question is answered, not another show's
                 if matches!(&self.top().view, View::Status(s) if Some(s.id) == n.closes) {
@@ -1897,7 +1905,16 @@ impl App {
                 Some(true) => self.scan_local(None),
                 _ => {
                     self.local = (found.iter()).map(|(m, eps)| (m.id, eps.clone())).collect();
-                    self.downloaded = Some(found.into_iter().map(|(m, _)| m).collect());
+                    let shows: Vec<Media> = found.into_iter().map(|(m, _)| m).collect();
+                    // saved when downloaded, maybe weeks ago: their progress is AniList's now
+                    let ids: Vec<u64> = (shows.iter().filter(|m| m.on_anilist()))
+                        .map(|m| m.id)
+                        .collect();
+                    if std::mem::take(&mut self.ask_local) && !ids.is_empty() {
+                        let (c, stamp) = (self.client.clone(), self.entries.stamp());
+                        self.spawn(move || Msg::Local(stamp, c.shows(&ids)));
+                    }
+                    self.downloaded = Some(shows);
                     self.rebuild();
                 }
             },

@@ -744,10 +744,10 @@ pub fn folder(m: &Media) -> PathBuf {
 /// Two AniList shows with one name (a remake) don't share a folder: the second one's name
 /// gets its AniList id. One ani-cli found shares it with the AniList show of its name.
 fn folder_in(root: &Path, all: Index, m: &Media) -> PathBuf {
-    if let Some((_, p)) = shows_in(root, all.clone())
-        .into_iter()
-        .find(|(s, _)| s.id == m.id)
-    {
+    // only this show's folders are looked at: another's on a disk asleep mustn't hold it up
+    let mine = (all.iter()).filter(|(_, d)| d.media.id == m.id);
+    let mine: Index = mine.map(|(p, d)| (p.clone(), d.clone())).collect();
+    if let Some((_, p)) = shows_in(root, mine).into_iter().next() {
         return p;
     }
     let name = m.name().replace('/', "∕");

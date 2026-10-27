@@ -102,6 +102,8 @@ pub struct Notice {
     pub error: bool,
     /// the show whose List status question it answers
     pub closes: Option<u64>,
+    /// the show whose Entry the write left as AniList has it now, and that Entry
+    pub saved: Option<(u64, Option<Entry>)>,
 }
 
 impl Entries {
@@ -155,14 +157,12 @@ impl Entries {
         for m in shows.into_iter().filter(|m| m.on_anilist()) {
             match self.known.get(&m.id) {
                 Some(k) if k.at > stamp.changes => m.media_list_entry = k.entry.clone(),
-                _ => {
+                // a write that ran before the last one taken in stays older than that one
+                known => {
+                    let ran = known.map_or(0, |k| k.ran);
                     let entry = m.media_list_entry.clone();
-                    let k = Known {
-                        entry,
-                        at: stamp.changes,
-                        ran: 0,
-                    };
-                    self.known.insert(m.id, k);
+                    let at = stamp.changes;
+                    self.known.insert(m.id, Known { entry, at, ran });
                 }
             }
         }
@@ -179,8 +179,8 @@ impl Entries {
         }
     }
 
-    /// Takes a write's answer: AniList's Entry now, for every reader and the Downloads index,
-    /// and what to say. None for an earlier login's write, which changes nothing here.
+    /// Takes a write's answer: AniList's Entry now, for every reader, and what to say. None
+    /// for an earlier login's write, which changes nothing here.
     pub fn finish(&mut self, done: Done) -> Option<Notice> {
         self.pending -= 1;
         if done.login != self.login {
@@ -189,7 +189,7 @@ impl Entries {
         let m = done.change.show();
         let name = m.name();
         let total = m.episodes.map_or("?".into(), |t| t.to_string());
-        let (entry, notice) = match done.res {
+        let (entry, mut notice) = match done.res {
             Err(e) => {
                 let not = match done.change {
                     Change::Remove(..) => "not removed",
@@ -218,7 +218,7 @@ impl Entries {
         // unless a write that ran after this one answered first
         if !self.known.get(&m.id).is_some_and(|k| k.ran > done.ran) {
             lists::changed();
-            let _ = ani::update_entry(m.id, &entry);
+            notice.saved = Some((m.id, entry.clone()));
             let k = Known {
                 entry,
                 at: lists::changes(),
@@ -243,18 +243,20 @@ fn notice(text: String, error: bool, closes: Option<u64>) -> Notice {
         text,
         error,
         closes,
+        saved: None,
     }
 }
 
 impl Work {
-    /// Blocks on AniList, in turn with every ani-hop's writes.
+    /// Blocks on AniList, in turn with every ani-hop's writes, and puts AniList's Entry in
+    /// the Downloads index before the next one's turn.
     pub fn run(self) -> Done {
         static RAN: AtomicU64 = AtomicU64::new(1);
         let mut ran = 0;
         let res = turn().and_then(|_turn| {
             ran = RAN.fetch_add(1, Ordering::Relaxed);
             let saved = |e| Answer::Saved(Some(e));
-            match &self.change {
+            let answer = match &self.change {
                 Change::Status(m, status) => self.anilist.save(m.id, Some(status), None).map(saved),
                 Change::Remove(_, entry) => {
                     self.anilist.remove(*entry).map(|()| Answer::Saved(None))
@@ -268,7 +270,10 @@ impl Work {
                         .save(k.entry.id, Some(k.status), Some(k.to))
                         .map(saved),
                 },
-            }
+            }?;
+            let (Answer::Saved(entry) | Answer::Moved(entry)) = &answer;
+            let _ = ani::update_entry(self.change.show().id, entry);
+            Ok(answer)
         });
         Done {
             login: self.login,
@@ -453,8 +458,32 @@ mod tests {
         let first = entries.begin(status("PAUSED")).run();
         let last = entries.begin(status("DROPPED")).run();
         entries.finish(last).unwrap();
+        // a list refreshed after both says so too, and the late answer is still older
+        let mut fresh = copy.clone();
+        fresh.media_list_entry.as_mut().unwrap().status = "DROPPED".into();
+        assert!(entries.observe(entries.stamp(), [&mut fresh]));
         entries.finish(first).unwrap();
         assert_eq!(entries.entry(&copy).unwrap().status, "DROPPED");
+    }
+
+    #[test]
+    fn the_downloads_index_follows_the_order_saves_ran_in_across_ani_hops() {
+        let copy = watching(70_007, 5);
+        let root = ani::home().join("entries-order");
+        let (dir, hold) = ani::prepare_in(&root, &copy).unwrap();
+        let (fake, mut a) = anilist(&copy, false);
+        let mut b = Entries::new(fake);
+        let status = |s: &str| Change::Status(copy.clone(), s.into());
+        // a saves first and answers last
+        let first = a.begin(status("PAUSED")).run();
+        let last = b.begin(status("DROPPED")).run();
+        b.finish(last).unwrap();
+        a.finish(first).unwrap();
+        let indexed = ani::local_shows().into_iter().find(|s| s.0.id == copy.id);
+        let status = indexed.unwrap().0.media_list_entry.unwrap().status;
+        assert_eq!(status, "DROPPED", "as AniList has it");
+        drop(hold);
+        let _ = ani::delete_show(&dir);
     }
 
     #[test]
