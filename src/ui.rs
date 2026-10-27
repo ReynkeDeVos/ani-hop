@@ -32,7 +32,7 @@ pub fn render(app: &mut App, f: &mut Frame) {
     ])
     .areas(f.area());
     let screen = app.stack.last().unwrap();
-    let (left, right) = split(body, question(screen));
+    let (left, right) = split(body, question(screen).filter(|_| widens(&screen.view)));
     header(app, f, head);
     menu(app, f, left);
     if let Some(right) = right {
@@ -208,6 +208,15 @@ fn question_rows(q: &str, answers: usize, inner: Rect) -> (u16, bool) {
     let need = q.line_count(inner.width) as u16;
     let room = inner.height.saturating_sub(1 + answers as u16).max(1);
     (need.clamp(1, room), need <= room)
+}
+
+/// Whether a question too long beside the preview may take its place: not one whose preview
+/// lists what it acts on (the files Delete takes, the downloads Resume picks up).
+fn widens(view: &View) -> bool {
+    !matches!(
+        view,
+        View::Confirm(Pending::Delete(_) | Pending::Resume(..))
+    )
 }
 
 /// The menu's side of `body`, and the preview's: a question too long for its side takes the
@@ -952,6 +961,9 @@ mod tests {
             split(body(40, 12), None).1.is_some(),
             "other screens keep it"
         );
+        // and questions whose preview lists what they act on
+        assert!(!widens(&View::Confirm(Pending::Delete(Vec::new()))));
+        assert!(widens(&View::Confirm(Pending::Remove(Media::default()))));
     }
 
     #[test]
