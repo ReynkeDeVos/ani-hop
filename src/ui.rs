@@ -45,13 +45,13 @@ pub fn render(app: &mut App, f: &mut Frame) {
 pub fn effects_running(app: &App) -> bool {
     app.started.elapsed().as_millis() < BOOT_MS
         || app.glint.1.elapsed().as_millis() < GLINT_MS
-        || app.playing.as_ref().is_some_and(|p| p.step.is_some())
+        || app.playback.now().is_some_and(|p| p.step.is_some())
 }
 
 /// While an episode starts, a box pops up in the middle with a running bar, so enter
 /// visibly did something at once. It goes when mpv shows the episode.
 fn starting(app: &App, f: &mut Frame) {
-    let Some((p, step)) = app.playing.as_ref().and_then(|p| Some((p, p.step?))) else {
+    let Some((p, step)) = app.playback.now().and_then(|p| Some((p, p.step?))) else {
         return;
     };
     // the cover color, unless it's too dark to see
@@ -322,7 +322,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     }
 
     // the episode being started shows it right where enter was pressed
-    let busy = app.playing.as_ref().and_then(|p| {
+    let busy = app.playback.now().and_then(|p| {
         let key = match &screen.view {
             View::Episodes(m, EpMode::Play) if m.id == p.id => p.ep.clone(),
             View::Show(m) if m.id == p.id && next.as_ref() == Some(&p.ep) => "next".into(),
@@ -1125,7 +1125,7 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     // read once: the worker can take the last one off between two reads
     let dl = app.downloads.snapshot();
     let n = dl.pending;
-    let status = match (toast, &app.playing) {
+    let status = match (toast, app.playback.now()) {
         // shortcut: what's still underway is told apart by its "…"; give toasts a kind once a
         // finished one can end in "…"
         (Some((text, err, _)), _) => Line::styled(

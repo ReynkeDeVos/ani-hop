@@ -7,6 +7,7 @@ mod entries;
 mod kitty;
 mod lists;
 mod menu;
+mod playback;
 mod progress;
 mod show_downloads;
 mod source;
@@ -17,6 +18,7 @@ use downloads::{AniCli, Job, Queue};
 use entries::{Change, Entries, Stamp};
 use lists::{Feed, List};
 use menu::{Act, Item, Menu};
+use playback::{Playback, Start};
 use progress::{Mark, Parts, Progress};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -140,28 +142,16 @@ enum Msg {
     Resolved(Media, u64, Result<Source, String>),
     /// a change to the user's list, answered
     Entry(entries::Done),
-    /// (media, episode, what it waits on now; None = the player is up)
-    PlayStep(u64, String, Option<&'static str>),
-    Played(Media, String, Result<(), String>),
+    /// (Playback attempt, what it waits on now; None = the player is up)
+    PlayStep(u64, Option<&'static str>),
+    /// (Playback attempt, show, episode, how it ended)
+    Played(u64, Media, String, Result<(), String>),
     /// an episode downloaded or failed: ("Show E3", result)
     DlDone(String, Result<(), String>),
     /// (version, update command) of a newer ani-hop
     Release(Option<(String, String)>),
 }
 
-/// The episode being started or watched.
-pub struct Playing {
-    pub id: u64,
-    pub ep: String,
-    pub title: String,
-    /// what it waits on, None once mpv shows it
-    pub step: Option<&'static str>,
-    /// when enter was pressed, for the pop-up
-    pub since: Instant,
-    pub color: Option<String>,
-}
-
-const SEARCHING: &str = "searching ani-cli";
 const PAUSED: &str = "Paused downloads · enter on a queued episode resumes them";
 
 pub struct App {
@@ -187,7 +177,7 @@ pub struct App {
     elsewhere: HashMap<u64, Vec<String>>,
     resolving: HashMap<u64, Option<Want>>,
     pub downloads: Queue,
-    pub playing: Option<Playing>,
+    pub playback: Playback,
     pub toast: Option<(String, bool, Instant)>,
     pub started: Instant,
     /// media whose title glint plays, and since when
@@ -452,7 +442,7 @@ impl App {
             local: HashMap::new(),
             elsewhere: HashMap::new(),
             resolving: HashMap::new(),
-            playing: None,
+            playback: Playback::new(Arc::new(playback::Mpv)),
             toast: None,
             started: Instant::now(),
             glint: (0, Instant::now()),
@@ -1665,56 +1655,21 @@ impl App {
     }
 
     fn play(&mut self, m: Media, ep: String) {
-        // a second enter would open a second player
-        if let Some(p) = &self.playing
-            && p.step.is_some()
-        {
-            return self.toast(format!("Still starting {}…", p.title), false);
-        }
-        let local = ani::local_episodes(&ani::folder(&m))
+        let file = ani::local_episodes(&ani::folder(&m))
             .into_iter()
             .find(|(e, _)| *e == ep);
-        let lookup = self.sources.lookup(m.id);
-        let step = match (&local, &lookup) {
-            (Some(_), _) => "opening the player",
-            (None, Lookup::Resolve) => SEARCHING,
-            (_, Lookup::Check(_)) => "checking the source",
-            _ => "fetching the stream",
-        };
-        self.playing = Some(Playing {
-            id: m.id,
-            ep: ep.clone(),
-            // the number first: a long title loses its end, not the episode
-            title: format!("Episode {ep} · {}", m.name()),
-            step: Some(step),
-            since: Instant::now(),
-            color: m.cover_image.color.clone(),
-        });
-        if local.is_none() && matches!(lookup, Lookup::Resolve) {
-            return self.resolve(&m, Some(Want::Play(ep)));
+        let (lookup, audio) = (self.sources.lookup(m.id), ani::audio(Some(m.id)));
+        match (self.playback).start(&m, &ep, file.map(|f| f.1), lookup, audio) {
+            Start::Busy(title) => self.toast(format!("Still starting {title}…"), false),
+            Start::Lookup => self.resolve(&m, Some(Want::Play(ep))),
+            Start::Run(run) => {
+                let (tx, attempt) = (self.tx.clone(), run.attempt);
+                self.spawn(move || {
+                    let res = run.run(&|step| _ = tx.send(Msg::PlayStep(attempt, step)));
+                    Msg::Played(attempt, m, ep, res)
+                });
+            }
         }
-        let (tx, id, e) = (self.tx.clone(), m.id, ep.clone());
-        let step = move |s| _ = tx.send(Msg::PlayStep(id, e.clone(), s));
-        let audio = ani::audio(Some(m.id));
-        self.spawn(move || {
-            let stream = |s: &Source| match ani::stream(s, &ep, audio, || step(None)) {
-                // dubs come later or not at all, the subtitled one is the next best
-                Err(e) if ani::dub(audio) && e.contains("dub") => {
-                    step(Some("no dub yet, fetching it with subtitles"));
-                    ani::stream(s, &ep, "sub", || step(None))
-                }
-                res => res,
-            };
-            let res = match (&local, lookup) {
-                (Some((_, file)), _) => ani::play_file(&m, &ep, file, || step(None)),
-                (_, Lookup::Ready(src)) => stream(&src),
-                (_, lookup) => lookup.run(&m).and_then(|s| {
-                    step(Some("fetching the stream"));
-                    stream(&s)
-                }),
-            };
-            Msg::Played(m, ep, res)
-        });
     }
 
     /// Shows AniList sent for a read asked at `stamp`, carrying the newest Entries known. An
@@ -1864,11 +1819,7 @@ impl App {
                 if !self.sources.answer(m.id, ticket, &res) {
                     return;
                 }
-                let want = self.resolving.remove(&m.id).flatten();
-                // the wait is over either way; playing it starts anew below
-                let waited = self
-                    .playing
-                    .take_if(|p| p.id == m.id && p.step == Some(SEARCHING));
+                let (id, want) = (m.id, self.resolving.remove(&m.id).flatten());
                 let here = matches!(&self.top().view, View::Show(s) | View::Episodes(s, _) if s.id == m.id);
                 match res {
                     Ok(_) => {
@@ -1893,12 +1844,8 @@ impl App {
                     }
                     Err(_) => {}
                 }
-                // same pop-up, it doesn't pop in a second time
-                if let (Some(w), Some(p)) = (waited, &mut self.playing)
-                    && p.id == w.id
-                {
-                    p.since = w.since;
-                }
+                // a play that waited on it and didn't start again (failed, or the page was left)
+                self.playback.give_up(id);
                 self.refresh();
             }
             Msg::Entry(done) => {
@@ -1912,22 +1859,9 @@ impl App {
                 }
                 self.refresh();
             }
-            Msg::PlayStep(id, ep, step) => {
-                if let Some(p) = &mut self.playing
-                    && p.id == id
-                    && p.ep == ep
-                {
-                    p.step = step;
-                }
-            }
-            Msg::Played(m, ep, res) => {
-                if self
-                    .playing
-                    .as_ref()
-                    .is_some_and(|p| p.id == m.id && p.ep == ep)
-                {
-                    self.playing = None;
-                }
+            Msg::PlayStep(attempt, step) => self.playback.step(attempt, step),
+            Msg::Played(attempt, m, ep, res) => {
+                self.playback.ended(attempt);
                 // not watched yet, as far as the show or the part it's in goes
                 let mark = self.progress(&m).unwatched(&ep);
                 match res {

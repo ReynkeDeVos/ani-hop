@@ -39,6 +39,12 @@ Finding a show's source by searching its titles and matching them to the provide
 A source the user chose by hand with Change source, used from then on.
 _Avoid_: override
 
+## Playing
+
+**Playback attempt**:
+One start of an episode, from enter until its player closes: a downloaded file, or a stream from the show's source.
+_Avoid_: playback session
+
 ## Downloads
 
 **Download queue**:
