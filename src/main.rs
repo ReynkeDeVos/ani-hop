@@ -100,7 +100,15 @@ pub struct Screen {
     pub title: String,
     pub view: View,
     pub menu: Menu,
-    pub loading: bool,
+    /// waits on a background result other than a list's (Pick source's search)
+    waiting: bool,
+}
+
+impl Screen {
+    /// Something it shows is on its way.
+    pub fn loading(&self) -> bool {
+        self.waiting || matches!(&self.view, View::Shows(list) if list.loading())
+    }
 }
 
 enum Want {
@@ -745,7 +753,7 @@ impl App {
             title: title.into(),
             view,
             menu,
-            loading: false,
+            waiting: false,
         });
         self.next_id
     }
@@ -762,11 +770,9 @@ impl App {
         let cache = cache.map(|k| lists::cache(&k));
         let (list, ask) = List::open(feed, cache, std::time::SystemTime::now());
         let id = self.push(title, View::Shows(list));
-        let Some(ask) = ask else {
-            return;
-        };
-        self.top().loading = true;
-        self.spawn(move || Msg::Shows(id, f(), ask));
+        if let Some(ask) = ask {
+            self.spawn(move || Msg::Shows(id, f(), ask));
+        }
     }
 
     fn pop(&mut self, n: usize) {
@@ -835,7 +841,7 @@ impl App {
     /// Something on screen changes without input (spinner, progress, fading toast).
     fn animating(&self) -> bool {
         ui::effects_running(self)
-            || self.stack.last().unwrap().loading
+            || self.stack.last().unwrap().loading()
             || self.downloads.snapshot().pending > 0 && !self.downloads.snapshot().paused
             || self
                 .toast
@@ -1564,13 +1570,12 @@ impl App {
     /// Fetches the next page of the ranking on top, as "More…" and ^f do.
     fn more(&mut self) {
         let screen = self.top();
-        let (id, refreshing) = (screen.id, screen.loading);
+        let id = screen.id;
         let View::Shows(list) = &mut screen.view else {
             return;
         };
-        match list.more(refreshing) {
+        match list.more() {
             Ok(Some((sort, page))) => {
-                self.top().loading = true;
                 let c = self.client.clone();
                 self.spawn(move || Msg::More(id, c.browse(&sort, None, page)));
             }
@@ -1711,7 +1716,7 @@ impl App {
             },
             Input::SourceQuery(m) => {
                 let id = self.push("Pick source", View::Sources(m, text.clone(), Vec::new()));
-                self.top().loading = true;
+                self.top().waiting = true;
                 self.spawn(move || Msg::Hits(id, source::search(&text).map(|r| r.0)));
             }
         }
@@ -1881,16 +1886,16 @@ impl App {
         });
     }
 
-    /// Fills a screen that waited on a background result. On failure it goes away, unless
-    /// it already shows something (cached entries stay usable offline).
-    fn fill<T>(&mut self, id: u64, res: Result<T, String>, set: impl FnOnce(&mut View, T)) {
+    /// Hands a background result to the screen that waited on it, through `set`. On failure
+    /// the screen goes away, unless it already shows something (cached entries stay usable
+    /// offline), and says why.
+    fn fill(&mut self, id: u64, set: impl FnOnce(&mut View) -> Result<(), String>) {
         let Some(pos) = self.stack.iter().position(|s| s.id == id) else {
             return;
         };
-        self.stack[pos].loading = false;
-        match res {
-            Ok(data) => {
-                set(&mut self.stack[pos].view, data);
+        self.stack[pos].waiting = false;
+        match set(&mut self.stack[pos].view) {
+            Ok(()) => {
                 let items = self.items(&self.stack[pos].view);
                 self.stack[pos].menu.set_items(items);
             }
@@ -1937,10 +1942,9 @@ impl App {
                     .as_ref()
                     .is_ok_and(|l| l.iter().any(|m| !m.on_anilist()))
                     && self.stack.iter().any(|s| s.id == id);
-                self.fill(id, res, |v, shows| {
-                    if let View::Shows(list) = v {
-                        list.refreshed(ask, shows);
-                    }
+                self.fill(id, |v| match v {
+                    View::Shows(list) => list.refreshed(ask, res),
+                    _ => Ok(()),
                 });
                 if fallback {
                     self.toast("AniList search failed, showing ani-cli's matches", true);
@@ -1953,15 +1957,12 @@ impl App {
             }
             Msg::Local(Err(_)) => {}
             Msg::More(id, res) => {
-                let screen = self.stack.iter_mut().find(|s| s.id == id);
-                if let Some(View::Shows(list)) = screen.map(|s| &mut s.view) {
-                    list.fetched();
-                }
                 let mut first = None; // Some(None): the page brought nothing new
-                self.fill(id, res, |v, more| {
+                self.fill(id, |v| {
                     if let View::Shows(list) = v {
-                        first = Some(list.more_came(more));
+                        first = Some(list.more_came(res)?);
                     }
+                    Ok(())
                 });
                 match (first, self.stack.iter_mut().find(|s| s.id == id)) {
                     (Some(Some(key)), Some(s)) => s.menu.select_key(&key),
@@ -1969,10 +1970,11 @@ impl App {
                     _ => {}
                 }
             }
-            Msg::Hits(id, res) => self.fill(id, res, |v, hits| {
+            Msg::Hits(id, res) => self.fill(id, |v| {
                 if let View::Sources(_, _, h) = v {
-                    *h = hits;
+                    *h = res?;
                 }
+                Ok(())
             }),
             // asked before logging out or in again: about another login
             Msg::Viewer(token, _) if token != self.client.token => {}

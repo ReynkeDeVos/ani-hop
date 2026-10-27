@@ -281,17 +281,17 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         ),
     };
     let mut info = vec![Span::styled(
-        if m.items.is_empty() && screen.loading {
+        if m.items.is_empty() && screen.loading() {
             String::new()
         } else {
             count
         },
         DIM,
     )];
-    if screen.loading {
+    if screen.loading() {
         info.push(Span::styled(format!(" {spin}"), ACCENT));
     }
-    if screen.loading && m.items.is_empty() {
+    if screen.loading() && m.items.is_empty() {
         f.render_widget(skeleton(list_area, shimmer), list_area);
     }
     if !m.marked.is_empty() {
@@ -308,7 +308,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     f.render_widget(Line::from(info), info_area);
     // an empty list says so, instead of a bare 0
     let empty = match &screen.view {
-        _ if !m.items.is_empty() || screen.loading => None,
+        _ if !m.items.is_empty() || screen.loading() => None,
         View::Shows(list) if list.is_local() => Some("Nothing downloaded yet"),
         View::Shows(list) if list.is_search() => Some("No shows found"),
         View::Shows(..) => Some("Nothing on this list"),
