@@ -63,6 +63,9 @@ pub struct Entries {
     known: HashMap<u64, Known>,
     /// the Entries kept for the Downloads list as last read (`catch_up`), by any ani-hop
     kept: ani::Learnt,
+    /// every Entry the Downloads list showed this session, by show: where a copy without a
+    /// Known may have come from
+    listed: HashMap<u64, Vec<Entry>>,
     pending: usize,
 }
 
@@ -112,6 +115,7 @@ impl Entries {
             login: 0,
             known: HashMap::new(),
             kept: ani::learnt(),
+            listed: HashMap::new(),
             pending: 0,
         }
     }
@@ -122,15 +126,22 @@ impl Entries {
     pub fn entry<'a>(&'a self, m: &'a Media) -> Option<&'a Entry> {
         let known = self.known.get(&m.id);
         let here = known.map_or(m.media_list_entry.as_ref(), |k| k.entry.as_ref());
-        match self.kept.get(&m.id) {
-            // a copy without a Known is from a cache, which the kept Entry is never older than
-            Some((Some(kept), when))
-                if here.is_some_and(|e| e.id == kept.id)
-                    && known.is_none_or(|k| k.when < *when) =>
-            {
-                Some(kept)
-            }
-            _ => here,
+        let Some((Some(kept), when)) = self.kept.get(&m.id) else {
+            return here;
+        };
+        let newer = match known {
+            Some(k) => k.when < *when,
+            // a copy the Downloads list showed, which the kept one followed; not one from a
+            // cache, which can be newer than what's kept: queuing a show keeps what this
+            // session read, when it read it
+            // shortcut: a cached copy equal to one the Downloads list showed gives way too,
+            // wrong only if progress went back and forth between two ani-hops' reads, one from
+            // before the show was kept; read times on copies if that ever shows up
+            None => here.is_some_and(|e| self.listed.get(&m.id).is_some_and(|l| l.contains(e))),
+        };
+        match here.is_some_and(|e| e.id == kept.id) && newer {
+            true => Some(kept),
+            false => here,
         }
     }
 
@@ -247,10 +258,17 @@ impl Entries {
         }
     }
 
-    /// Reads the Entries kept for the Downloads list again, as a rescan brings them there:
-    /// another ani-hop's saves and reads since, which `entry` goes by where they're newer.
-    pub fn catch_up(&mut self) {
+    /// Reads the Entries kept for the Downloads list again, as a rescan brings them there
+    /// with the shows it `listed`: another ani-hop's saves and reads since, which `entry` goes
+    /// by where they're newer.
+    pub fn catch_up<'a>(&mut self, listed: impl IntoIterator<Item = &'a Media>) {
         self.kept = ani::learnt();
+        for m in listed {
+            let shown = self.listed.entry(m.id).or_default();
+            if let Some(e) = m.media_list_entry.as_ref().filter(|e| !shown.contains(e)) {
+                shown.push(e.clone());
+            }
+        }
     }
 
     /// Another login, or none: what was known was the old login's, and its writes still out
@@ -625,7 +643,7 @@ mod tests {
             "Saved Show · Watching · 9/12"
         );
         assert_eq!(entries.entry(&copy).unwrap().progress, 5);
-        entries.catch_up();
+        entries.catch_up(&listed());
         assert_eq!(entries.progress(&copy, &[]).mark("10").unwrap().was, 9);
         drop(hold);
         let _ = ani::delete_show(&dir);
@@ -638,15 +656,17 @@ mod tests {
         let root = ani::home().join("entries-open-page");
         let (dir, hold) = ani::prepare_in(&root, &copy).unwrap();
         let (fake, mut entries) = anilist(&copy, false);
+        entries.catch_up(&listed());
+        let page = listed().into_iter().find(|m| m.id == copy.id).unwrap();
         mark(&mut Entries::new(fake), &copy, "9");
-        assert_eq!(entries.progress(&copy, &[]).next(), 6);
-        entries.catch_up();
+        assert_eq!(entries.progress(&page, &[]).next(), 6);
+        entries.catch_up(&listed());
         assert_eq!(
-            entries.progress(&copy, &[]).next(),
+            entries.progress(&page, &[]).next(),
             10,
             "Continue with episode 10"
         );
-        assert_eq!(entries.progress(&copy, &[]).mark("10").unwrap().was, 9);
+        assert_eq!(entries.progress(&page, &[]).mark("10").unwrap().was, 9);
         drop(hold);
         let _ = ani::delete_show(&dir);
     }
@@ -667,7 +687,7 @@ mod tests {
         // the old login's save answers last, and is kept for the Downloads list
         assert!(entries.finish(work.run()).is_none());
         assert_eq!(kept(&copy), 6);
-        entries.catch_up();
+        entries.catch_up(&listed());
         assert_eq!(
             entries.entry(&copy).unwrap().progress,
             2,
@@ -675,6 +695,38 @@ mod tests {
         );
         drop(hold);
         let _ = ani::delete_show(&dir);
+    }
+
+    /// The shows the Downloads list has, as a rescan finds them.
+    fn listed() -> Vec<Media> {
+        ani::local_shows().into_iter().map(|(m, _)| m).collect()
+    }
+
+    #[test]
+    fn a_cached_copy_newer_than_what_queuing_kept_stays() {
+        // read here at `was`, then elsewhere at `cached`, before the show was downloaded or
+        // queued; then queued here, which keeps `was`, with when it was read
+        let check = |id, was, cached| {
+            let read = watching(id, was);
+            let (fake, mut here) = anilist(&read, false);
+            assert!(here.observe(here.stamp(), [&mut read.clone()]));
+            let mut elsewhere = Entries::new(fake.clone());
+            let copy = watching(id, cached);
+            assert!(elsewhere.observe(elsewhere.stamp(), [&mut copy.clone()]));
+            here.remember(&read);
+            let root = ani::home().join(format!("entries-queued-{id}"));
+            let (dir, hold) = ani::prepare_in(&root, &read).unwrap();
+            assert_eq!(kept(&read), was);
+            // a later session shows the list cached elsewhere
+            let mut later = Entries::new(fake);
+            later.catch_up(&listed());
+            assert_eq!(later.entry(&copy).unwrap().progress, cached);
+            assert_eq!(later.progress(&copy, &[]).next(), cached + 1);
+            drop(hold);
+            let _ = ani::delete_show(&dir);
+        };
+        check(70_015, 5, 9);
+        check(70_016, 9, 2);
     }
 
     #[test]

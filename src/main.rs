@@ -1909,6 +1909,7 @@ impl App {
                 }
             }
             Msg::Scanned(found) => {
+                self.entries.catch_up(found.iter().map(|(m, _)| m));
                 let again = self.scanning.take() == Some(true);
                 let shows;
                 (self.local, shows) = rescanned(found, &self.synced, &self.local);
@@ -1922,7 +1923,6 @@ impl App {
                     self.spawn(move || Msg::Local(stamp, c.shows(&ids)));
                 }
                 self.downloaded = Some(shows);
-                self.entries.catch_up();
                 self.rebuild();
                 // and the one asked for meanwhile, for the rest
                 if again {
