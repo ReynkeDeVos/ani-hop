@@ -515,13 +515,14 @@ fn audio_path() -> PathBuf {
     config_dir().join("audio.json")
 }
 
-/// What a show plays with, as (key, label). The provider has Japanese and English audio,
-/// both with English subtitles, which mpv shows or keeps hidden (v switches).
-pub const AUDIO: [(&str, &str); 4] = [
-    ("raw", "Japanese · no subtitles"),
-    ("sub", "Japanese · English subtitles"),
-    ("dub", "English dub"),
-    ("dub+sub", "English dub · English subtitles"),
+/// What a show plays with, as (key, label, the label for a narrow row). The provider has
+/// Japanese and English audio, both with English subtitles, which mpv shows or keeps hidden
+/// (v switches).
+pub const AUDIO: [(&str, &str, &str); 4] = [
+    ("raw", "Japanese · no subtitles", "no subs"),
+    ("sub", "Japanese · English subtitles", "subtitled"),
+    ("dub", "English dub", "dubbed"),
+    ("dub+sub", "English dub · English subtitles", "dub + subs"),
 ];
 
 /// Audio chosen per AniList id and for "all" shows, as AUDIO keys.
@@ -550,6 +551,11 @@ fn audio_in(all: &HashMap<String, String>, id: Option<u64>) -> &'static str {
 
 pub fn audio_label(audio: &str) -> &'static str {
     AUDIO.iter().find(|a| a.0 == audio).map_or("", |a| a.1)
+}
+
+/// The audio's label for a row too narrow for `audio_label`, which says the same.
+pub fn audio_short(audio: &str) -> &'static str {
+    AUDIO.iter().find(|a| a.0 == audio).map_or("", |a| a.2)
 }
 
 pub fn dub(audio: &str) -> bool {

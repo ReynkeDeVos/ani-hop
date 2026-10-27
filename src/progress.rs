@@ -176,12 +176,12 @@ impl Mark {
         }
     }
 
-    /// What Yes saves: "saves 3/12", "saves 1/10 to Part 2".
+    /// What Save saves: "3/12", "1/10 to Part 2".
     pub fn hint(&self) -> String {
         let total = self.entry.episodes.map_or("?".into(), |t| t.to_string());
         match self.part.as_str() {
-            "" => format!("saves {}/{total}", self.to),
-            part => format!("saves {}/{total} to {part}", self.to),
+            "" => format!("{}/{total}", self.to),
+            part => format!("{}/{total} to {part}", self.to),
         }
     }
 
@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(k.also(), "Adds it to Watching.");
         assert!(k.only_this());
         let k = mark(&watching(1, 12, 5), "6");
-        assert_eq!((k.also(), k.hint()), (String::new(), "saves 6/12".into()));
+        assert_eq!((k.also(), k.hint()), (String::new(), "6/12".into()));
         // the last one completes it, a rewatch stays one
         assert_eq!(mark(&watching(1, 12, 11), "12").status, "COMPLETED");
         let again = show(1, 12, Some((2, "REPEATING")));
@@ -306,7 +306,7 @@ mod tests {
             Some((2, 10, "Part 2".into())),
             "Part 2's last"
         );
-        assert_eq!(run.mark("16").unwrap().hint(), "saves 4/10 to Part 2");
+        assert_eq!(run.mark("16").unwrap().hint(), "4/10 to Part 2");
         // asked after playing only when it adds anything
         assert!(run.unwatched("15").is_none() && run.unwatched("12.5").is_none());
         assert_eq!(run.unwatched("16").map(|k| k.to), Some(4));

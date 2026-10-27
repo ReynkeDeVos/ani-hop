@@ -18,6 +18,8 @@ pub struct Item {
     pub action: bool,
     /// rows of another group start under a faint rule naming it (a sequel's episodes)
     pub group: String,
+    /// the hint said shorter, for a row too narrow for it ("subtitled")
+    pub short: String,
 }
 
 impl Item {
@@ -30,6 +32,7 @@ impl Item {
             about: String::new(),
             action: false,
             group: String::new(),
+            short: String::new(),
         }
     }
 }

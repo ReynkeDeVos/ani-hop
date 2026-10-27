@@ -627,6 +627,8 @@ impl App {
         let m = match &screen.view {
             View::Episodes(m, EpMode::Download) => m,
             View::Episodes(_, EpMode::Play) => return Some("play"),
+            View::Input(Input::Search | Input::SourceQuery(_)) => return Some("search"),
+            View::Input(_) => return Some("save"),
             _ => return Some("select"),
         };
         let eps: Vec<String> = (screen.menu.selection().iter())
@@ -886,11 +888,7 @@ impl App {
                     "Skip openings/endings",
                     if ani::skip_on() { "on" } else { "off" },
                 ),
-                Item::new(
-                    "audio",
-                    "Default audio…",
-                    ani::audio_label(ani::audio(None)),
-                ),
+                audio_item("Default audio…", ani::audio(None)),
                 Item::new(
                     "folder",
                     "Download folder…",
@@ -979,11 +977,7 @@ impl App {
                     let progress = format!("{}/{total}", entry.map_or(0, |e| e.progress));
                     v.push(Item::new("watched", "✓  Watched up to…", progress));
                 }
-                v.push(Item::new(
-                    "audio",
-                    "♪  Audio…",
-                    ani::audio_label(ani::audio(Some(m.id))),
-                ));
+                v.push(audio_item("♪  Audio…", ani::audio(Some(m.id))));
                 v.push(Item::new(
                     "source",
                     "⇄  Change source…",
@@ -1037,7 +1031,7 @@ impl App {
                 let (cur, default) = (ani::audio(id), ani::audio(None));
                 ani::AUDIO
                     .iter()
-                    .map(|(k, label)| {
+                    .map(|(k, label, _)| {
                         let mut hint = Vec::new();
                         if *k == cur {
                             hint.push("current");
@@ -1085,33 +1079,42 @@ impl App {
                 }
                 v
             }
-            // No discards what was downloaded so far; esc asks again next start
-            View::Confirm(Pending::Resume(..)) => vec![
-                Item::new("no", "No", "deletes partial files"),
-                Item::new("yes", "Yes", ""),
-            ],
-            // what it saves, as that can be the entry's last (the second half of a special)
-            // or a part's
-            View::Confirm(Pending::Progress(mark)) => {
+            // the safe answer first, both named by what they do, with what that changes
+            View::Confirm(p) => {
+                let (no, yes, no_hint, yes_hint) = match p {
+                    Pending::Delete(_) => ("Keep", "Delete", "", String::new()),
+                    Pending::Stop(m, eps) => {
+                        let parts = self.show_downloads(m).deletes(eps);
+                        let hint = show_downloads::deletes_hint(&parts);
+                        ("Keep downloading", "Stop", "", hint)
+                    }
+                    Pending::Pause(..) => ("Keep going", "Pause", "", String::new()),
+                    Pending::Remove(_) => ("Keep on list", "Remove", "", String::new()),
+                    // what it saves, as that can be the entry's last (the second half of a
+                    // special) or a part's
+                    Pending::Progress(mark) => ("Don't save", "Save", "", mark.hint()),
+                    Pending::Quit => {
+                        // when it asks about downloads, which it doesn't while they're paused
+                        let s = self.downloads.snapshot();
+                        let hint = match s.pending > 0 && !s.paused {
+                            true => "downloads kept for next start",
+                            false => "",
+                        };
+                        ("Stay", "Quit", "", hint.into())
+                    }
+                    // dropping them deletes what they got; esc asks again next start
+                    Pending::Resume(..) => (
+                        "Drop them",
+                        "Resume",
+                        "deletes partial files",
+                        String::new(),
+                    ),
+                };
                 vec![
-                    Item::new("no", "No", ""),
-                    Item::new("yes", "Yes", mark.hint()),
+                    Item::new("no", no, no_hint),
+                    Item::new("yes", yes, yes_hint),
                 ]
             }
-            View::Confirm(Pending::Stop(m, eps)) => {
-                let hint = show_downloads::deletes_hint(&self.show_downloads(m).deletes(eps));
-                vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
-            }
-            View::Confirm(Pending::Quit) => {
-                // when it asks about downloads, which it doesn't while they're paused
-                let s = self.downloads.snapshot();
-                let hint = match s.pending > 0 && !s.paused {
-                    true => "kept for next start",
-                    false => "",
-                };
-                vec![Item::new("no", "No", ""), Item::new("yes", "Yes", hint)]
-            }
-            View::Confirm(_) => vec![Item::new("no", "No", ""), Item::new("yes", "Yes", "")],
             View::Input(_) => Vec::new(),
         }
     }
@@ -1913,6 +1916,13 @@ impl App {
             Msg::Release(v) => self.release = v,
         }
     }
+}
+
+/// The row for choosing audio, saying the one now: shorter where the row is narrow.
+fn audio_item(label: &str, audio: &str) -> Item {
+    let mut it = Item::new("audio", label, ani::audio_label(audio));
+    it.short = ani::audio_short(audio).into();
+    it
 }
 
 /// The show a screen is about, whose downloads it shows.

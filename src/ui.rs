@@ -155,17 +155,25 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
     };
     let [crumbs_area, user_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(user.width() as u16)])
+            .spacing(1)
             .areas(area);
-    // newest crumbs first; whatever doesn't fit folds into "…" (the current one never does)
+    // newest crumbs first; whatever doesn't fit folds into "…", and the current one is cut
+    // in the middle, keeping a season's or part's name
+    let crumbs: Vec<&str> = app.stack.iter().skip(1).rev().map(crumb).collect();
     let mut room = (crumbs_area.width as usize).saturating_sub(10);
-    let mut shown = Vec::new();
-    for t in app.stack.iter().skip(1).rev().map(crumb) {
-        let w = Span::raw(t).width() + 3;
-        if w > room && !shown.is_empty() {
-            shown.push("…");
-            break;
-        }
-        room = room.saturating_sub(w);
+    let mut shown: Vec<String> = Vec::new();
+    for (i, t) in crumbs.iter().enumerate() {
+        // room for " › …" while older ones follow
+        let fold = if i + 1 < crumbs.len() { 4 } else { 0 };
+        let t = match i {
+            0 => fit_middle(t, room.saturating_sub(3 + fold)),
+            _ if Span::raw(*t).width() + 3 + fold > room => {
+                shown.push("…".into());
+                break;
+            }
+            _ => t.to_string(),
+        };
+        room = room.saturating_sub(Span::raw(t.as_str()).width() + 3);
         shown.push(t);
     }
     let mut crumbs = vec![Span::styled(
@@ -322,7 +330,8 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let fetching = matches!(&screen.view, View::Shows(list) if list.fetching());
     let busy = busy.or_else(|| fetching.then(|| ("more".to_string(), format!("{spin} loading…"))));
     let busy = busy.or(dl_row);
-    let width = list_area.width.saturating_sub(1) as usize; // minus the pointer column
+    let width = list_area.width.saturating_sub(1).max(2) as usize; // minus the pointer column
+    let titles = matches!(screen.view, View::Shows(..) | View::Sources(..));
     let selected = m.state.selected();
     let rows: Vec<ListItem> = (m.matches.iter().enumerate())
         .map(|(k, (i, hits))| {
@@ -333,17 +342,27 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 _ => " ",
             };
             let mut spans = vec![Span::styled(mark, Color::Green), " ".into()];
-            spans.extend(item.label.chars().enumerate().map(|(ci, ch)| {
+            let plain = if item.done { SOFT } else { Style::new() };
+            let chars = item.label.char_indices().enumerate().map(|(ci, (at, ch))| {
                 let hit = hits.binary_search(&(ci as u32)).is_ok();
-                Span::styled(
-                    ch.to_string(),
-                    match (hit, item.done) {
-                        (true, _) => Style::new().fg(MATCH).bold(),
-                        (false, true) => SOFT,
-                        _ => Style::new(),
-                    },
-                )
-            }));
+                let style = if hit {
+                    Style::new().fg(MATCH).bold()
+                } else {
+                    plain
+                };
+                (at, Span::styled(ch.to_string(), style))
+            });
+            // a show's title too long for its row keeps its end, as seasons and parts of one
+            // show differ there: "Attack on Titan Fi…Special 2"
+            match titles.then(|| middle_cut(&item.label, width - 2)).flatten() {
+                Some((head, tail)) => {
+                    let chars: Vec<_> = chars.collect();
+                    spans.extend(chars.iter().filter(|c| c.0 < head).map(|c| c.1.clone()));
+                    spans.push(Span::styled("…", plain));
+                    spans.extend(chars.into_iter().filter(|c| c.0 >= tail).map(|c| c.1));
+                }
+                None => spans.extend(chars.map(|c| c.1)),
+            }
             let mut used: usize = spans.iter().map(|s| s.width()).sum();
             // a title too long for the row ends in "…", like a cut hint
             if used > width {
@@ -352,10 +371,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 {
                     used -= s.width();
                 }
-                spans.push(Span::styled(
-                    "…",
-                    if item.done { SOFT } else { Style::new() },
-                ));
+                spans.push(Span::styled("…", plain));
                 used += 1;
             }
             let room = width.saturating_sub(used + 2);
@@ -364,6 +380,9 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 _ => (item.hint.clone(), DIM),
             };
             let mut hint = hint;
+            if Span::raw(hint.as_str()).width() > room && !item.short.is_empty() {
+                hint = item.short.clone();
+            }
             while Span::raw(hint.as_str()).width() > room
                 && let Some((head, _)) = hint.rsplit_once(" · ")
             {
@@ -430,22 +449,18 @@ fn skeleton(area: Rect, tick: usize) -> Text<'static> {
 fn input_help(input: &Input) -> Text<'static> {
     let lines: Vec<Line> = match input {
         Input::Search => vec!["Type a title and press enter.".into()],
+        // one line per step or idea, wrapped by the pane, as 80 columns leave it 29
         Input::ClientId => vec![
             "One-time setup: ani-hop needs your own AniList API client.".into(),
             "".into(),
-            "1. Open anilist.co/settings/developer".into(),
-            "   → Create New Client".into(),
-            "2. Name: ani-hop".into(),
-            "   Redirect URL:".into(),
-            Line::from(vec![
-                "   ".into(),
-                Span::styled(PIN_REDIRECT, Style::new().fg(ACCENT).not_dim()),
-            ]),
-            "3. Paste the client ID here and press enter.".into(),
+            "1. On anilist.co/settings/developer, choose Create New Client.".into(),
+            "2. Name it ani-hop, with this redirect URL:".into(),
+            Line::styled(PIN_REDIRECT, Style::new().fg(ACCENT).not_dim()),
+            "3. Paste its client ID here and press enter.".into(),
         ],
         Input::Token => vec![
-            "Approve ani-hop in your browser, then paste".into(),
-            "the token AniList shows and press enter.".into(),
+            "Approve ani-hop in your browser, then paste the token AniList shows and press enter."
+                .into(),
             "".into(),
             Line::styled(
                 "Pasting the whole redirect URL works too.",
@@ -455,15 +470,14 @@ fn input_help(input: &Input) -> Text<'static> {
             "Wrong client ID? Press enter with this empty.".into(),
         ],
         Input::SourceQuery(_) => vec![
-            "Search ani-cli with this text, then pick the".into(),
-            "right entry. ani-hop remembers the choice.".into(),
+            "Search ani-cli with this text, then pick the right entry. ani-hop remembers it."
+                .into(),
         ],
         Input::DownloadDir => vec![
-            "Where new downloads go. ~ works.".into(),
+            "Where downloads go. ~ works.".into(),
             format!("Empty goes back to {}.", ani::tilde(&ani::default_root())).into(),
             "".into(),
-            "Shows downloaded before keep their folder,".into(),
-            "new episodes of them too.".into(),
+            "Shows downloaded before keep their folder, also for new episodes.".into(),
         ],
     };
     Text::from(lines).style(SOFT)
@@ -811,6 +825,40 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(hints, hints_area);
 }
 
+/// Where to cut `label` to fit `room` columns, keeping its start and its last two words (or
+/// its last one), where a season or part says which it is: (end of the start, start of the
+/// end) as byte offsets. None when it fits, or when that end takes over half the room.
+fn middle_cut(label: &str, room: usize) -> Option<(usize, usize)> {
+    let width = |s: &str| Span::raw(s).width();
+    if width(label) <= room {
+        return None;
+    }
+    let starts: Vec<usize> = label.match_indices(' ').map(|(i, _)| i + 1).collect();
+    let ends = [starts.iter().rev().nth(1), starts.last()];
+    let tail = *ends
+        .into_iter()
+        .flatten()
+        .find(|&&t| width(&label[t..]) <= room / 2)?;
+    let mut room = room - width(&label[tail..]) - 1;
+    let mut head = 0;
+    for (at, ch) in label.char_indices() {
+        let w = width(&label[at..at + ch.len_utf8()]);
+        if w > room {
+            break;
+        }
+        (room, head) = (room - w, at + ch.len_utf8());
+    }
+    Some((label[..head].trim_end().len(), tail))
+}
+
+/// `label` cut in the middle to fit `room` (`middle_cut`), else at its end.
+fn fit_middle(label: &str, room: usize) -> String {
+    match middle_cut(label, room) {
+        Some((head, tail)) => format!("{}…{}", &label[..head], &label[tail..]),
+        None => fit(label.to_string(), room),
+    }
+}
+
 /// `s` cut to `room` columns with "…", measured as drawn: CJK characters take two.
 fn fit(mut s: String, room: usize) -> String {
     if Span::raw(s.as_str()).width() > room {
@@ -852,5 +900,16 @@ mod tests {
         assert_eq!(fit("~/ビデオ/Anime".into(), 11), "~/ビデオ/A…");
         assert_eq!(fit("~/ビデオ/Anime".into(), 14), "~/ビデオ/Anime");
         assert_eq!(fit("on".into(), 0), "…");
+    }
+
+    #[test]
+    fn long_titles_keep_their_season() {
+        let special = "Attack on Titan Final Season THE FINAL CHAPTERS Special 2";
+        assert_eq!(fit_middle(special, 26), "Attack on Titan…Special 2");
+        let part = "Attack on Titan Final Season Part 2";
+        assert_eq!(fit_middle(part, 26), "Attack on Titan Fin…Part 2");
+        assert_eq!(fit_middle("Frieren", 26), "Frieren");
+        // without spaces there's no season to keep: cut at the end
+        assert_eq!(fit_middle("ビデオビデオビデオビデオ", 9), "ビデオビ…");
     }
 }
