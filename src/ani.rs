@@ -781,22 +781,33 @@ fn learnt_path() -> PathBuf {
     cache_dir().join("entries.json")
 }
 
-/// Keeps `entries` as AniList had them at `at` (ms since 1970), unless newer ones are kept:
-/// a save, of this ani-hop or another, or a refresh asked for before it, in any order.
+/// Keeps `entries` as AniList had them at `at` (ms since 1970), for the shows downloaded or
+/// queued (`new`: a download of them was just queued), unless newer ones are kept: a save,
+/// of this ani-hop or another, a list read before or after it, in any order. Other shows
+/// aren't kept, so an old save of one can't outlast a fresher list once it's downloaded.
 /// shortcut: ordered by the wall clock, which a clock set back can fool until the next save.
-pub fn learn(entries: impl IntoIterator<Item = (u64, Option<Entry>)>, at: u64) {
+pub fn learn(entries: impl IntoIterator<Item = (u64, Option<Entry>)>, at: u64, new: bool) {
     let path = learnt_path();
     let edit = || -> std::io::Result<()> {
         fs::create_dir_all(cache_dir())?;
         let lock = fs::File::create(path.with_extension("lock"))?;
         lock.lock()?;
         let mut all: Learnt = read_json(&path);
+        let downloaded: std::collections::HashSet<u64> =
+            index().values().map(|d| d.media.id).collect();
+        let mut changed = false;
         for (id, entry) in entries {
-            if all.get(&id).is_none_or(|k| k.1 <= at) {
+            let kept = all.get(&id).map(|k| k.1);
+            let ours = new || kept.is_some() || downloaded.contains(&id);
+            if ours && kept.is_none_or(|t| t <= at) {
                 all.insert(id, (entry, at));
+                changed = true;
             }
         }
-        write_json(&path, &all)
+        if changed {
+            write_json(&path, &all)?;
+        }
+        Ok(())
     };
     let _ = edit();
 }
@@ -1193,6 +1204,29 @@ fn left(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_the_newest_entries_of_downloaded_or_queued_shows() {
+        let at = |progress| {
+            let status = "CURRENT".into();
+            Some(Entry {
+                id: 1,
+                status,
+                progress,
+            })
+        };
+        let (queued, other) = (71_001, 71_002);
+        learn([(other, at(6))], 10, false);
+        learn([(queued, at(5))], 10, true);
+        learn([(queued, at(4))], 9, false);
+        let kept: Learnt = read_json(&learnt_path());
+        assert!(!kept.contains_key(&other), "never downloaded or queued");
+        assert_eq!(
+            kept[&queued].0.as_ref().map(|e| e.progress),
+            Some(5),
+            "the newest"
+        );
+    }
 
     #[test]
     fn tests_never_touch_the_real_home() {

@@ -29,8 +29,8 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use show_downloads::{Action, ShowDownloads, which};
 use source::{Lookup, Source, Sources};
+use std::collections::HashMap;
 use std::collections::hash_map::Entry::Vacant;
-use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -147,7 +147,7 @@ enum Msg {
     /// (Playback attempt, show, episode, how it ended)
     Played(u64, Media, String, Result<(), String>),
     /// what a rescan of the download folder found: the shows and their episodes
-    Scanned(Vec<(Media, Vec<(String, PathBuf)>)>),
+    Scanned(Vec<(Media, OnDisk)>),
     /// an episode downloaded or failed: ("Show E3", result)
     DlDone(String, Result<(), String>),
     /// (version, update command) of a newer ani-hop
@@ -175,13 +175,14 @@ pub struct App {
     parts: HashMap<u64, ((u32, u32), Parts)>,
     pub sources: Sources,
     /// downloaded episodes per show, as the last rescan found them
-    pub local: HashMap<u64, Vec<(String, PathBuf)>>,
+    pub local: HashMap<u64, OnDisk>,
     /// the downloaded shows, as the last rescan found them (none before the first)
     downloaded: Option<Vec<Media>>,
     /// a rescan of the download folder is on its way, and (true) another was asked for since
     scanning: Option<bool>,
-    /// shows rescanned on screen since the running rescan started, newer than what it finds
-    synced: HashSet<u64>,
+    /// shows rescanned on screen since the running rescan started, newer than what it finds:
+    /// each one if it's downloaded
+    synced: HashMap<u64, Option<Media>>,
     /// Downloads opened: AniList is asked about its shows once the rescan has them
     ask_local: bool,
     /// episodes per show other running ani-hops have queued, rescanned on refresh
@@ -449,7 +450,7 @@ impl App {
             local: HashMap::new(),
             downloaded: None,
             scanning: None,
-            synced: HashSet::new(),
+            synced: HashMap::new(),
             ask_local: false,
             elsewhere: HashMap::new(),
             resolving: HashMap::new(),
@@ -759,11 +760,12 @@ impl App {
     fn scan_local(&mut self, m: Option<&Media>) {
         self.elsewhere = self.downloads.elsewhere();
         if let Some(m) = m {
-            match ani::local_episodes(&ani::folder(m)) {
+            let dir = ani::folder(m);
+            match ani::local_episodes(&dir) {
                 eps if eps.is_empty() => _ = self.local.remove(&m.id),
                 eps => _ = self.local.insert(m.id, eps),
             }
-            self.synced.insert(m.id);
+            self.synced.insert(m.id, ani::ours(&dir).then(|| m.clone()));
         }
         match &mut self.scanning {
             Some(again) => *again = true,
@@ -1710,10 +1712,16 @@ impl App {
         stamp: Stamp,
         mut res: Result<Vec<Media>, String>,
     ) -> Result<Vec<Media>, String> {
-        match self.entries.observe(stamp, res.iter_mut().flatten()) {
-            true => res,
-            false => Err(String::new()),
+        if !self.entries.observe(stamp, res.iter_mut().flatten()) {
+            return Err(String::new());
         }
+        // for the Downloads list, also offline later: kept for the shows downloaded
+        let shows = res
+            .iter()
+            .flatten()
+            .map(|m| (m.id, m.media_list_entry.clone()));
+        ani::learn(shows, stamp.sent, false);
+        res
     }
 
     /// Hands a background result to the screen that waited on it, through `set`. On failure
@@ -1761,8 +1769,6 @@ impl App {
                 // offline is when downloads are watched: no error for that
                 if let Ok(fresh) = self.observed(stamp, res) {
                     ani::refresh_shows(&fresh);
-                    let entries = fresh.iter().map(|m| (m.id, m.media_list_entry.clone()));
-                    ani::learn(entries, stamp.sent);
                     self.refresh();
                 }
             }
@@ -1907,22 +1913,14 @@ impl App {
             }
             Msg::Scanned(found) => {
                 let again = self.scanning.take() == Some(true);
-                // what's on screen was rescanned since this one started: that stays
-                let mut local: HashMap<u64, Vec<(String, PathBuf)>> =
-                    (found.iter()).map(|(m, eps)| (m.id, eps.clone())).collect();
-                for id in &self.synced {
-                    match self.local.get(id) {
-                        Some(eps) => _ = local.insert(*id, eps.clone()),
-                        None => _ = local.remove(id),
-                    }
-                }
-                self.local = local;
-                let shows: Vec<Media> = found.into_iter().map(|(m, _)| m).collect();
+                let shows;
+                (self.local, shows) = rescanned(found, &self.synced, &self.local);
                 // saved when downloaded, maybe weeks ago: their progress is AniList's now
                 let ids: Vec<u64> = (shows.iter().filter(|m| m.on_anilist()))
                     .map(|m| m.id)
                     .collect();
-                if std::mem::take(&mut self.ask_local) && !ids.is_empty() {
+                if self.ask_local && !ids.is_empty() {
+                    self.ask_local = false;
                     let (c, stamp) = (self.client.clone(), self.entries.stamp());
                     self.spawn(move || Msg::Local(stamp, c.shows(&ids)));
                 }
@@ -1955,6 +1953,32 @@ fn audio_item(label: &str, audio: &str) -> Item {
     let mut it = Item::new("audio", label, ani::audio_label(audio));
     it.short = ani::audio_short(audio).into();
     it
+}
+
+/// A show's downloaded episodes, as (episode, file).
+type OnDisk = Vec<(String, PathBuf)>;
+
+/// Episodes on disk per show, and the downloaded shows, by name, as a rescan `found` them,
+/// but the shows `synced` on screen since it started as the screen found them (`local`):
+/// their episodes, and whether they're downloaded at all.
+fn rescanned(
+    found: Vec<(Media, OnDisk)>,
+    synced: &HashMap<u64, Option<Media>>,
+    local: &HashMap<u64, OnDisk>,
+) -> (HashMap<u64, OnDisk>, Vec<Media>) {
+    let (mut shows, mut eps): (Vec<Media>, HashMap<_, _>) = (found.into_iter())
+        .map(|(m, e)| (m.clone(), (m.id, e)))
+        .unzip();
+    for (id, show) in synced {
+        shows.retain(|m| m.id != *id);
+        shows.extend(show.clone());
+        match local.get(id) {
+            Some(e) => _ = eps.insert(*id, e.clone()),
+            None => _ = eps.remove(id),
+        }
+    }
+    shows.sort_by(|a, b| a.name().cmp(b.name()));
+    (eps, shows)
 }
 
 /// The show a screen is about, whose downloads it shows.
@@ -2004,6 +2028,28 @@ pub fn in_child(name: &str, env: &[(&str, std::ffi::OsString)]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_rescan_keeps_what_the_screen_found_since() {
+        use std::path::PathBuf;
+        let show = |id, name: &str| {
+            let mut m = super::Media {
+                id,
+                ..Default::default()
+            };
+            m.title.romaji = Some(name.into());
+            m
+        };
+        let eps = |e: &str| vec![(e.to_string(), PathBuf::from(format!("{e}.mp4")))];
+        // it found A, deleted on screen since, and C; not B, downloaded on screen since
+        let found = vec![(show(1, "A"), eps("1")), (show(3, "C"), eps("1"))];
+        let synced = super::HashMap::from([(1, None), (2, Some(show(2, "B")))]);
+        let local = super::HashMap::from([(2, eps("4"))]);
+        let (now, shows) = super::rescanned(found, &synced, &local);
+        let names: Vec<&str> = shows.iter().map(|m| m.name()).collect();
+        assert_eq!(names, ["B", "C"]);
+        assert!(!now.contains_key(&1) && now[&2] == eps("4") && now.contains_key(&3));
+    }
+
     #[test]
     fn token_from_url_or_bare() {
         assert_eq!(

@@ -243,7 +243,7 @@ impl Entries {
     /// is queued: a show's first one starts its Show folder with it.
     pub fn remember(&self, m: &Media) {
         if let Some(k) = self.known.get(&m.id) {
-            ani::learn([(m.id, k.entry.clone())], k.time);
+            ani::learn([(m.id, k.entry.clone())], k.time, true);
         }
     }
 
@@ -290,7 +290,7 @@ impl Work {
             }?;
             let (Answer::Saved(entry) | Answer::Moved(entry)) = &answer;
             time = ani::now_ms();
-            ani::learn([(self.change.show().id, entry.clone())], time);
+            ani::learn([(self.change.show().id, entry.clone())], time, false);
             Ok(answer)
         });
         Done {
@@ -501,7 +501,11 @@ mod tests {
         thread::sleep(Duration::from_millis(2));
         let k = entries.progress(&copy, &[]).mark("6").unwrap();
         let done = entries.begin(Change::Progress(k)).run();
-        ani::learn([(copy.id, copy.media_list_entry.clone())], asked.sent);
+        ani::learn(
+            [(copy.id, copy.media_list_entry.clone())],
+            asked.sent,
+            false,
+        );
         assert_eq!(shown(), 6, "the refresh was older than the save");
         entries.finish(done).unwrap();
         // AniList's website moved it on to 9, a list showed that, then an episode got queued
