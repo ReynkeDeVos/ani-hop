@@ -146,6 +146,8 @@ enum Msg {
     PlayStep(u64, Option<&'static str>),
     /// (Playback attempt, show, episode, how it ended)
     Played(u64, Media, String, Result<(), String>),
+    /// what a rescan of the download folder found: the shows and their episodes
+    Scanned(Vec<(Media, Vec<(String, PathBuf)>)>),
     /// an episode downloaded or failed: ("Show E3", result)
     DlDone(String, Result<(), String>),
     /// (version, update command) of a newer ani-hop
@@ -172,8 +174,12 @@ pub struct App {
     /// were looked up for
     parts: HashMap<u64, ((u32, u32), Parts)>,
     pub sources: Sources,
-    /// downloaded episodes per show, rescanned on refresh
+    /// downloaded episodes per show, as the last rescan found them
     pub local: HashMap<u64, Vec<(String, PathBuf)>>,
+    /// the downloaded shows, as the last rescan found them (none before the first)
+    downloaded: Option<Vec<Media>>,
+    /// a rescan of the download folder is on its way, and (true) another was asked for since
+    scanning: Option<bool>,
     /// episodes per show other running ani-hops have queued, rescanned on refresh
     elsewhere: HashMap<u64, Vec<String>>,
     resolving: HashMap<u64, Option<Want>>,
@@ -437,6 +443,8 @@ impl App {
             parts: HashMap::new(),
             sources: Sources::load(),
             local: HashMap::new(),
+            downloaded: None,
+            scanning: None,
             elsewhere: HashMap::new(),
             resolving: HashMap::new(),
             playback: Playback::new(Arc::new(playback::Mpv)),
@@ -449,7 +457,6 @@ impl App {
             parked: None,
             quit: false,
         };
-        app.scan_local();
         app.push("ani-hop", View::Main);
         let welcomed = ani::config_dir().join("welcomed");
         let first = !welcomed.exists();
@@ -643,7 +650,7 @@ impl App {
             self.want_episodes(m);
         }
         let multi = matches!(view, View::Shows(..) | View::Episodes(_, EpMode::Download));
-        self.scan_local();
+        self.scan_local(shown(&view));
         let menu = Menu::new(self.items(&view), multi);
         self.next_id += 1;
         self.stack.push(Screen {
@@ -691,13 +698,21 @@ impl App {
         self.refresh();
     }
 
-    /// Rebuilds the visible menu from current state (keeps query and cursor).
+    /// Rescans what's downloaded and rebuilds the visible menu (keeps query and cursor).
     fn refresh(&mut self) {
-        self.scan_local();
+        let m = shown(&self.stack.last().unwrap().view).cloned();
+        self.scan_local(m.as_ref());
+        self.rebuild();
+    }
+
+    /// Rebuilds the visible menu from current state (keeps query and cursor).
+    fn rebuild(&mut self) {
+        let downloaded = self.downloaded.clone();
         if let View::Shows(list) = &mut self.top().view
             && list.is_local()
+            && let Some(shows) = downloaded
         {
-            list.shows = ani::local_shows().into_iter().map(|(m, _)| m).collect();
+            list.shows = shows;
         }
         let items = self.items(&self.stack.last().unwrap().view);
         // a chooser whose action under the cursor went (the episode finished, say), or a pause
@@ -717,12 +732,27 @@ impl App {
         self.top().menu.set_items(items);
     }
 
-    fn scan_local(&mut self) {
-        self.local = ani::local_shows()
-            .into_iter()
-            .map(|(m, p)| (m.id, ani::local_episodes(&p)))
-            .collect();
+    /// Rescans what's downloaded: `m`'s folder at once, so what was just done to it shows,
+    /// and every show folder in the background, as the download folder may be on a slow disk
+    /// (a NAS, a USB disk asleep). Other ani-hops' queues are in the cache, read at once.
+    fn scan_local(&mut self, m: Option<&Media>) {
         self.elsewhere = self.downloads.elsewhere();
+        if let Some(m) = m {
+            match ani::local_episodes(&ani::folder(m)) {
+                eps if eps.is_empty() => _ = self.local.remove(&m.id),
+                eps => _ = self.local.insert(m.id, eps),
+            }
+        }
+        match &mut self.scanning {
+            Some(again) => *again = true,
+            None => {
+                self.scanning = Some(false);
+                self.spawn(|| {
+                    let shows = ani::local_shows().into_iter();
+                    Msg::Scanned(shows.map(|(m, p)| (m, ani::local_episodes(&p))).collect())
+                });
+            }
+        }
     }
 
     /// Where `m`'s episodes stand with downloads, as of the last rescan and the queue now.
@@ -832,7 +862,7 @@ impl App {
                 if self.user.is_some() {
                     v.extend(LISTS[2..].iter().map(list));
                 }
-                let local = self.local.len();
+                let local = self.downloaded.as_ref().map_or(0, Vec::len);
                 let shows = if local > 0 {
                     plural(local, "show")
                 } else {
@@ -1410,6 +1440,7 @@ impl App {
             }
             "downloads" => {
                 let list: Vec<Media> = ani::local_shows().into_iter().map(|(m, _)| m).collect();
+                self.downloaded = Some(list.clone());
                 // saved when downloaded, maybe weeks ago: their progress is AniList's now
                 let ids: Vec<u64> = (list.iter().filter(|m| m.on_anilist()))
                     .map(|m| m.id)
@@ -1858,6 +1889,15 @@ impl App {
                     Ok(()) => {}
                 }
             }
+            Msg::Scanned(found) => match self.scanning.take() {
+                // asked for again meanwhile: it may be older than what a screen just showed
+                Some(true) => self.scan_local(None),
+                _ => {
+                    self.local = (found.iter()).map(|(m, eps)| (m.id, eps.clone())).collect();
+                    self.downloaded = Some(found.into_iter().map(|(m, _)| m).collect());
+                    self.rebuild();
+                }
+            },
             Msg::DlDone(label, res) => {
                 match res {
                     Ok(()) => self.toast(format!("Downloaded {label}"), false),
@@ -1872,6 +1912,14 @@ impl App {
             }
             Msg::Release(v) => self.release = v,
         }
+    }
+}
+
+/// The show a screen is about, whose downloads it shows.
+fn shown(view: &View) -> Option<&Media> {
+    match view {
+        View::Show(m) | View::Episodes(m, _) | View::DlChoice(m, _) => Some(m),
+        _ => None,
     }
 }
 
