@@ -928,7 +928,7 @@ fn media_preview(
         lines.push("".into());
     }
     let status = |p: &Media| {
-        let e = p.media_list_entry.as_ref()?;
+        let e = app.entries.entry(p)?;
         let total = p.episodes.map_or("?".into(), |t| t.to_string());
         let line = format!("● {} · {}/{total}", list_label(&e.status), e.progress);
         Some(Line::styled(line, Color::Green))

@@ -5,7 +5,7 @@
 //! writes the menu to a file. That way the provider scraping stays ani-cli's business and
 //! keeps working after `ani-cli -U`.
 
-use crate::anilist::Media;
+use crate::anilist::{Entry, Media};
 use crate::source::Source;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -767,6 +767,18 @@ pub fn refresh_shows(fresh: &[Media]) {
     });
 }
 
+/// Puts AniList's Entry of show `id` on its downloaded copies, which the Downloads list shows.
+pub fn update_entry(id: u64, entry: &Option<Entry>) -> std::io::Result<()> {
+    if !index().values().any(|d| d.media.id == id) {
+        return Ok(()); // not downloaded: no index to make
+    }
+    edit_index(|all| {
+        for d in all.values_mut().filter(|d| d.media.id == id) {
+            d.media.media_list_entry = entry.clone();
+        }
+    })
+}
+
 /// Downloaded shows and their folders, by name: also those downloaded before the download
 /// folder changed, which stay where they are.
 pub fn local_shows() -> Vec<(Media, PathBuf)> {
@@ -971,7 +983,12 @@ pub fn prepare_in(root: &Path, m: &Media) -> Result<(PathBuf, Hold), String> {
         made = held.map_err(|e| e.to_string()).map(|hold| {
             let d = all.entry(dir.clone()).or_default();
             if replaces(m, &d.media) {
+                // the show's Entry stays the index's: a queued job's is from when it was queued
+                let kept = (d.media.id == m.id).then(|| d.media.media_list_entry.take());
                 d.media = m.clone();
+                if let Some(entry) = kept {
+                    d.media.media_list_entry = entry;
+                }
             }
             (dir, hold)
         });
