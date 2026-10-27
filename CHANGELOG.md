@@ -22,6 +22,8 @@
 - A mistyped AniList client ID blocked logging in, with no way to enter another one. Enter on the empty token field now goes back to the client ID step.
 - A download that ended just as it was stopped could print "kill: No such process" over the screen.
 - A cache folder ani-hop can't write to stopped it with Rust's debug output. It says "ani-hop: can't write to ~/.cache/ani-hop: Permission denied" now.
+- A filter for how a title starts or ends with a capital letter, like `^Attack` or `Titan$`, found nothing unless it was the whole title. A word filter like `'Horizons` or `!Horizons` missed the word at the very end of a title or episode summary with an accent in it, like "Pokémon Horizons".
+- A question too long for a small terminal, like "Mark episode 6 of … as watched?" with what saving also changes, was cut after six lines. It now uses the lines it needs, and the whole width when it doesn't fit beside the preview.
 
 ## 0.7.0 – 2026-10-26
 

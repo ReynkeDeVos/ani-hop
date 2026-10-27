@@ -42,14 +42,20 @@ impl Item {
 /// `s` as the matcher reads it: one char per grapheme, its first, so where it matched counts
 /// graphemes as a row draws them. nucleo's own `Utf32Str::new` falls back to counting bytes
 /// when every grapheme starts with an ASCII char, as in a decomposed "é".
+/// Always chars, and a space after them, around two bugs in nucleo-matcher 0.3.1: an ASCII
+/// haystack fails a case-sensitive ^, $ or ^…$ unless the needle is all of it, and a char
+/// haystack never has a substring (', !) found at its very end. ^, $ and words skip the space.
 fn haystack<'a>(s: &'a str, buf: &'a mut Vec<char>) -> Utf32Str<'a> {
-    if s.is_ascii() {
-        return Utf32Str::Ascii(s.as_bytes());
-    }
     buf.clear();
-    let span = Span::raw(s);
-    let graphemes = span.styled_graphemes(Style::new());
-    buf.extend(graphemes.filter_map(|g| g.symbol.chars().next()));
+    match s.is_ascii() {
+        true => buf.extend(s.chars()),
+        false => {
+            let span = Span::raw(s);
+            let graphemes = span.styled_graphemes(Style::new());
+            buf.extend(graphemes.filter_map(|g| g.symbol.chars().next()));
+        }
+    }
+    buf.push(' ');
     Utf32Str::Unicode(buf)
 }
 
@@ -280,6 +286,30 @@ mod tests {
         let mut m = Menu::new(vec![Item::new("k", label, "")], false);
         m.edit(|q| *q = "A".into());
         assert_eq!(m.matches[0].1, [5]);
+        // and a word that ends it, as typed
+        m.edit(|q| *q = "'Axx".into());
+        assert_eq!(m.matches[0].1, [5, 6, 7]);
+        m.edit(|q| *q = "!Axx".into());
+        assert!(m.matches.is_empty());
+    }
+
+    #[test]
+    fn starts_ends_and_last_words_match() {
+        let items = ["Plain Start end", "Plain Axx", "Other", "Pokémon Horizons"];
+        let mut m = Menu::new(items.iter().map(|l| Item::new(*l, *l, "")).collect(), false);
+        let found = |m: &mut Menu, q: &str| {
+            m.edit(|query| *query = q.into());
+            let found = m.matches.iter().map(|(i, _)| m.items[*i].label.clone());
+            found.collect::<Vec<_>>()
+        };
+        assert_eq!(found(&mut m, "^Plain"), ["Plain Start end", "Plain Axx"]);
+        assert_eq!(found(&mut m, "Axx$"), ["Plain Axx"]);
+        assert_eq!(found(&mut m, "^Other$"), ["Other"]);
+        assert_eq!(found(&mut m, "'Horizons"), ["Pokémon Horizons"]);
+        assert_eq!(found(&mut m, "!Horizons").len(), 3);
+        // what an episode is about, by its last word
+        m.items[2].about = "A town where everyone sleeps".into();
+        assert_eq!(found(&mut m, "sleeps"), ["Other"]);
     }
 
     #[test]

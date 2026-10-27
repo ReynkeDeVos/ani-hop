@@ -31,11 +31,13 @@ pub fn render(app: &mut App, f: &mut Frame) {
         Constraint::Length(1),
     ])
     .areas(f.area());
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]).areas(body);
+    let screen = app.stack.last().unwrap();
+    let (left, right) = split(body, question(screen));
     header(app, f, head);
     menu(app, f, left);
-    preview(app, f, right);
+    if let Some(right) = right {
+        preview(app, f, right);
+    }
     footer(app, f, foot);
     starting(app, f);
     boot(app, f.buffer_mut());
@@ -188,6 +190,37 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(user, user_area);
 }
 
+/// The question a confirmation asks, and how many answers it has.
+fn question(screen: &crate::Screen) -> Option<(&str, usize)> {
+    let asks = matches!(screen.view, View::Confirm(_));
+    asks.then_some((screen.title.as_str(), screen.menu.items.len()))
+}
+
+/// Where the menu's rows go in its panel at `area`.
+fn menu_inner(area: Rect) -> Rect {
+    panel().inner(area).inner(Margin::new(1, 0))
+}
+
+/// Rows question `q` gets in `inner`: what it wraps to, but leaving the rule under it and
+/// its `answers` on screen; and whether that's all of it.
+fn question_rows(q: &str, answers: usize, inner: Rect) -> (u16, bool) {
+    let q = Paragraph::new(Line::styled(q, Style::new().bold())).wrap(Wrap { trim: true });
+    let need = q.line_count(inner.width) as u16;
+    let room = inner.height.saturating_sub(1 + answers as u16).max(1);
+    (need.clamp(1, room), need <= room)
+}
+
+/// The menu's side of `body`, and the preview's: a question too long for its side takes the
+/// whole width, so what it changes reads in full before it's answered.
+fn split(body: Rect, asked: Option<(&str, usize)>) -> (Rect, Option<Rect>) {
+    let [left, right] =
+        Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]).areas(body);
+    match asked {
+        Some((q, answers)) if !question_rows(q, answers, menu_inner(left)).1 => (body, None),
+        _ => (left, Some(right)),
+    }
+}
+
 fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let spin = spinner(app);
     let shimmer = (app.started.elapsed().as_millis() / 30) as usize;
@@ -205,14 +238,12 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     };
     let screen = app.stack.last_mut().unwrap();
     let block = panel();
-    let inner = block.inner(area).inner(Margin::new(1, 0));
+    let inner = menu_inner(area);
     f.render_widget(block, area);
     // a confirmation shows its question where the filter prompt would be, wrapped
-    let question = matches!(screen.view, View::Confirm(_)).then_some(screen.title.as_str());
-    let rows = question.map_or(1, |q| {
-        let q = Paragraph::new(Line::styled(q, Style::new().bold())).wrap(Wrap { trim: true });
-        (q.line_count(inner.width) as u16).clamp(1, 6)
-    });
+    let asked = question(screen);
+    let rows = asked.map_or(1, |(q, answers)| question_rows(q, answers, inner).0);
+    let question = asked.map(|(q, _)| q);
     let [prompt_area, info_area, list_area] = Layout::vertical([
         Constraint::Length(rows),
         Constraint::Length(1),
@@ -903,6 +934,25 @@ pub fn hex(s: &str) -> Option<Color> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_reads_in_full_before_its_answers() {
+        let q = "Mark episode 2 of Attack on Titan Final Season Special 2 as watched? \
+                 Unmarks 3–5 and moves it to Watching.";
+        // the screen's body: all but the header and the footer
+        let body = |w: u16, h: u16| Rect::new(0, 1, w, h - 2);
+        // too long beside the preview in a small terminal: it takes the whole width
+        let (menu, preview) = split(body(40, 12), Some((q, 2)));
+        assert_eq!((menu, preview), (body(40, 12), None));
+        assert_eq!(question_rows(q, 2, menu_inner(menu)), (4, true));
+        // beside the preview where it fits
+        let (menu, preview) = split(body(80, 24), Some((q, 2)));
+        assert!(preview.is_some() && question_rows(q, 2, menu_inner(menu)).1);
+        assert!(
+            split(body(40, 12), None).1.is_some(),
+            "other screens keep it"
+        );
+    }
 
     #[test]
     fn a_rule_names_the_next_group_across_the_row() {
