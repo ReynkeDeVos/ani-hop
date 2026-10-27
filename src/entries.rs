@@ -236,9 +236,15 @@ impl Entries {
 
     /// Takes in the Entries kept for the Downloads list that are newer than what's known here:
     /// another ani-hop's saves and reads since, which rescans bring to the Downloads list.
+    /// Only the same Entry, by its AniList id: another login's, a save of this ani-hop's
+    /// before logging in again or another ani-hop's, has an id of its own.
     pub fn catch_up(&mut self) {
         for (id, (entry, when)) in ani::learnt() {
-            if let Some(k) = self.known.get_mut(&id).filter(|k| k.when < when) {
+            let same = |k: &&mut Known| match (&k.entry, &entry) {
+                (Some(known), Some(kept)) => known.id == kept.id,
+                _ => false,
+            };
+            if let Some(k) = self.known.get_mut(&id).filter(|k| k.when < when && same(k)) {
                 *k = Known { entry, when };
             }
         }
@@ -618,6 +624,32 @@ mod tests {
         assert_eq!(entries.entry(&copy).unwrap().progress, 5);
         entries.catch_up();
         assert_eq!(entries.progress(&copy, &[]).mark("10").unwrap().was, 9);
+        drop(hold);
+        let _ = ani::delete_show(&dir);
+    }
+
+    #[test]
+    fn a_rescan_leaves_another_logins_entries_out() {
+        let copy = watching(70_013, 5);
+        let root = ani::home().join("entries-other-login");
+        let (dir, hold) = ani::prepare_in(&root, &copy).unwrap();
+        let (fake, mut entries) = anilist(&copy, false);
+        // a save to 6 goes out, then another account logs in, which has the show at 2
+        let k = entries.progress(&copy, &[]).mark("6").unwrap();
+        let work = entries.begin(Change::Progress(k));
+        entries.login(fake);
+        let mut theirs = watching(70_013, 2);
+        theirs.media_list_entry.as_mut().unwrap().id = 99;
+        assert!(entries.observe(entries.stamp(), [&mut theirs]));
+        // the old login's save answers last, and is kept for the Downloads list
+        assert!(entries.finish(work.run()).is_none());
+        assert_eq!(kept(&copy), 6);
+        entries.catch_up();
+        assert_eq!(
+            entries.entry(&copy).unwrap().progress,
+            2,
+            "not the old login's 6"
+        );
         drop(hold);
         let _ = ani::delete_show(&dir);
     }
