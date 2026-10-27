@@ -263,7 +263,13 @@ fn main() -> std::io::Result<()> {
             std::process::exit(2);
         }
     }
-    ani::setup()?;
+    if let Err(e) = ani::setup() {
+        eprintln!(
+            "ani-hop: can't write to {}: {e}",
+            ani::tilde(&ani::cache_dir())
+        );
+        std::process::exit(1);
+    }
     kitty::init();
     let mut terminal = ratatui::init();
     execute!(std::io::stdout(), EnableBracketedPaste)?;
@@ -498,8 +504,7 @@ impl App {
         app.push("ani-hop", View::Main);
         let welcomed = ani::config_dir().join("welcomed");
         let first = !welcomed.exists();
-        // ani-skip is optional (and Homebrew has none), so it alone doesn't bring this up
-        let needed = app.missing.iter().any(|d| d.0 != "ani-skip");
+        let needed = app.missing.iter().any(|d| !ani::optional(d.0));
         if first || needed || app.old_ani_cli.is_some() {
             let _ = fs::create_dir_all(ani::config_dir());
             let _ = fs::write(&welcomed, "");
@@ -527,12 +532,8 @@ impl App {
     fn after_install(&mut self) {
         self.missing = ani::missing_deps();
         self.old_ani_cli = ani::old_ani_cli();
-        // ani-skip is optional and Homebrew has none, so it's no reason for an error
-        let names: Vec<&str> = self
-            .missing
-            .iter()
-            .map(|d| d.0)
-            .filter(|&n| n != "ani-skip")
+        let names: Vec<&str> = (self.missing.iter().map(|d| d.0))
+            .filter(|&n| !ani::optional(n))
             .collect();
         match (names.is_empty(), &self.old_ani_cli) {
             (false, _) => self.toast(format!("Still missing: {}", names.join(", ")), true),
@@ -1611,10 +1612,7 @@ impl App {
             }
             "login" => match client_id() {
                 Some(id) => self.start_auth(&id),
-                None => {
-                    open_url("https://anilist.co/settings/developer");
-                    self.push("AniList setup", View::Input(Input::ClientId));
-                }
+                None => self.ask_client_id(),
             },
             "skip" => {
                 let on = !ani::skip_on();
@@ -1646,6 +1644,13 @@ impl App {
         }
     }
 
+    /// The one-time setup of an AniList API client of the user's own; a saved client ID stays
+    /// until another one is entered.
+    fn ask_client_id(&mut self) {
+        open_url("https://anilist.co/settings/developer");
+        self.push("AniList setup", View::Input(Input::ClientId));
+    }
+
     fn start_auth(&mut self, client_id: &str) {
         open_url(&format!(
             "https://anilist.co/api/v2/oauth/authorize?client_id={client_id}&response_type=token"
@@ -1654,10 +1659,15 @@ impl App {
     }
 
     fn submit(&mut self, input: Input, text: String) {
-        if text.is_empty() && !matches!(input, Input::DownloadDir) {
+        if text.is_empty() && !matches!(input, Input::DownloadDir | Input::Token) {
             return;
         }
         match input {
+            // a mistyped client ID would fail every login: enter it again
+            Input::Token if text.is_empty() => {
+                self.pop(1);
+                self.ask_client_id();
+            }
             Input::Search => {
                 let c = self.client.clone();
                 let title = text.clone();
@@ -2137,6 +2147,11 @@ impl App {
             Msg::DlDone(label, res) => {
                 match res {
                     Ok(()) => self.toast(format!("Downloaded {label}"), false),
+                    // the queue paused and kept it
+                    Err(e) if ani::unreachable(&e) => self.toast(
+                        format!("Paused downloads · {e} · enter on a queued episode resumes them"),
+                        true,
+                    ),
                     Err(e) => self.toast(format!("{label}: {e}"), true),
                 }
                 self.refresh();

@@ -124,12 +124,10 @@ const ANI_CLI_ONLY: u64 = 1 << 63;
 impl Media {
     /// A show found through ani-cli alone. The id hashes the search and the entry, not the
     /// shown name, so the same pick has it again next time and a provider's own "X (2)" can't
-    /// take a numbered one's (FNV-1a: std's hasher may change between releases).
+    /// take a numbered one's.
     pub fn from_ani_cli(name: &str, at: crate::source::Source) -> Media {
         let key = format!("{}\n{}\n{}", at.query, at.title, at.nth);
-        let hash = (key.bytes()).fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-            (h ^ b as u64).wrapping_mul(0x100_0000_01b3)
-        });
+        let hash = crate::ani::fnv1a(key.as_bytes());
         Media {
             id: ANI_CLI_ONLY | hash,
             title: Title {

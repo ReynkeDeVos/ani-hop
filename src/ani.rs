@@ -60,7 +60,16 @@ rm -f "$log"
 [ $ok = 0 ] && mv -f "$out.part" "$out"
 "#;
 
+/// A test outside `in_child`: it gets a home of its own, so no test run touches the user's
+/// config, cache or downloads.
+fn testing() -> bool {
+    cfg!(test) && std::env::var_os("ANIHOP_CHILD").is_none()
+}
+
 pub fn home() -> PathBuf {
+    if testing() {
+        return std::env::temp_dir().join(format!("ani-hop-test-{}", std::process::id()));
+    }
     std::env::home_dir().unwrap_or_else(std::env::temp_dir)
 }
 
@@ -68,7 +77,7 @@ pub fn home() -> PathBuf {
 fn xdg(var: &str, fallback: &str) -> PathBuf {
     std::env::var_os(var)
         .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
+        .filter(|p| p.is_absolute() && !testing())
         .unwrap_or_else(|| home().join(fallback))
 }
 
@@ -196,6 +205,11 @@ pub fn have(bin: &str) -> bool {
 pub fn deps() -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
     DEPS.into_iter()
         .filter(|d| !(cfg!(target_os = "macos") && d.0 == "xdg-open"))
+}
+
+/// A tool ani-hop works without, just plainer: ani-skip (which Homebrew doesn't have).
+pub fn optional(bin: &str) -> bool {
+    bin == "ani-skip"
 }
 
 pub fn missing_deps() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -415,32 +429,41 @@ pub fn plain(query: &str) -> &str {
     query.trim_start_matches('-')
 }
 
-/// ani-cli prints its errors with colors and line clears.
+/// ani-cli's error, without the colors and line clears it prints it with. A connection error
+/// wins over what failed after it: ani-cli goes on past a server page it couldn't fetch and
+/// ends with "No sources found for dub!".
 pub fn last_error(stderr: &[u8]) -> String {
-    let s = String::from_utf8_lossy(stderr);
-    let line = s
-        .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("ani-cli failed");
-    let mut out = String::new();
-    let mut chars = line.chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\x1b' => while chars.next().is_some_and(|c| !c.is_ascii_alphabetic()) {},
-            '\r' => out.clear(),
-            c => out.push(c),
+    let plain = |line: &str| {
+        let mut out = String::new();
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                '\x1b' => while chars.next().is_some_and(|c| !c.is_ascii_alphabetic()) {},
+                '\r' => out.clear(),
+                c => out.push(c),
+            }
         }
-    }
-    let out = out.trim();
+        out.trim().to_string()
+    };
+    let s = String::from_utf8_lossy(stderr);
+    let lines: Vec<String> = s.lines().map(plain).filter(|l| !l.is_empty()).collect();
     // "Connection error: could not fetch https://hianime.at/search?keyword=… (no HTTP res…"
-    match out.split_once("could not fetch ") {
-        Some((_, url)) => {
+    let url = lines
+        .iter()
+        .find_map(|l| l.split_once("could not fetch "))
+        .map(|l| l.1);
+    match url {
+        Some(url) => {
             let host = url.split("://").nth(1).and_then(|u| u.split('/').next());
             format!("can't reach {}", host.unwrap_or("its site"))
         }
-        None => out.to_string(),
+        None => lines.last().map_or("ani-cli failed".into(), String::clone),
     }
+}
+
+/// Whether `last_error` says ani-cli's site couldn't be reached: offline, worth another try.
+pub fn unreachable(error: &str) -> bool {
+    error.starts_with("can't reach ")
 }
 
 /// Feeds the child's output lines to `line` (also the ones redrawn with \r) until it
@@ -641,37 +664,30 @@ struct Downloaded {
 /// By show folder.
 type Index = std::collections::BTreeMap<PathBuf, Downloaded>;
 
-#[cfg(not(test))]
 fn index_path() -> PathBuf {
     config_dir().join("downloads.json")
 }
 
-#[cfg(test)]
-fn index_path() -> PathBuf {
-    std::env::temp_dir().join("ani-hop-test-index.json")
-}
-
 /// One lock file per download folder ever downloaded into; they stay, as one deleted
 /// could let a download and a removal both think they hold it.
-#[cfg(not(test))]
 fn holds_dir() -> PathBuf {
     cache_dir().join("folders")
-}
-
-#[cfg(test)]
-fn holds_dir() -> PathBuf {
-    std::env::temp_dir().join("ani-hop-test-folders")
 }
 
 /// A download folder held by a download into it, from making the folder until the download
 /// is done: it isn't dropped meanwhile, also while still empty. Several may hold one.
 pub struct Hold(#[allow(dead_code)] fs::File);
 
+/// FNV-1a, for ids and lock names that are saved or shared with other ani-hops: std's hasher
+/// may change between Rust releases.
+pub fn fnv1a(bytes: &[u8]) -> u64 {
+    (bytes.iter()).fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ *b as u64).wrapping_mul(0x100_0000_01b3)
+    })
+}
+
 fn hold_file(dir: &Path) -> std::io::Result<fs::File> {
-    let hash = (dir.as_os_str().as_encoded_bytes().iter())
-        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
-            (h ^ *b as u64).wrapping_mul(0x100_0000_01b3)
-        });
+    let hash = fnv1a(dir.as_os_str().as_encoded_bytes());
     fs::create_dir_all(holds_dir())?;
     fs::File::create(holds_dir().join(format!("{hash:016x}.lock")))
 }
@@ -1126,10 +1142,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tests_never_touch_the_real_home() {
+        let tmp = std::env::temp_dir();
+        assert!(home().starts_with(&tmp) && config_dir().starts_with(&tmp));
+        assert!(cache_dir().starts_with(&tmp) && index_path().starts_with(&tmp));
+    }
+
+    #[test]
     fn says_which_site_ani_cli_cant_reach() {
         let err = b"\x1b[2K\x1b[1;31mConnection error: could not fetch https://hianime.at/search?keyword=x (no HTTP response; curl exit 7)\x1b[0m\n";
         assert_eq!(last_error(err), "can't reach hianime.at");
         assert_eq!(last_error(b"No results found!\n"), "No results found!");
+        // a server page it couldn't fetch, then no stream: offline, not a missing dub
+        let later = b"\x1b[1;31mConnection error: could not fetch https://hianime.at/ajax/x (no HTTP response; curl exit 6)\x1b[0m\nNo sources found for dub!\n\x1b[0m\n";
+        assert_eq!(last_error(later), "can't reach hianime.at");
+        assert!(unreachable(&last_error(later)) && !unreachable("No results found!"));
     }
 
     #[test]

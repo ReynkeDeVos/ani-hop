@@ -480,6 +480,8 @@ fn input_help(input: &Input) -> Text<'static> {
                 "Pasting the whole redirect URL works too.",
                 Style::new().italic(),
             ),
+            "".into(),
+            "Wrong client ID? Press enter with this empty.".into(),
         ],
         Input::SourceQuery(_) => vec![
             "Search ani-cli with this text, then pick the".into(),
@@ -641,7 +643,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     };
     let row = |good: bool, name: &str, what: &'static str| {
         // extras: without them ani-hop works, just plainer
-        let mark = match good || !matches!(name, "ani-skip" | "graphics") {
+        let mark = match good || !(ani::optional(name) || name == "graphics") {
             true => mark(good),
             false => Span::styled("  ○ ", Color::Yellow),
         };
