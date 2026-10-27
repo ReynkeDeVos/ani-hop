@@ -468,6 +468,10 @@ impl Queue {
             Ok(s) => s,
             Err(e) => {
                 let mut st = self.lock();
+                // stopped while it was looked up: nothing to pause or say
+                if !st.jobs.iter().any(|j| j.id == job.id) {
+                    return true;
+                }
                 // offline: it stays queued, and downloads wait as after a pause
                 if ani::unreachable(&e) {
                     st.paused = true;
@@ -762,10 +766,15 @@ mod tests {
         fn prepare(&self, m: &Media) -> Result<(PathBuf, ani::Hold), String> {
             ani::prepare_in(&self.root, m)
         }
-        fn resolve(&self, _: &Media, lookup: Lookup, _: bool) -> Result<Source, String> {
+        fn resolve(&self, m: &Media, lookup: Lookup, _: bool) -> Result<Source, String> {
             match lookup {
                 Lookup::Ready(s) | Lookup::Check(s) => Ok(s),
                 Lookup::Resolve if self.script == OFFLINE => Err("can't reach hianime.at".into()),
+                // a lookup that takes a moment, then can't reach the provider
+                Lookup::Resolve if m.name() == "Unreachable" => {
+                    thread::sleep(Duration::from_millis(300));
+                    Err("can't reach hianime.at".into())
+                }
                 Lookup::Resolve => Ok(source()),
             }
         }
@@ -1086,6 +1095,28 @@ mod tests {
             indexed.map(|e| e.unwrap().progress).collect::<Vec<_>>(),
             [6]
         );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_show_stopped_while_looked_up_doesnt_pause_the_next() {
+        let dir = temp("cancelled");
+        let (q, done) = queue(&dir, "a", QUICK);
+        let mut slow = job(&["1"]);
+        slow.media.id += 1;
+        slow.media.title.romaji = Some("Unreachable".into());
+        slow.lookup = Lookup::Resolve;
+        q.enqueue(slow.clone()).unwrap();
+        thread::sleep(Duration::from_millis(50)); // being looked up
+        q.stop(&slow.media, &["1".into()], None, &[]).unwrap();
+        q.enqueue(job(&["2"])).unwrap();
+        let (label, res) = done.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            (label.as_str(), res),
+            ("Show E2", Ok(())),
+            "nothing of the stopped one"
+        );
+        assert!(!q.snapshot().paused);
         fs::remove_dir_all(&dir).unwrap();
     }
 
