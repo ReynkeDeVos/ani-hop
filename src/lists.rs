@@ -67,14 +67,20 @@ fn outdate(path: &PathBuf) {
 }
 
 impl List {
-    /// The download folder's shows.
-    pub fn local(shows: Vec<Media>) -> List {
+    /// The download folder's shows, as its last rescan found them; before the first one,
+    /// loading until `scanned` brings them.
+    pub fn local(shows: Option<Vec<Media>>) -> List {
         List {
-            shows,
+            refreshing: shows.is_none(),
+            shows: shows.unwrap_or_default(),
             feed: Feed::Local,
             cache: None,
-            refreshing: false,
         }
+    }
+
+    /// What a rescan of the download folder found.
+    pub fn scanned(&mut self, shows: Vec<Media>) {
+        (self.shows, self.refreshing) = (shows, false);
     }
 
     /// A list as its cache has it at `now`, and the refresh to ask for unless that's fresh

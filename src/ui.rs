@@ -343,26 +343,8 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
             };
             let mut spans = vec![Span::styled(mark, Color::Green), " ".into()];
             let plain = if item.done { SOFT } else { Style::new() };
-            let chars = item.label.char_indices().enumerate().map(|(ci, (at, ch))| {
-                let hit = hits.binary_search(&(ci as u32)).is_ok();
-                let style = if hit {
-                    Style::new().fg(MATCH).bold()
-                } else {
-                    plain
-                };
-                (at, Span::styled(ch.to_string(), style))
-            });
-            // a show's title too long for its row keeps its end, as seasons and parts of one
-            // show differ there: "Attack on Titan Fi…Special 2"
-            match titles.then(|| middle_cut(&item.label, width - 2)).flatten() {
-                Some((head, tail)) => {
-                    let chars: Vec<_> = chars.collect();
-                    spans.extend(chars.iter().filter(|c| c.0 < head).map(|c| c.1.clone()));
-                    spans.push(Span::styled("…", plain));
-                    spans.extend(chars.into_iter().filter(|c| c.0 >= tail).map(|c| c.1));
-                }
-                None => spans.extend(chars.map(|c| c.1)),
-            }
+            let room = titles.then_some(width - 2);
+            spans.extend(row_label(&item.label, hits, plain, room));
             let mut used: usize = spans.iter().map(|s| s.width()).sum();
             // a title too long for the row ends in "…", like a cut hint
             if used > width {
@@ -825,6 +807,37 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(hints, hints_area);
 }
 
+/// A row's label, a span per grapheme as drawn (joined emoji stay whole), with the filter's
+/// matched characters (`hits`, by character) lit. With `room`, a show's title too long for it
+/// keeps its end, as seasons and parts of one show differ there: "Attack on Titan Fi…Special 2".
+fn row_label(text: &str, hits: &[u32], plain: Style, room: Option<usize>) -> Vec<Span<'static>> {
+    let cut = room.and_then(|room| middle_cut(text, room));
+    let mut spans = Vec::new();
+    let (mut at, mut ci) = (0, 0u32);
+    for g in Span::raw(text)
+        .styled_graphemes(Style::new())
+        .map(|g| g.symbol)
+    {
+        let n = g.chars().count() as u32;
+        let hit = (ci..ci + n).any(|c| hits.binary_search(&c).is_ok());
+        let style = if hit {
+            Style::new().fg(MATCH).bold()
+        } else {
+            plain
+        };
+        match cut {
+            Some((head, tail)) if at >= head && at < tail => {
+                if at == head {
+                    spans.push(Span::styled("…", plain));
+                }
+            }
+            _ => spans.push(Span::styled(g.to_string(), style)),
+        }
+        (at, ci) = (at + g.len(), ci + n);
+    }
+    spans
+}
+
 /// Where to cut `label` to fit `room` columns, keeping its start and its last two words (or
 /// its last one), where a season or part says which it is: (end of the start, start of the
 /// end) as byte offsets. None when it fits, or when that end takes over half the room.
@@ -903,6 +916,26 @@ mod tests {
         assert_eq!(fit("~/ビデオ/Anime".into(), 11), "~/ビデオ/A…");
         assert_eq!(fit("~/ビデオ/Anime".into(), 14), "~/ビデオ/Anime");
         assert_eq!(fit("on".into(), 0), "…");
+    }
+
+    #[test]
+    fn rows_draw_whole_graphemes() {
+        let family = "👩\u{200d}👩\u{200d}👧";
+        let title = family.repeat(8) + " Final Part 2";
+        let spans = row_label(&title, &[], Style::new(), Some(26));
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.ends_with("…Part 2") && Span::raw(text.as_str()).width() <= 26,
+            "{text}"
+        );
+        assert!(
+            spans.iter().any(|s| s.content == family),
+            "a family stays one"
+        );
+        // the filter's hits count characters: the family's second one lights the whole family
+        let lit = row_label(&format!("{family}a"), &[2], Style::new(), None);
+        assert_eq!(lit[0].style.fg, Some(MATCH));
+        assert_eq!(lit[1].style.fg, None);
     }
 
     #[test]

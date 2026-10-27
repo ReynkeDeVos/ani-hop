@@ -29,8 +29,8 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use show_downloads::{Action, ShowDownloads, which};
 use source::{Lookup, Source, Sources};
-use std::collections::HashMap;
 use std::collections::hash_map::Entry::Vacant;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
@@ -180,6 +180,8 @@ pub struct App {
     downloaded: Option<Vec<Media>>,
     /// a rescan of the download folder is on its way, and (true) another was asked for since
     scanning: Option<bool>,
+    /// shows rescanned on screen since the running rescan started, newer than what it finds
+    synced: HashSet<u64>,
     /// Downloads opened: AniList is asked about its shows once the rescan has them
     ask_local: bool,
     /// episodes per show other running ani-hops have queued, rescanned on refresh
@@ -447,6 +449,7 @@ impl App {
             local: HashMap::new(),
             downloaded: None,
             scanning: None,
+            synced: HashSet::new(),
             ask_local: false,
             elsewhere: HashMap::new(),
             resolving: HashMap::new(),
@@ -730,7 +733,7 @@ impl App {
             && list.is_local()
             && let Some(shows) = downloaded
         {
-            list.shows = shows;
+            list.scanned(shows);
         }
         let items = self.items(&self.stack.last().unwrap().view);
         // a chooser whose action under the cursor went (the episode finished, say), or a pause
@@ -760,11 +763,13 @@ impl App {
                 eps if eps.is_empty() => _ = self.local.remove(&m.id),
                 eps => _ = self.local.insert(m.id, eps),
             }
+            self.synced.insert(m.id);
         }
         match &mut self.scanning {
             Some(again) => *again = true,
             None => {
                 self.scanning = Some(false);
+                self.synced.clear(); // what this rescan finds is newer
                 self.spawn(|| {
                     let shows = ani::local_shows().into_iter();
                     Msg::Scanned(shows.map(|(m, p)| (m, ani::local_episodes(&p))).collect())
@@ -1456,8 +1461,8 @@ impl App {
             }
             "downloads" => {
                 // as the last rescan found them; the one opening it starts fills it in
-                let list = self.downloaded.clone().unwrap_or_default();
-                self.push("Downloads", View::Shows(List::local(list)));
+                let list = List::local(self.downloaded.clone());
+                self.push("Downloads", View::Shows(list));
                 self.ask_local = true;
             }
             "login" => match client_id() {
@@ -1900,24 +1905,34 @@ impl App {
                     Ok(()) => {}
                 }
             }
-            Msg::Scanned(found) => match self.scanning.take() {
-                // asked for again meanwhile: it may be older than what a screen just showed
-                Some(true) => self.scan_local(None),
-                _ => {
-                    self.local = (found.iter()).map(|(m, eps)| (m.id, eps.clone())).collect();
-                    let shows: Vec<Media> = found.into_iter().map(|(m, _)| m).collect();
-                    // saved when downloaded, maybe weeks ago: their progress is AniList's now
-                    let ids: Vec<u64> = (shows.iter().filter(|m| m.on_anilist()))
-                        .map(|m| m.id)
-                        .collect();
-                    if std::mem::take(&mut self.ask_local) && !ids.is_empty() {
-                        let (c, stamp) = (self.client.clone(), self.entries.stamp());
-                        self.spawn(move || Msg::Local(stamp, c.shows(&ids)));
+            Msg::Scanned(found) => {
+                let again = self.scanning.take() == Some(true);
+                // what's on screen was rescanned since this one started: that stays
+                let mut local: HashMap<u64, Vec<(String, PathBuf)>> =
+                    (found.iter()).map(|(m, eps)| (m.id, eps.clone())).collect();
+                for id in &self.synced {
+                    match self.local.get(id) {
+                        Some(eps) => _ = local.insert(*id, eps.clone()),
+                        None => _ = local.remove(id),
                     }
-                    self.downloaded = Some(shows);
-                    self.rebuild();
                 }
-            },
+                self.local = local;
+                let shows: Vec<Media> = found.into_iter().map(|(m, _)| m).collect();
+                // saved when downloaded, maybe weeks ago: their progress is AniList's now
+                let ids: Vec<u64> = (shows.iter().filter(|m| m.on_anilist()))
+                    .map(|m| m.id)
+                    .collect();
+                if std::mem::take(&mut self.ask_local) && !ids.is_empty() {
+                    let (c, stamp) = (self.client.clone(), self.entries.stamp());
+                    self.spawn(move || Msg::Local(stamp, c.shows(&ids)));
+                }
+                self.downloaded = Some(shows);
+                self.rebuild();
+                // and the one asked for meanwhile, for the rest
+                if again {
+                    self.scan_local(None);
+                }
+            }
             Msg::DlDone(label, res) => {
                 match res {
                     Ok(()) => self.toast(format!("Downloaded {label}"), false),
