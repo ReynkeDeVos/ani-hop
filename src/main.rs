@@ -1922,6 +1922,7 @@ impl App {
                     self.spawn(move || Msg::Local(stamp, c.shows(&ids)));
                 }
                 self.downloaded = Some(shows);
+                self.entries.catch_up();
                 self.rebuild();
                 // and the one asked for meanwhile, for the rest
                 if again {

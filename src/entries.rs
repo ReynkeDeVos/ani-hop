@@ -234,6 +234,16 @@ impl Entries {
         }
     }
 
+    /// Takes in the Entries kept for the Downloads list that are newer than what's known here:
+    /// another ani-hop's saves and reads since, which rescans bring to the Downloads list.
+    pub fn catch_up(&mut self) {
+        for (id, (entry, when)) in ani::learnt() {
+            if let Some(k) = self.known.get_mut(&id).filter(|k| k.when < when) {
+                *k = Known { entry, when };
+            }
+        }
+    }
+
     /// Another login, or none: what was known was the old login's, and its writes still out
     /// change nothing when they answer.
     pub fn login(&mut self, anilist: Arc<dyn AniList>) {
@@ -588,6 +598,26 @@ mod tests {
             "Saved Show · Watching · 7/12"
         );
         assert_eq!(kept(&copy), 7);
+        drop(hold);
+        let _ = ani::delete_show(&dir);
+    }
+
+    #[test]
+    fn a_rescan_catches_up_on_another_ani_hops_save() {
+        let copy = watching(70_012, 5);
+        let root = ani::home().join("entries-catch-up");
+        let (dir, hold) = ani::prepare_in(&root, &copy).unwrap();
+        let (fake, mut entries) = anilist(&copy, false);
+        assert!(entries.observe(entries.stamp(), [&mut copy.clone()]));
+        // another ani-hop marks 9, and this one is offline: only a rescan can tell
+        let mut other = Entries::new(fake);
+        assert_eq!(
+            mark(&mut other, &copy, "9").text,
+            "Saved Show · Watching · 9/12"
+        );
+        assert_eq!(entries.entry(&copy).unwrap().progress, 5);
+        entries.catch_up();
+        assert_eq!(entries.progress(&copy, &[]).mark("10").unwrap().was, 9);
         drop(hold);
         let _ = ani::delete_show(&dir);
     }

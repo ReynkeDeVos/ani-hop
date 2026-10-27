@@ -775,10 +775,15 @@ pub fn refresh_shows(fresh: &[Media]) {
 
 /// The user's AniList Entries as last read or saved, by show, each with when (`tick`): what
 /// the Downloads list shows, also offline in a later session.
-type Learnt = HashMap<u64, (Option<Entry>, u64)>;
+pub type Learnt = HashMap<u64, (Option<Entry>, u64)>;
 
 fn learnt_path() -> PathBuf {
     cache_dir().join("entries.json")
+}
+
+/// The Entries kept (`learn`), by any ani-hop.
+pub fn learnt() -> Learnt {
+    read_json(&learnt_path())
 }
 
 /// Keeps `entries` as AniList had them at `at` (`tick`), for the shows downloaded, unless
@@ -825,7 +830,7 @@ static CLOCK: AtomicU64 = AtomicU64::new(0);
 /// two run, a read the other asked for before a save here can still be kept over the save;
 /// a counter file every tick takes in turn if that ever shows up.
 pub fn tick() -> u64 {
-    seen(&read_json(&learnt_path()));
+    seen(&learnt());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
@@ -850,7 +855,7 @@ fn seen(all: &Learnt) {
 /// Downloaded shows and their folders, by name: also those downloaded before the download
 /// folder changed, which stay where they are. Each with its Entry as last learnt.
 pub fn local_shows() -> Vec<(Media, PathBuf)> {
-    let learnt: Learnt = read_json(&learnt_path());
+    let learnt = learnt();
     let mut shows = shows_in(&download_root(), index());
     for (m, _) in &mut shows {
         if let Some((entry, _)) = learnt.get(&m.id) {
