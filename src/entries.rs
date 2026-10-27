@@ -61,6 +61,8 @@ pub struct Entries {
     /// one more for every log in and out
     login: u64,
     known: HashMap<u64, Known>,
+    /// the Entries kept for the Downloads list as last read (`catch_up`), by any ani-hop
+    kept: ani::Learnt,
     pending: usize,
 }
 
@@ -109,15 +111,26 @@ impl Entries {
             anilist,
             login: 0,
             known: HashMap::new(),
+            kept: ani::learnt(),
             pending: 0,
         }
     }
 
-    /// `m`'s Entry, the newest known: this session's, else the one `m` came with.
+    /// `m`'s Entry, the newest known: this session's, else the one `m` came with; but the one
+    /// kept for the Downloads list when that's newer (another ani-hop's save or read since)
+    /// and the same Entry, by its AniList id: another login's has an id of its own.
     pub fn entry<'a>(&'a self, m: &'a Media) -> Option<&'a Entry> {
-        match self.known.get(&m.id) {
-            Some(k) => k.entry.as_ref(),
-            None => m.media_list_entry.as_ref(),
+        let known = self.known.get(&m.id);
+        let here = known.map_or(m.media_list_entry.as_ref(), |k| k.entry.as_ref());
+        match self.kept.get(&m.id) {
+            // a copy without a Known is from a cache, which the kept Entry is never older than
+            Some((Some(kept), when))
+                if here.is_some_and(|e| e.id == kept.id)
+                    && known.is_none_or(|k| k.when < *when) =>
+            {
+                Some(kept)
+            }
+            _ => here,
         }
     }
 
@@ -234,20 +247,10 @@ impl Entries {
         }
     }
 
-    /// Takes in the Entries kept for the Downloads list that are newer than what's known here:
-    /// another ani-hop's saves and reads since, which rescans bring to the Downloads list.
-    /// Only the same Entry, by its AniList id: another login's, a save of this ani-hop's
-    /// before logging in again or another ani-hop's, has an id of its own.
+    /// Reads the Entries kept for the Downloads list again, as a rescan brings them there:
+    /// another ani-hop's saves and reads since, which `entry` goes by where they're newer.
     pub fn catch_up(&mut self) {
-        for (id, (entry, when)) in ani::learnt() {
-            let same = |k: &&mut Known| match (&k.entry, &entry) {
-                (Some(known), Some(kept)) => known.id == kept.id,
-                _ => false,
-            };
-            if let Some(k) = self.known.get_mut(&id).filter(|k| k.when < when && same(k)) {
-                *k = Known { entry, when };
-            }
-        }
+        self.kept = ani::learnt();
     }
 
     /// Another login, or none: what was known was the old login's, and its writes still out
@@ -623,6 +626,26 @@ mod tests {
         );
         assert_eq!(entries.entry(&copy).unwrap().progress, 5);
         entries.catch_up();
+        assert_eq!(entries.progress(&copy, &[]).mark("10").unwrap().was, 9);
+        drop(hold);
+        let _ = ani::delete_show(&dir);
+    }
+
+    #[test]
+    fn a_rescan_catches_up_on_a_page_open_from_downloads() {
+        // a downloaded show's page, open offline: its copy at 5, nothing read this session
+        let copy = watching(70_014, 5);
+        let root = ani::home().join("entries-open-page");
+        let (dir, hold) = ani::prepare_in(&root, &copy).unwrap();
+        let (fake, mut entries) = anilist(&copy, false);
+        mark(&mut Entries::new(fake), &copy, "9");
+        assert_eq!(entries.progress(&copy, &[]).next(), 6);
+        entries.catch_up();
+        assert_eq!(
+            entries.progress(&copy, &[]).next(),
+            10,
+            "Continue with episode 10"
+        );
         assert_eq!(entries.progress(&copy, &[]).mark("10").unwrap().was, 9);
         drop(hold);
         let _ = ani::delete_show(&dir);
