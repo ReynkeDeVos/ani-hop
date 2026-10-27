@@ -8,6 +8,7 @@ mod kitty;
 mod lists;
 mod menu;
 mod playback;
+mod preview;
 mod progress;
 mod show_downloads;
 mod source;
@@ -19,6 +20,7 @@ use entries::{Change, Entries, Stamp};
 use lists::{Feed, List};
 use menu::{Act, Item, Menu};
 use playback::{Playback, Start};
+use preview::Preview;
 use progress::{Mark, Parts, Progress};
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -133,8 +135,6 @@ enum Msg {
     Hits(u64, Result<Vec<String>, String>),
     /// who's logged in, asked with this token
     Viewer(Option<String>, Result<(u64, String, bool), String>),
-    /// a prepared poster
-    Cover(kitty::Loaded),
     EpInfo(u64, HashMap<String, EpInfo>),
     /// sequels of a show, looked up for its episode counts (App::parts_key)
     Parts(u64, (u32, u32), Stamp, Result<Parts, String>),
@@ -161,7 +161,8 @@ pub struct App {
     rx: Receiver<Msg>,
     client: Client,
     pub user: Option<(u64, String)>,
-    pub posters: kitty::Posters,
+    /// the show or episode in the right-hand pane: its poster, and how far it's read
+    pub preview: Preview,
     /// the user's Entries, newest known, and the changes to them
     pub entries: Entries,
     /// episode titles and summaries per show (empty while loading or when there are none)
@@ -180,11 +181,6 @@ pub struct App {
     pub playback: Playback,
     pub toast: Option<(String, bool, Instant)>,
     pub started: Instant,
-    /// media whose title glint plays, and since when
-    pub glint: (u64, Instant),
-    /// the show and episode in the preview, and how many pages down it's read; another
-    /// starts at its top
-    pub scroll: (Option<(u64, Option<String>)>, u16),
     pub missing: Vec<(&'static str, &'static str, &'static str)>,
     /// the installed ani-cli's version, when it's older than ani::TESTED_ANI_CLI
     pub old_ani_cli: Option<String>,
@@ -241,13 +237,13 @@ fn main() -> std::io::Result<()> {
     let res = (|| -> std::io::Result<()> {
         let mut dirty = true;
         while !app.quit {
-            let (fx, glint) = (ui::effects_running(&app), app.glint.1);
+            let (fx, glint) = (ui::effects_running(&app), app.preview.glint());
             if dirty || app.animating() {
                 terminal.draw(|f| ui::render(&mut app, f))?;
             }
             // one more frame after an effect ends (or starts in a slow frame), so it never
             // freezes mid-sweep
-            dirty = fx || app.glint.1 != glint;
+            dirty = fx || app.preview.glint() != glint;
             // ~60 fps while an effect plays, otherwise just often enough for spinners
             let fps = if ui::effects_running(&app) { 16 } else { 80 };
             let mut wait = Duration::from_millis(fps);
@@ -263,13 +259,14 @@ fn main() -> std::io::Result<()> {
                 app.on_msg(msg);
                 dirty = true;
             }
-            if app.posters.check(Instant::now()) {
+            let (shown, off) = app.preview.tick(Instant::now());
+            if off {
                 app.toast(
                     "This terminal didn't take the posters, showing colors instead",
                     true,
                 );
-                dirty = true;
             }
+            dirty |= shown || off;
             if let Some(cmd) = app.external.take() {
                 execute!(std::io::stdout(), DisableBracketedPaste)?;
                 ratatui::restore();
@@ -282,7 +279,7 @@ fn main() -> std::io::Result<()> {
         }
         Ok(())
     })();
-    app.posters.forget();
+    app.preview.forget();
     kitty::shutdown();
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
@@ -434,7 +431,7 @@ impl App {
             rx,
             client,
             user: user.map(|(id, name, _)| (id, name)),
-            posters: kitty::Posters::new(kitty::Tty, kitty::supported()),
+            preview: Preview::new(kitty::Posters::new(kitty::Tty, kitty::supported())),
             entries,
             ep_info: HashMap::new(),
             parts: HashMap::new(),
@@ -445,8 +442,6 @@ impl App {
             playback: Playback::new(Arc::new(playback::Mpv)),
             toast: None,
             started: Instant::now(),
-            glint: (0, Instant::now()),
-            scroll: (None, 0),
             missing: ani::missing_deps(),
             old_ani_cli: ani::old_ani_cli(),
             release: None,
@@ -643,6 +638,10 @@ impl App {
     }
 
     fn push(&mut self, title: impl Into<String>, view: View) -> u64 {
+        // episode titles load while the show is open, so its episode list has them right away
+        if let View::Show(m) | View::Episodes(m, _) = &view {
+            self.want_episodes(m);
+        }
         let multi = matches!(view, View::Shows(..) | View::Episodes(_, EpMode::Download));
         self.scan_local();
         let menu = Menu::new(self.items(&view), multi);
@@ -746,17 +745,9 @@ impl App {
                 .is_some_and(|t| t.2.elapsed().as_secs() < 5)
     }
 
-    /// Starts loading a show's poster at the size of the last layout; `urgent` is the one on
-    /// screen.
-    pub fn want_cover(&mut self, m: &Media, urgent: bool) {
-        if let Some(load) = self.posters.want(m, urgent) {
-            self.spawn(move || Msg::Cover(load.run()));
-        }
-    }
-
     /// Episode titles and summaries, once a session per show, and the sequels the provider
     /// runs on into once it lists more episodes than AniList.
-    pub fn want_episodes(&mut self, m: &Media) {
+    fn want_episodes(&mut self, m: &Media) {
         // ani.zip and AniList know shows by AniList id only
         if !m.on_anilist() {
             return;
@@ -980,11 +971,11 @@ impl App {
                 let item = |key: &str, ep: &str, hint: String| {
                     let mut it = Item::new(key, format!("Episode {ep}"), hint);
                     it.done = run.watched(ep);
-                    if let Some(i) = self.ep_about(m, ep).filter(|_| it.done) {
-                        if !i.title.is_empty() {
-                            it.label = format!("{} · {}", it.label, i.title);
+                    if let Some((title, about)) = self.ep_about(m, ep).map(|i| i.told(it.done)) {
+                        if !title.is_empty() {
+                            it.label = format!("{} · {title}", it.label);
                         }
-                        it.about = i.about.clone();
+                        it.about = about.to_string();
                     }
                     it.group = run.group(ep).to_string();
                     it
@@ -1112,12 +1103,7 @@ impl App {
         if k.modifiers.contains(KeyModifiers::SHIFT)
             && matches!(k.code, KeyCode::Up | KeyCode::Down)
         {
-            let n = &mut self.scroll.1;
-            *n = match k.code {
-                KeyCode::Up => n.saturating_sub(1),
-                _ => n.saturating_add(1),
-            };
-            return;
+            return self.preview.scroll(k.code == KeyCode::Down);
         }
         match self.top().menu.key(k) {
             Some(Act::Accept) => self.accept(),
@@ -1813,7 +1799,6 @@ impl App {
                 self.parts.insert(id, (key, parts));
                 self.refresh();
             }
-            Msg::Cover(loaded) => self.posters.loaded(loaded),
             Msg::Resolved(m, ticket, res) => {
                 // a lookup from before the source was changed by hand
                 if !self.sources.answer(m.id, ticket, &res) {

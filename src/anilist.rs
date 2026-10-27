@@ -221,6 +221,17 @@ pub struct EpInfo {
     pub aired: Option<String>,
 }
 
+impl EpInfo {
+    /// Its title and summary once it's watched; before, they'd give things away (its air date
+    /// doesn't).
+    pub fn told(&self, watched: bool) -> (&str, &str) {
+        match watched {
+            true => (&self.title, &self.about),
+            false => ("", ""),
+        }
+    }
+}
+
 /// Titles and summaries of every episode, from ani.zip (keyed by AniList id, one request a
 /// show, served from Cloudflare's cache) as AniList has none per episode.
 pub fn episodes(id: u64) -> Result<HashMap<String, EpInfo>, String> {
