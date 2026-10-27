@@ -156,13 +156,6 @@ fn panel() -> Block<'static> {
         .border_style(DIM)
 }
 
-/// A paused download's row: how far it got, without the stale speed of its last line, when
-/// that's kept (yt-dlp; ffmpeg starts over).
-fn paused(n: &crate::downloads::Now) -> String {
-    let at = crate::got_so_far(&n.text).filter(|_| n.resumes);
-    at.map_or("‖ paused".into(), |p| format!("‖ paused {p}"))
-}
-
 fn spinner(app: &App) -> &'static str {
     SPINNER[(app.started.elapsed().as_millis() / 80) as usize % SPINNER.len()]
 }
@@ -213,6 +206,11 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     };
     let unaired =
         matches!(&app.stack.last().unwrap().view, View::Episodes(m, _) if app.upcoming(m));
+    // the episode downloading right now on its row, or how far it got when paused
+    let dl_row = match &app.stack.last().unwrap().view {
+        View::Episodes(m, _) => app.show_downloads(m).row(),
+        _ => None,
+    };
     let screen = app.stack.last_mut().unwrap();
     let block = panel();
     let inner = block.inner(area).inner(Margin::new(1, 0));
@@ -339,18 +337,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     // and the next page right on "More…"
     let fetching = matches!(&screen.view, View::Shows(list) if list.fetching());
     let busy = busy.or_else(|| fetching.then(|| ("more".to_string(), format!("{spin} loading…"))));
-    // and the episode downloading right now on its row, or how far it got when paused
-    let dl = app.downloads.snapshot();
-    let busy = busy.or_else(|| match (&screen.view, &dl.now) {
-        (View::Episodes(m, _), Some(n)) if m.id == n.id => Some((
-            n.ep.clone(),
-            match dl.paused {
-                true => paused(n),
-                false => format!("↓ {}", n.text),
-            },
-        )),
-        _ => None,
-    });
+    let busy = busy.or(dl_row);
     let width = list_area.width.saturating_sub(1) as usize; // minus the pointer column
     let selected = m.state.selected();
     let rows: Vec<ListItem> = (m.matches.iter().enumerate())
@@ -1100,14 +1087,15 @@ fn flow(text: &[(&str, Style)], narrow: usize, first: u16, rest: u16) -> Vec<Lin
 
 fn footer(app: &App, f: &mut Frame, area: Rect) {
     let screen = app.stack.last().unwrap();
-    let enter = app.dl_verb();
+    let enter = app.enter_verb();
     // esc empties a typed filter (or a prefilled input) before it goes back
     let esc = if screen.menu.query.is_empty() {
         "back"
     } else {
         "clear"
     };
-    let mut keys = vec![("enter", enter)];
+    // none when enter does nothing (episodes another ani-hop has queued)
+    let mut keys: Vec<(&str, &str)> = enter.map(|v| ("enter", v)).into_iter().collect();
     // the main menu has nothing to go back to
     if app.stack.len() > 1 || !screen.menu.query.is_empty() {
         keys.push(("esc", esc));
@@ -1116,7 +1104,10 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         keys.splice(0..0, [("tab", "mark"), ("^a", "all")]);
     }
     if matches!(&screen.view, View::Shows(list) if list.more_page().is_some()) {
-        let at = keys.iter().position(|k| k.0 == "enter").unwrap();
+        let at = keys
+            .iter()
+            .position(|k| k.0 == "enter")
+            .unwrap_or(keys.len());
         keys.insert(at, ("^f", "more"));
     }
     keys.push(("^c", "quit"));
@@ -1153,7 +1144,7 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
             // how far the one downloading got first, so that's what 80 columns keep, then
             // which one it is and what's after it
             let head = match (&dl.now, dl.paused) {
-                (Some(d), true) => paused(d),
+                (Some(d), true) => crate::show_downloads::paused(d),
                 (Some(d), false) => format!("{} ↓ {}", spinner(app), d.text),
                 (None, true) => format!("‖ paused · {n} queued"),
                 (None, false) => format!("{} ↓ {n} queued", spinner(app)),

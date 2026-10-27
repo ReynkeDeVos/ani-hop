@@ -53,6 +53,9 @@ The queues of ani-hops that are gone, which the next start resumes or drops.
 **Show folder**:
 The folder one show's episodes download into, inside the download folder of the time.
 
+**Show downloads**:
+Where a show's episodes stand with downloads (on disk, queued, queued by another ani-hop, downloading or paused), and what enter does with the ones picked.
+
 ## Screen
 
 **Preview**:
