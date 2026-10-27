@@ -119,9 +119,10 @@ impl Entries {
     /// `m`'s Entry, the newest known: this session's, else the one `m` came with. One this
     /// session read or saved gives way to the one kept for the Downloads list when that's newer
     /// (another ani-hop's save or read since) and the same Entry, by its AniList id: another
-    /// login's has an id of its own.
-    /// shortcut: a copy this session didn't read (a page opened offline from Downloads) keeps
-    /// its progress while another ani-hop saves, until it's opened again or AniList is read:
+    /// login's has an id of its own. A removal or re-add elsewhere has no Entry on one side to
+    /// match, so it shows once AniList is read; a Mark meanwhile isn't saved (`Work::run`).
+    /// shortcut: a copy this session didn't read (a page opened offline) keeps its progress
+    /// while another ani-hop saves, until it's opened again from Downloads or AniList is read:
     /// a copy has no read time to tell it from a cache newer than what's kept; give copies one
     /// if that ever matters.
     pub fn entry<'a>(&'a self, m: &'a Media) -> Option<&'a Entry> {
