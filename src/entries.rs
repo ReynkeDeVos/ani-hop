@@ -549,6 +549,49 @@ mod tests {
         let _ = ani::delete_show(&dir);
     }
 
+    /// `m`'s progress as the Downloads list has it.
+    fn kept(m: &Media) -> u32 {
+        let show = ani::local_shows().into_iter().find(|s| s.0.id == m.id);
+        show.unwrap().0.media_list_entry.unwrap().progress
+    }
+
+    /// An hour past this ani-hop's clock: kept before the clock was set back and ani-hop
+    /// started again, or by another ani-hop whose clock is ahead.
+    fn ahead() -> u64 {
+        ani::tick() + 3_600_000
+    }
+
+    #[test]
+    fn a_read_is_kept_after_the_clock_went_back() {
+        let copy = watching(70_010, 5);
+        let root = ani::home().join("entries-read-ahead");
+        let (dir, hold) = ani::prepare_in(&root, &copy).unwrap();
+        let (_, mut entries) = anilist(&copy, false);
+        ani::learn([(copy.id, copy.media_list_entry.clone())], ahead(), false);
+        // the first read since, before anything rescanned the downloads: AniList has 9
+        assert!(entries.observe(entries.stamp(), [&mut watching(70_010, 9)]));
+        assert_eq!(kept(&copy), 9);
+        drop(hold);
+        let _ = ani::delete_show(&dir);
+    }
+
+    #[test]
+    fn a_save_is_kept_after_another_ani_hops_whose_clock_is_ahead() {
+        let copy = watching(70_011, 6);
+        let root = ani::home().join("entries-save-ahead");
+        let (dir, hold) = ani::prepare_in(&root, &copy).unwrap();
+        let (_, mut entries) = anilist(&copy, false);
+        // the other ani-hop saved 6, then this one marks 7
+        ani::learn([(copy.id, copy.media_list_entry.clone())], ahead(), false);
+        assert_eq!(
+            mark(&mut entries, &copy, "7").text,
+            "Saved Show · Watching · 7/12"
+        );
+        assert_eq!(kept(&copy), 7);
+        drop(hold);
+        let _ = ani::delete_show(&dir);
+    }
+
     #[test]
     fn notices_say_what_happened() {
         let copy = watching(70_005, 5);

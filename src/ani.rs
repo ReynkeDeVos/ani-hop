@@ -818,18 +818,20 @@ pub fn learn(entries: impl IntoIterator<Item = (u64, Option<Entry>)>, at: u64, q
 static CLOCK: AtomicU64 = AtomicU64::new(0);
 
 /// Now, as one number that orders AniList's Entries (`learn`): ms since 1970, but always past
-/// every tick before it in this ani-hop and every one kept by others, so a clock set back or
-/// two reads in one ms still come in order.
-/// shortcut: two ani-hops running at once each go by their own clock and what the other has
-/// kept so far; one set back while the other runs can order their reads wrongly until it
-/// catches up.
+/// every tick before it in this ani-hop and every one kept, by any ani-hop, also before this
+/// one started, so a clock set back or two reads in one ms still come in order. A save's,
+/// taken in its turn (`entries::turn`), comes after every save before it.
+/// shortcut: reads another ani-hop still has out aren't seen, so with the clock set back while
+/// two run, a read the other asked for before a save here can still be kept over the save;
+/// a counter file every tick takes in turn if that ever shows up.
 pub fn tick() -> u64 {
+    seen(&read_json(&learnt_path()));
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64);
     let mut last = CLOCK.load(Ordering::SeqCst);
     loop {
-        let next = now.max(last + 1);
+        let next = now.max(last.saturating_add(1));
         match CLOCK.compare_exchange_weak(last, next, Ordering::SeqCst, Ordering::SeqCst) {
             Ok(_) => return next,
             Err(now_last) => last = now_last,
@@ -849,7 +851,6 @@ fn seen(all: &Learnt) {
 /// folder changed, which stay where they are. Each with its Entry as last learnt.
 pub fn local_shows() -> Vec<(Media, PathBuf)> {
     let learnt: Learnt = read_json(&learnt_path());
-    seen(&learnt);
     let mut shows = shows_in(&download_root(), index());
     for (m, _) in &mut shows {
         if let Some((entry, _)) = learnt.get(&m.id) {
