@@ -773,33 +773,35 @@ pub fn refresh_shows(fresh: &[Media]) {
     });
 }
 
-/// The user's AniList Entries as last read or saved, by show, each with when (ms since 1970):
-/// what the Downloads list shows, also offline in a later session.
+/// The user's AniList Entries as last read or saved, by show, each with when (`tick`): what
+/// the Downloads list shows, also offline in a later session.
 type Learnt = HashMap<u64, (Option<Entry>, u64)>;
 
 fn learnt_path() -> PathBuf {
     cache_dir().join("entries.json")
 }
 
-/// Keeps `entries` as AniList had them at `at` (ms since 1970), for the shows downloaded or
-/// queued (`new`: a download of them was just queued), unless newer ones are kept: a save,
-/// of this ani-hop or another, a list read before or after it, in any order. Other shows
-/// aren't kept, so an old save of one can't outlast a fresher list once it's downloaded.
-/// shortcut: ordered by the wall clock, which a clock set back can fool until the next save.
-pub fn learn(entries: impl IntoIterator<Item = (u64, Option<Entry>)>, at: u64, new: bool) {
+/// Keeps `entries` as AniList had them at `at` (`tick`), for the shows downloaded, unless
+/// newer ones are kept: a save, of this ani-hop or another, a list read before or after it,
+/// in any order. Other shows aren't kept, so an old save of one can't outlast a fresher list
+/// once it's downloaded. `queued`: a download of them was just queued, which keeps them too,
+/// with what this session knew of them, so only over older ones.
+pub fn learn(entries: impl IntoIterator<Item = (u64, Option<Entry>)>, at: u64, queued: bool) {
     let path = learnt_path();
     let edit = || -> std::io::Result<()> {
         fs::create_dir_all(cache_dir())?;
         let lock = fs::File::create(path.with_extension("lock"))?;
         lock.lock()?;
         let mut all: Learnt = read_json(&path);
+        seen(&all);
         let downloaded: std::collections::HashSet<u64> =
             index().values().map(|d| d.media.id).collect();
         let mut changed = false;
         for (id, entry) in entries {
             let kept = all.get(&id).map(|k| k.1);
-            let ours = new || kept.is_some() || downloaded.contains(&id);
-            if ours && kept.is_none_or(|t| t <= at) {
+            let ours = queued || kept.is_some() || downloaded.contains(&id);
+            let newer = kept.is_none_or(|t| t < at || t == at && !queued);
+            if ours && newer {
                 all.insert(id, (entry, at));
                 changed = true;
             }
@@ -812,17 +814,42 @@ pub fn learn(entries: impl IntoIterator<Item = (u64, Option<Entry>)>, at: u64, n
     let _ = edit();
 }
 
-/// Milliseconds since 1970, for `learn`.
-pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
+/// The last `tick`.
+static CLOCK: AtomicU64 = AtomicU64::new(0);
+
+/// Now, as one number that orders AniList's Entries (`learn`): ms since 1970, but always past
+/// every tick before it in this ani-hop and every one kept by others, so a clock set back or
+/// two reads in one ms still come in order.
+/// shortcut: two ani-hops running at once each go by their own clock and what the other has
+/// kept so far; one set back while the other runs can order their reads wrongly until it
+/// catches up.
+pub fn tick() -> u64 {
+    let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, |d| d.as_millis() as u64);
+    let mut last = CLOCK.load(Ordering::SeqCst);
+    loop {
+        let next = now.max(last + 1);
+        match CLOCK.compare_exchange_weak(last, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return next,
+            Err(now_last) => last = now_last,
+        }
+    }
+}
+
+/// Ticks from here on come after everything kept.
+fn seen(all: &Learnt) {
+    CLOCK.fetch_max(
+        all.values().map(|k| k.1).max().unwrap_or(0),
+        Ordering::SeqCst,
+    );
 }
 
 /// Downloaded shows and their folders, by name: also those downloaded before the download
 /// folder changed, which stay where they are. Each with its Entry as last learnt.
 pub fn local_shows() -> Vec<(Media, PathBuf)> {
     let learnt: Learnt = read_json(&learnt_path());
+    seen(&learnt);
     let mut shows = shows_in(&download_root(), index());
     for (m, _) in &mut shows {
         if let Some((entry, _)) = learnt.get(&m.id) {
@@ -1219,13 +1246,19 @@ mod tests {
         learn([(other, at(6))], 10, false);
         learn([(queued, at(5))], 10, true);
         learn([(queued, at(4))], 9, false);
-        let kept: Learnt = read_json(&learnt_path());
-        assert!(!kept.contains_key(&other), "never downloaded or queued");
-        assert_eq!(
-            kept[&queued].0.as_ref().map(|e| e.progress),
-            Some(5),
-            "the newest"
-        );
+        let kept = || {
+            let kept: Learnt = read_json(&learnt_path());
+            (
+                kept.contains_key(&other),
+                kept[&queued].0.as_ref().map(|e| e.progress),
+            )
+        };
+        assert_eq!(kept(), (false, Some(5)), "the newest, of shows queued");
+        // queuing again keeps what this session knew only over older ones: another ani-hop may
+        // have saved at the same moment since
+        learn([(queued, at(6))], 11, false);
+        learn([(queued, at(5))], 11, true);
+        assert_eq!(kept().1, Some(6));
     }
 
     #[test]

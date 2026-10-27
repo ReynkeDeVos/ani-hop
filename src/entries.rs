@@ -13,7 +13,6 @@ use crate::progress::{Mark, Progress};
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Where Entries are written: AniList, or a stand-in in tests.
 pub trait AniList: Send + Sync {
@@ -53,17 +52,8 @@ impl Change {
 struct Known {
     /// None: not on the list
     entry: Option<Entry>,
-    /// when AniList had it (`when`)
+    /// when AniList had it (`ani::tick`): a read's asking, a save's answer
     when: u64,
-    /// when it was written, among this ani-hop's writes in the same ms; 0 when AniList sent it
-    ran: u64,
-}
-
-/// When AniList had an Entry, as one number that orders them all, here and in what's kept
-/// for the Downloads list: ms since 1970, doubled, and one more for a save, which wins over a
-/// read asked for in the same ms (that read may not have seen it).
-fn when(ms: u64, saved: bool) -> u64 {
-    ms * 2 + u64::from(saved)
 }
 
 pub struct Entries {
@@ -78,15 +68,8 @@ pub struct Entries {
 #[derive(Clone, Copy)]
 pub struct Stamp {
     login: u64,
-    /// ms since 1970
-    sent: u64,
-}
-
-impl Stamp {
-    /// When AniList had what the read brings, as `when` orders it.
-    pub fn read(&self) -> u64 {
-        when(self.sent, false)
-    }
+    /// `ani::tick`
+    asked: u64,
 }
 
 /// A write, to run in the background once.
@@ -99,8 +82,7 @@ pub struct Work {
 /// A write's answer, for `Entries::finish`.
 pub struct Done {
     login: u64,
-    ran: u64,
-    /// when AniList answered (`when`)
+    /// when AniList answered (`ani::tick`)
     when: u64,
     change: Change,
     res: Result<Answer, String>,
@@ -153,14 +135,14 @@ impl Entries {
     pub fn stamp(&self) -> Stamp {
         Stamp {
             login: self.login,
-            sent: ani::now_ms(),
+            asked: ani::tick(),
         }
     }
 
     /// Takes in shows AniList sent for a read asked at `stamp`. Each one's Entry is learnt,
-    /// unless one saved after the read was asked is newer; the shows then carry the newest,
-    /// for the caches they go into. False for an earlier login's read, whose shows aren't the
-    /// user's anymore.
+    /// here and for the Downloads list, unless a newer one is known (saved or read since);
+    /// the shows then carry the newest, for the caches they go into. False for an earlier
+    /// login's read, whose shows aren't the user's anymore.
     pub fn observe<'a>(
         &mut self,
         stamp: Stamp,
@@ -169,22 +151,22 @@ impl Entries {
         if stamp.login != self.login {
             return false;
         }
-        let read = stamp.read();
+        let mut learnt = Vec::new();
         for m in shows.into_iter().filter(|m| m.on_anilist()) {
             match self.known.get(&m.id) {
-                // a save after the read was asked for, or a read asked for after it
-                Some(k) if k.when > read => m.media_list_entry = k.entry.clone(),
+                Some(k) if k.when > stamp.asked => m.media_list_entry = k.entry.clone(),
                 _ => {
                     let entry = m.media_list_entry.clone();
+                    learnt.push((m.id, entry.clone()));
                     let k = Known {
                         entry,
-                        when: read,
-                        ran: 0,
+                        when: stamp.asked,
                     };
                     self.known.insert(m.id, k);
                 }
             }
         }
+        ani::learn(learnt, stamp.asked, false);
         true
     }
 
@@ -235,16 +217,11 @@ impl Entries {
             }
         };
         lists::changed();
-        // unless what's known is newer: a write that ran after this one, or a read asked for
-        // after it answered
-        let newer = |k: &Known| (k.when, k.ran) > (done.when, done.ran);
-        if !self.known.get(&m.id).is_some_and(newer) {
-            let k = Known {
-                entry,
-                when: done.when,
-                ran: done.ran,
-            };
-            self.known.insert(m.id, k);
+        // unless what's known is newer: a write that answered after this one, or a read asked
+        // for after it answered
+        if !self.known.get(&m.id).is_some_and(|k| k.when > done.when) {
+            let when = done.when;
+            self.known.insert(m.id, Known { entry, when });
         }
         Some(notice)
     }
@@ -278,10 +255,8 @@ impl Work {
     /// Blocks on AniList, in turn with every ani-hop's writes, and keeps AniList's Entry for
     /// the Downloads list before the next one's turn.
     pub fn run(self) -> Done {
-        static RAN: AtomicU64 = AtomicU64::new(1);
-        let (mut ran, mut answered) = (0, 0);
+        let mut answered = 0;
         let res = turn().and_then(|_turn| {
-            ran = RAN.fetch_add(1, Ordering::Relaxed);
             let saved = |e| Answer::Saved(Some(e));
             let answer = match &self.change {
                 Change::Status(m, status) => self.anilist.save(m.id, Some(status), None).map(saved),
@@ -299,13 +274,12 @@ impl Work {
                 },
             }?;
             let (Answer::Saved(entry) | Answer::Moved(entry)) = &answer;
-            answered = when(ani::now_ms(), true);
+            answered = ani::tick();
             ani::learn([(self.change.show().id, entry.clone())], answered, false);
             Ok(answer)
         });
         Done {
             login: self.login,
-            ran,
             when: answered,
             change: self.change,
             res,
@@ -508,12 +482,11 @@ mod tests {
         };
         // Downloads asked AniList at 5, the save to 6 ran, then the refresh came in
         let asked = entries.stamp();
-        thread::sleep(Duration::from_millis(2));
         let k = entries.progress(&copy, &[]).mark("6").unwrap();
         let done = entries.begin(Change::Progress(k)).run();
         ani::learn(
             [(copy.id, copy.media_list_entry.clone())],
-            asked.read(),
+            asked.asked,
             false,
         );
         assert_eq!(shown(), 6, "the refresh was older than the save");
@@ -522,6 +495,11 @@ mod tests {
         fake.save(copy.id, None, Some(9)).unwrap();
         let mut seen = watching(70_008, 9);
         assert!(entries.observe(entries.stamp(), [&mut seen]));
+        assert_eq!(
+            shown(),
+            9,
+            "a read is kept for the Downloads list too, a Part's as well"
+        );
         entries.remember(&copy);
         assert_eq!(shown(), 9);
         drop(hold);
@@ -535,7 +513,6 @@ mod tests {
         let at = |progress| watching(70_009, progress);
         // two reads asked for one after the other, answered the other way round
         let older = entries.stamp();
-        thread::sleep(Duration::from_millis(2));
         assert!(entries.observe(entries.stamp(), [&mut at(9)]));
         assert!(entries.observe(older, [&mut at(6)]));
         assert_eq!(entries.progress(&copy, &[]).mark("10").unwrap().was, 9);
@@ -544,12 +521,12 @@ mod tests {
         fake.save(copy.id, None, Some(9)).unwrap();
         let k = entries.progress(&copy, &[]).mark("10").unwrap();
         let done = entries.begin(Change::Progress(k)).run();
-        thread::sleep(Duration::from_millis(2));
         assert!(entries.observe(entries.stamp(), [&mut at(12)]));
         entries.finish(done).unwrap();
         assert_eq!(entries.entry(&copy).unwrap().progress, 12);
-        // a read asked for in the ms a save answered may not have seen it: the save wins
-        assert!(when(7, false) < when(7, true) && when(7, true) < when(8, false));
+        // ticks come in order, also many in one ms
+        let ticks: Vec<u64> = (0..100).map(|_| ani::tick()).collect();
+        assert!(ticks.windows(2).all(|t| t[0] < t[1]));
     }
 
     #[test]

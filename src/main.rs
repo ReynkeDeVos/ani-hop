@@ -1712,16 +1712,10 @@ impl App {
         stamp: Stamp,
         mut res: Result<Vec<Media>, String>,
     ) -> Result<Vec<Media>, String> {
-        if !self.entries.observe(stamp, res.iter_mut().flatten()) {
-            return Err(String::new());
+        match self.entries.observe(stamp, res.iter_mut().flatten()) {
+            true => res,
+            false => Err(String::new()),
         }
-        // for the Downloads list, also offline later: kept for the shows downloaded
-        let shows = res
-            .iter()
-            .flatten()
-            .map(|m| (m.id, m.media_list_entry.clone()));
-        ani::learn(shows, stamp.read(), false);
-        res
     }
 
     /// Hands a background result to the screen that waited on it, through `set`. On failure
