@@ -61,10 +61,13 @@ fn haystack<'a>(s: &'a str, kind: AtomKind, buf: &'a mut Vec<char>) -> Utf32Str<
         }
     }
     if matches!(kind, AtomKind::Substring) {
-        buf.push('\u{FFFF}'); // a noncharacter: no query has it
+        buf.push(END);
     }
     Utf32Str::Unicode(buf)
 }
+
+/// What ends a char haystack for ' and !: a noncharacter, taken out of every query.
+const END: char = '\u{FFFF}';
 
 pub enum Act {
     Accept,
@@ -127,10 +130,11 @@ impl Menu {
     }
 
     fn filter(&mut self) {
-        let pattern = Pattern::parse(&self.query, CaseMatching::Smart, Normalization::Smart);
+        let query = self.query.replace(END, "");
+        let pattern = Pattern::parse(&query, CaseMatching::Smart, Normalization::Smart);
         // hidden text is long: fuzzy would match almost anything, so every word as typed
         let words = Pattern::new(
-            &self.query,
+            &query,
             CaseMatching::Smart,
             Normalization::Smart,
             AtomKind::Substring,
@@ -357,6 +361,19 @@ mod tests {
         for q in ["Solo\\ ", "Solo\\ $", "'Solo\\ ", "'Sólo\\ ", "Sólo\\ $"] {
             m.edit(|query| *query = q.into());
             assert!(m.matches.is_empty(), "{q}");
+        }
+        // nor what ends them, pasted: it's as if it wasn't there, in what rows show or hide
+        m.items[1].about = "Un día más".into();
+        for q in ["'\u{FFFF}", "!\u{FFFF}", "Sólo\u{FFFF}", "más\u{FFFF}"] {
+            m.edit(|query| *query = q.into());
+            let without = q.replace('\u{FFFF}', "");
+            let mut plain = Menu::new(
+                labels.iter().map(|l| Item::new(*l, *l, "")).collect(),
+                false,
+            );
+            plain.items[1].about = m.items[1].about.clone();
+            plain.edit(|query| *query = without);
+            assert_eq!(m.matches, plain.matches, "{q}");
         }
     }
 

@@ -429,9 +429,18 @@ pub fn plain(query: &str) -> &str {
     query.trim_start_matches('-')
 }
 
+/// What the system says, through ffmpeg or yt-dlp, when there's no connection: ani-cli got the
+/// episode's links, then the network went.
+const NO_NETWORK: [&str; 4] = [
+    "Network is unreachable",
+    "No route to host",
+    "Temporary failure in name resolution",
+    "nodename nor servname provided", // macOS
+];
+
 /// ani-cli's error, without the colors and line clears it prints it with. A connection error
 /// wins over what failed after it: ani-cli goes on past a server page it couldn't fetch and
-/// ends with "No sources found for dub!".
+/// ends with "No sources found for dub!", and ani-hop's ffmpeg with "parts of it failed".
 pub fn last_error(stderr: &[u8]) -> String {
     let plain = |line: &str| {
         let mut out = String::new();
@@ -447,14 +456,15 @@ pub fn last_error(stderr: &[u8]) -> String {
     };
     let s = String::from_utf8_lossy(stderr);
     let lines: Vec<String> = s.lines().map(plain).filter(|l| !l.is_empty()).collect();
-    // "Connection error: could not fetch https://hianime.at/search?keyword=… (no HTTP res…"
-    let url = lines
-        .iter()
-        .find_map(|l| l.split_once("could not fetch "))
-        .map(|l| l.1);
-    match url {
-        Some(url) => {
-            let host = url.split("://").nth(1).and_then(|u| u.split('/').next());
+    // "Connection error: could not fetch https://hianime.at/search?keyword=… (no HTTP res…",
+    // "[tcp @ 0x55d0] Connection to tcp://vault-12.owocdn.top:443 failed: Network is unreac…"
+    let offline =
+        |l: &&String| l.contains("could not fetch ") || NO_NETWORK.iter().any(|n| l.contains(n));
+    match lines.iter().find(offline) {
+        Some(l) => {
+            let host = l
+                .split_once("://")
+                .and_then(|(_, u)| u.split(['/', ':', ' ']).next());
             format!("can't reach {}", host.unwrap_or("its site"))
         }
         None => lines.last().map_or("ani-cli failed".into(), String::clone),
@@ -1283,6 +1293,11 @@ mod tests {
         let later = b"\x1b[1;31mConnection error: could not fetch https://hianime.at/ajax/x (no HTTP response; curl exit 6)\x1b[0m\nNo sources found for dub!\n\x1b[0m\n";
         assert_eq!(last_error(later), "can't reach hianime.at");
         assert!(unreachable(&last_error(later)) && !unreachable("No results found!"));
+        // the network went once ani-cli had the episode's links: ffmpeg's or yt-dlp's words
+        let cut = b"[tcp @ 0x55d0] Connection to tcp://vault-12.owocdn.top:443 failed: Network is unreachable\n[in#0 @ 0x55d1] Error opening input: Network is unreachable\nparts of it failed to download\n";
+        assert_eq!(last_error(cut), "can't reach vault-12.owocdn.top");
+        let dns = b"ERROR: Unable to download webpage: <urlopen error [Errno -3] Temporary failure in name resolution>\n";
+        assert_eq!(last_error(dns), "can't reach its site");
     }
 
     #[test]

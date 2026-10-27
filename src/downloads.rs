@@ -783,6 +783,8 @@ mod tests {
         "printf '[download]  50.0%% of ~ 1.00MiB at 1.00MiB/s ETA 00:01\\n'; printf x > \"$OUT\"";
     /// what ani-cli says without a connection; a show to look up fails the same way
     const OFFLINE: &str = "echo 'Connection error: could not fetch https://hianime.at/x (no HTTP response; curl exit 6)' >&2; exit 1";
+    /// what ani-hop's ffmpeg says when the connection goes mid-episode
+    const CUT_OFF: &str = "echo '[tcp @ 0x55d0] Connection to tcp://vault-12.owocdn.top:443 failed: Network is unreachable' >&2; echo 'parts of it failed to download' >&2; exit 1";
     /// writes a piece and waits to be stopped, unless it was stopped before: then it finishes
     const SLOW: &str = "if [ -e \"$OUT.again\" ]; then printf x > \"$OUT\"; exit; fi; : > \"$OUT.again\"; printf '[download]  10.0%% of ~ 1.00MiB at 1.00MiB/s ETA 00:09\\n'; : > \"$OUT.part\"; exec sleep 30";
 
@@ -1076,18 +1078,30 @@ mod tests {
 
     #[test]
     fn going_offline_pauses_downloads_and_keeps_them() {
-        // the show can't be looked up, or its episode can't be fetched
-        for (name, lookup) in [
-            ("offline-lookup", Lookup::Resolve),
-            ("offline-episode", Lookup::Ready(source())),
+        // the show can't be looked up, its episode can't be fetched, or the connection goes
+        // while ffmpeg downloads it
+        for (name, lookup, script, said) in [
+            ("offline-lookup", Lookup::Resolve, OFFLINE, "hianime.at"),
+            (
+                "offline-episode",
+                Lookup::Ready(source()),
+                OFFLINE,
+                "hianime.at",
+            ),
+            (
+                "offline-ffmpeg",
+                Lookup::Ready(source()),
+                CUT_OFF,
+                "vault-12.owocdn.top",
+            ),
         ] {
             let dir = temp(name);
-            let (q, done) = queue(&dir, "a", OFFLINE);
+            let (q, done) = queue(&dir, "a", script);
             let mut j = job(&["1", "2"]);
             j.lookup = lookup;
             q.enqueue(j).unwrap();
             let (_, res) = done.recv_timeout(Duration::from_secs(10)).unwrap();
-            assert_eq!(res, Err("can't reach hianime.at".into()));
+            assert_eq!(res, Err(format!("can't reach {said}")));
             wait("paused", || q.snapshot().paused);
             let quiet = done.recv_timeout(Duration::from_millis(300));
             assert!(quiet.is_err(), "{name}: one error, then it waits");

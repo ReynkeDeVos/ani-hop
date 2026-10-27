@@ -16,7 +16,7 @@
 
 - After saving progress, Downloads showed the show's old progress again, and the next "Mark as watched" failed with "not saved · AniList has 6/12 now". A queued download also wrote back the progress from when it was queued.
 - Two ani-hops marking episodes at the same moment could set the progress back on AniList. Saves now go one at a time across ani-hops, and the later one says "not saved · AniList has 7/12 now".
-- Going offline, or starting before the Wi-Fi was up, emptied the download queue: every queued episode failed and was dropped. Downloads now pause and keep their queue: "Paused downloads · can't reach hianime.at · enter on a queued episode resumes them".
+- Going offline, also in the middle of an episode, or starting before the Wi-Fi was up, emptied the download queue: every queued episode failed and was dropped. Downloads now pause and keep their queue: "Paused downloads · can't reach hianime.at · enter on a queued episode resumes them".
 - A save still running while you logged out and in as someone else changed the new login's screens.
 - Starting an episode again while its first player was still open could end the second start's pop-up when the first player closed.
 - A mistyped AniList client ID blocked logging in, with no way to enter another one. Enter on the empty token field now goes back to the client ID step.
