@@ -835,18 +835,21 @@ fn middle_cut(label: &str, room: usize) -> Option<(usize, usize)> {
     }
     let starts: Vec<usize> = label.match_indices(' ').map(|(i, _)| i + 1).collect();
     let ends = [starts.iter().rev().nth(1), starts.last()];
-    let tail = *ends
-        .into_iter()
-        .flatten()
+    let tail = *(ends.into_iter().flatten())
+        .filter(|&&t| !label[t..].trim().is_empty())
         .find(|&&t| width(&label[t..]) <= room / 2)?;
     let mut room = room - width(&label[tail..]) - 1;
+    // whole graphemes, as drawn: "❤️" is two characters and two columns
     let mut head = 0;
-    for (at, ch) in label.char_indices() {
-        let w = width(&label[at..at + ch.len_utf8()]);
+    for g in Span::raw(label)
+        .styled_graphemes(Style::new())
+        .map(|g| g.symbol)
+    {
+        let w = width(g);
         if w > room {
             break;
         }
-        (room, head) = (room - w, at + ch.len_utf8());
+        (room, head) = (room - w, head + g.len());
     }
     Some((label[..head].trim_end().len(), tail))
 }
@@ -911,5 +914,14 @@ mod tests {
         assert_eq!(fit_middle("Frieren", 26), "Frieren");
         // without spaces there's no season to keep: cut at the end
         assert_eq!(fit_middle("ビデオビデオビデオビデオ", 9), "ビデオビ…");
+        // no room at all, or a trailing space, is no season either
+        assert_eq!(fit_middle("Title ", 0), "…");
+        // emoji are cut whole and measured as drawn
+        let hearts = "❤️".repeat(20) + " Final Part 2";
+        let cut = fit_middle(&hearts, 26);
+        assert!(
+            cut.ends_with("…Part 2") && Span::raw(cut.as_str()).width() <= 26,
+            "{cut}"
+        );
     }
 }
