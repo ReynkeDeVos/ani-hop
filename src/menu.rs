@@ -18,7 +18,8 @@ pub struct Item {
     pub about: String,
     /// a command like "More…", not something to pick: can't be marked, isn't counted
     pub action: bool,
-    /// rows of another group start under a faint rule naming it (a sequel's episodes)
+    /// rows of another group start under a faint rule naming it (a sequel's episodes, a
+    /// TheTVDB season)
     pub group: String,
     /// the hint said shorter, for a row too narrow for it ("subtitled")
     pub short: String,

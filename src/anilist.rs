@@ -219,6 +219,10 @@ pub struct EpInfo {
     /// cache from before air dates, which is then fetched again
     #[serde(default)]
     pub aired: Option<String>,
+    /// its TheTVDB season (0 if TheTVDB has none for it: a recap, a special, one not sorted
+    /// in yet); None in a cache from before seasons, which is then fetched again
+    #[serde(default)]
+    pub season: Option<u32>,
 }
 
 impl EpInfo {
@@ -256,6 +260,7 @@ fn episode_info(v: &Value) -> HashMap<String, EpInfo> {
             about: tidy(about.and_then(|a| a.split("\nSource:").next())),
             number: e["episodeNumber"].as_u64().map(|n| n as u32),
             aired: Some(tidy(e["airdate"].as_str())),
+            season: Some(e["seasonNumber"].as_u64().unwrap_or(0) as u32),
         };
         (ep.clone(), info)
     })
@@ -573,7 +578,8 @@ mod tests {
     fn reads_episode_titles_and_summaries() {
         let v = serde_json::json!({ "episodes": {
             "1": { "title": { "en": "The Journey`s End", "x-jat": "Bouken no Owari" },
-                   "summary": "It`s over.\nSource: Crunchyroll", "airdate": "2023-09-29" },
+                   "summary": "It`s over.\nSource: Crunchyroll", "airdate": "2023-09-29",
+                   "seasonNumber": 1 },
             "2": { "title": { "x-jat": "Betsu ni" }, "overview": "Magic lessons.", "episodeNumber": 14 },
             "S1": { "title": { "en": "Episode S1" } },
         }});
@@ -588,6 +594,8 @@ mod tests {
         // a cache from before air dates has None, a show without one an empty date
         assert_eq!(eps["1"].aired.as_deref(), Some("2023-09-29"));
         assert_eq!(eps["2"].aired.as_deref(), Some(""));
+        // and the same for seasons: None from before them, 0 for an episode without one
+        assert_eq!((eps["1"].season, eps["2"].season), (Some(1), Some(0)));
         assert_eq!(
             (eps["S1"].title.as_str(), eps["S1"].about.as_str()),
             ("", "")

@@ -561,6 +561,7 @@ mod tests {
             about: "A boy's drawings come alive.".into(),
             number: None,
             aired: Some("2005-10-23".into()),
+            season: Some(1),
         };
         let told = |ep| {
             let p = page(&Shown {
