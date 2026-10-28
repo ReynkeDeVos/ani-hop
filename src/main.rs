@@ -400,8 +400,13 @@ fn load_episodes(m: &Media) -> HashMap<String, EpInfo> {
     let age = age.and_then(|t| t.elapsed().ok()).unwrap_or(Duration::MAX);
     let cached: Option<HashMap<String, EpInfo>> = ani::read_json(&path);
     match cached {
-        // one from before air dates fetches again, but still stands in when that fails
-        Some(eps) if age.as_secs() < days * 86_400 && eps.values().all(|e| e.aired.is_some()) => {
+        // one from before air dates or seasons fetches again, but still stands in when that fails
+        Some(eps)
+            if age.as_secs() < days * 86_400
+                && eps
+                    .values()
+                    .all(|e| e.aired.is_some() && e.season.is_some()) =>
+        {
             eps
         }
         cached => match anilist::episodes(m.id) {
@@ -412,6 +417,23 @@ fn load_episodes(m: &Media) -> HashMap<String, EpInfo> {
             Err(_) => cached.unwrap_or_default(),
         },
     }
+}
+
+/// Each episode's TheTVDB season, for episodes in order. One without (0: a recap, a special,
+/// one not sorted in yet) is in the season before it, or at the start the one after.
+fn seasons(each: impl IntoIterator<Item = u32>) -> Vec<u32> {
+    let mut last = 0;
+    let mut all: Vec<u32> = (each.into_iter())
+        .map(|s| {
+            last = if s > 0 { s } else { last };
+            last
+        })
+        .collect();
+    let first = all.iter().copied().find(|&s| s > 0).unwrap_or(0);
+    all.iter_mut()
+        .take_while(|s| **s == 0)
+        .for_each(|s| *s = first);
+    all
 }
 
 impl App {
@@ -1014,8 +1036,14 @@ impl App {
             View::Episodes(m, mode) => {
                 let dl = self.show_downloads(m);
                 let run = self.progress(m);
+                let listed = self.sources.get(m.id).map_or(&[][..], |s| &s.episodes);
+                let eps = dl.episodes(listed);
+                let seasons = seasons(
+                    eps.iter()
+                        .map(|ep| (self.ep_about(m, ep).and_then(|i| i.season)).unwrap_or(0)),
+                );
                 // what a watched episode is called and about; nothing that spoils the rest
-                let item = |key: &str, ep: &str, hint: String| {
+                let item = |key: &str, ep: &str, hint: String, season: u32| {
                     let mut it = Item::new(key, format!("Episode {ep}"), hint);
                     it.done = run.watched(ep);
                     if let Some((title, about)) = self.ep_about(m, ep).map(|i| i.told(it.done)) {
@@ -1024,13 +1052,17 @@ impl App {
                         }
                         it.about = about.to_string();
                     }
-                    it.group = run.group(ep).to_string();
+                    // a part AniList counts on its own, or TheTVDB's season (a long show
+                    // like One Piece has 23, where AniList has one entry)
+                    it.group = match run.group(ep) {
+                        "" if season > 0 => format!("Season {season}"),
+                        part => part.to_string(),
+                    };
                     it
                 };
-                let listed = self.sources.get(m.id).map_or(&[][..], |s| &s.episodes);
                 let sizes = *mode == EpMode::Download;
-                (dl.episodes(listed).iter())
-                    .map(|ep| item(ep, ep, dl.hint(ep, sizes)))
+                (eps.iter().zip(seasons))
+                    .map(|(ep, season)| item(ep, ep, dl.hint(ep, sizes), season))
                     .collect()
             }
             View::DlChoice(m, eps) => self.show_downloads(m).choices(eps),
@@ -2046,6 +2078,14 @@ mod tests {
         let names: Vec<&str> = shows.iter().map(|m| m.name()).collect();
         assert_eq!(names, ["B", "C"]);
         assert!(!now.contains_key(&1) && now[&2] == eps("4") && now.contains_key(&3));
+    }
+
+    #[test]
+    fn an_episode_without_a_season_is_in_the_one_around_it() {
+        // a special before season 1, a recap in it, and new episodes TheTVDB hasn't sorted in
+        assert_eq!(super::seasons([0, 1, 0, 1, 2, 0, 0]), [1, 1, 1, 1, 2, 2, 2]);
+        assert_eq!(super::seasons([0, 0]), [0, 0], "none at all");
+        assert!(super::seasons([]).is_empty());
     }
 
     #[test]

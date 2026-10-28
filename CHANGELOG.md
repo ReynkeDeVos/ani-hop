@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.7.6 – 2026-10-28
+
+### Added
+
+- The episode list of a long show that AniList keeps as one, like One Piece, Naruto or Detective Conan, shows where each of its seasons on TheTVDB starts: "── Season 2 ──", as "── Part 2 ──" marks where a season AniList splits in two goes on. For One Piece the seasons follow its story arcs (Season 21 is Wano). Recaps and episodes TheTVDB hasn't sorted in yet stay in the season around them.
+
 ## 0.7.5 – 2026-10-27
 
 ### Changed
