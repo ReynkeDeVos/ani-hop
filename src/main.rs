@@ -980,7 +980,10 @@ impl App {
                             hint.push(format!("{e} ep"));
                         }
                         hint.extend(m.season_year.map(|y| y.to_string()));
-                        Item::new(m.id.to_string(), m.name(), hint.join(" · "))
+                        let mut it = Item::new(m.id.to_string(), m.name(), hint.join(" · "));
+                        // found by its other titles too: "attack on titan", "aot"
+                        it.about = m.titles().cloned().collect::<Vec<_>>().join(" · ");
+                        it
                     })
                     .collect();
                 if let Some(page) = list.more_page()
@@ -1561,7 +1564,7 @@ impl App {
                 let c = self.client.clone();
                 let title = text.clone();
                 self.push_loading(&title, Feed::Whole, None, move || {
-                    let found = c.browse("SEARCH_MATCH", Some(&text), 1);
+                    let found = |q: &str| c.browse("SEARCH_MATCH", Some(q), 1);
                     source::or_ani_cli(found, &text, source::search)
                 });
             }

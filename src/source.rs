@@ -196,7 +196,7 @@ pub fn search(query: &str) -> Result<Hits, String> {
     if ani::plain(query).trim().is_empty() {
         return Err("No results found!".into());
     }
-    match probe(&[ani::plain(query)])? {
+    match probe(&[&ani::plain(query)])? {
         Some((p, lines)) if p.starts_with("Select anime") => Ok((
             lines
                 .iter()
@@ -209,16 +209,39 @@ pub fn search(query: &str) -> Result<Hits, String> {
     }
 }
 
-/// AniList's results, or if AniList failed, ani-cli's: one show per provider entry, equal
-/// titles numbered so each gets its own id and folder. `search` is `search`, passed in for tests.
+/// AniList's results for `query`, or if AniList failed, ani-cli's: one show per provider entry,
+/// equal titles numbered so each gets its own id and folder. AniList finds nothing for a typo
+/// or words run together ("frieran", "onepiece") that the provider does find: then AniList's
+/// results for the provider's top title, if one of theirs starts like `query`, as the provider
+/// has a guess for anything ("Soso no Furiren": Wooser). `anilist` searches AniList and
+/// `search` is `search`, passed in for tests.
 pub fn or_ani_cli(
-    anilist: Result<Vec<Media>, String>,
+    mut anilist: impl FnMut(&str) -> Result<Vec<Media>, String>,
     query: &str,
     search: impl FnOnce(&str) -> Result<Hits, String>,
 ) -> Result<Vec<Media>, String> {
-    let e = match anilist {
+    let e = match anilist(query) {
+        Ok(none) if none.is_empty() => {
+            // a single hit shows no title to search for
+            let top = (search(query).ok())
+                .filter(|(_, eps)| eps.is_none())
+                .and_then(|(hits, _)| hits.into_iter().next());
+            let Some(top) = top else {
+                return Ok(none); // no results is an answer too
+            };
+            // AniList finds no "Jujutsu Kaisen (TV)"
+            let found = anilist(top.split(" (").next().unwrap_or(&top))?;
+            let start = |s: &str| -> String {
+                let alnum = s.chars().filter(|c| c.is_alphanumeric());
+                alnum.flat_map(char::to_lowercase).take(3).collect()
+            };
+            let typed = start(query);
+            let close = |t: &String| !typed.is_empty() && start(t).starts_with(&typed);
+            let found_it = found.iter().flat_map(Media::titles).any(close);
+            return Ok(if found_it { found } else { none });
+        }
         Err(e) => e,
-        ok => return ok, // no results is an answer too
+        ok => return ok,
     };
     let (hits, _) = search(query).map_err(|a| format!("{e} · ani-cli: {a}"))?;
     let mut taken: HashSet<String> = hits.iter().cloned().collect();
@@ -239,7 +262,7 @@ pub fn or_ani_cli(
 }
 
 fn episodes(query: &str, index: usize) -> Result<Vec<String>, String> {
-    match probe(&["-S", &index.to_string(), ani::plain(query)])? {
+    match probe(&["-S", &index.to_string(), &ani::plain(query)])? {
         Some((_, eps)) => Ok(eps),
         None => Ok(vec!["1".into()]), // single-episode show, ani-cli doesn't ask
     }
@@ -263,24 +286,40 @@ fn title_key(s: &str) -> String {
         .collect()
 }
 
-/// Best hits, equally good: same canonical title as on AniList, else the closest title
-/// that contains one of AniList's (or is contained), else none.
-fn best_matches(m: &Media, hits: &[String]) -> Vec<usize> {
-    let titles: Vec<String> = [&m.title.english, &m.title.romaji]
-        .into_iter()
-        .flatten()
-        .chain(&m.synonyms)
+/// How close each hit is to one of AniList's titles, 0 the closest: spelled the same (case and
+/// spaces aside), as canonical titles lose what tells some seasons apart ("Kaguya-sama: Love
+/// is War?" is the second); 1, the same canonical title; more, a title that contains one of
+/// AniList's (or is contained), the more the longer or shorter. None: not close.
+fn closeness(m: &Media, hits: &[String]) -> Vec<Option<usize>> {
+    let names: Vec<&String> = m.titles().collect();
+    let spelled = |s: &str| {
+        s.to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let spellings: HashSet<String> = names.iter().map(|t| spelled(t)).collect();
+    let titles: Vec<String> = (names.iter())
         .map(|t| title_key(t))
         .filter(|t| !t.is_empty())
         .collect();
-    let hits: Vec<String> = hits.iter().map(|h| title_key(h)).collect();
-    let closeness = |h: &String| {
+    let close = |h: &String| {
+        if spellings.contains(&spelled(h)) {
+            return Some(0);
+        }
+        let h = title_key(h);
         let near = titles
             .iter()
             .filter(|t| h.contains(t.as_str()) || t.contains(h.as_str()));
-        near.map(|t| t.len().abs_diff(h.len())).min()
+        near.map(|t| 1 + t.len().abs_diff(h.len())).min()
     };
-    let scores: Vec<Option<usize>> = hits.iter().map(closeness).collect();
+    hits.iter().map(close).collect()
+}
+
+/// Best hits, equally good: spelled as on AniList, else the same canonical title, else the
+/// closest title that contains one of AniList's (or is contained), else none.
+fn best_matches(m: &Media, hits: &[String]) -> Vec<usize> {
+    let scores = closeness(m, hits);
     match scores.iter().flatten().min() {
         Some(best) => (0..hits.len())
             .filter(|&i| scores[i] == Some(*best))
@@ -290,23 +329,32 @@ fn best_matches(m: &Media, hits: &[String]) -> Vec<usize> {
 }
 
 /// Searches `queries` in turn up to the first whose hits have one of `m`'s titles, as one can
-/// find only other shows ("Hagane no Renkinjutsushi": just Arpeggio). If none does, the first
-/// that found anything. `search` is `search`, passed in for tests.
+/// find only other shows ("Hagane no Renkinjutsushi": just Arpeggio), or only ones whose titles
+/// contain `m`'s ("Pocket Monsters": Pokémon Horizons, not Pokémon). If none does, the first
+/// with a title that contains one, else the first that found anything. `search` is `search`,
+/// passed in for tests.
 fn first_fit(
     m: &Media,
     queries: &[String],
     mut search: impl FnMut(&str) -> Result<Hits, String>,
 ) -> Result<(String, Hits), String> {
     let mut found = Err("no title to search for".to_string());
+    // how well `found` fits: 2 one of `m`'s titles, 1 one containing one, 0 none
+    let mut fit = None;
     for q in queries {
         let res = search(q).map(|r| (q.clone(), r));
-        // a single hit shows no title to check, and it's the only show there is
-        let fits = (res.as_ref())
-            .is_ok_and(|(_, (hits, eps))| eps.is_some() || !best_matches(m, hits).is_empty());
-        if fits || found.is_err() {
-            found = res;
+        let f = res.as_ref().ok().map(|(_, (hits, eps))| match eps {
+            Some(_) => 2, // a single hit shows no title to check, and it's the only show there is
+            None => match closeness(m, hits).into_iter().flatten().min() {
+                Some(0 | 1) => 2,
+                Some(_) => 1,
+                None => 0,
+            },
+        });
+        if f > fit || found.is_err() {
+            (found, fit) = (res, f);
         }
-        if fits {
+        if f == Some(2) {
             break;
         }
     }
@@ -591,12 +639,12 @@ mod tests {
         let unused = |_: &str| -> Result<Hits, String> {
             panic!("ani-cli searched although AniList answered")
         };
-        let list = vec![Media::default()];
-        assert_eq!(or_ani_cli(Ok(list), "x", unused).unwrap().len(), 1);
-        assert!(or_ani_cli(Ok(vec![]), "x", unused).unwrap().is_empty());
+        let one = |_: &str| Ok(vec![Media::default()]);
+        assert_eq!(or_ani_cli(one, "x", unused).unwrap().len(), 1);
+        let down = |_: &str| Err("AniList: down".to_string());
 
         let hits = |_: &str| Ok((vec!["A".into(), "B".into(), "A".into()], None));
-        let shows = or_ani_cli(Err("AniList: down".into()), "a", hits).unwrap();
+        let shows = or_ani_cli(down, "a", hits).unwrap();
         let names: Vec<&str> = shows.iter().map(|m| m.name()).collect();
         assert_eq!(names, ["A", "B", "A (2)"]);
         assert!(shows.iter().all(|m| !m.on_anilist()));
@@ -609,28 +657,140 @@ mod tests {
 
         // the provider's own "A (2)" keeps its name, so the second A takes the next number
         let clash = |_: &str| Ok((vec!["A".into(), "A".into(), "A (2)".into()], None));
-        let shows = or_ani_cli(Err("e".into()), "a", clash).unwrap();
+        let shows = or_ani_cli(down, "a", clash).unwrap();
         let names: Vec<&str> = shows.iter().map(|m| m.name()).collect();
         assert_eq!(names, ["A", "A (3)", "A (2)"]);
         let ids: HashSet<u64> = shows.iter().map(|m| m.id).collect();
         assert_eq!(ids.len(), 3);
         // the same entries from an earlier search without the provider's "A (2)" keep their ids
         let before = |_: &str| Ok((vec!["A".into(), "A".into()], None));
-        let before = or_ani_cli(Err("e".into()), "a", before).unwrap();
+        let before = or_ani_cli(down, "a", before).unwrap();
         assert_eq!(before[1].name(), "A (2)");
         assert_eq!(before[1].id, shows[1].id); // the second A, now "A (3)"
         assert_ne!(before[1].id, shows[2].id); // not the provider's "A (2)"
 
         // one hit: ani-cli shows no title, only its episodes
         let single = |q: &str| Ok((vec![q.to_string()], Some(vec!["1".into(), "2".into()])));
-        let shows = or_ani_cli(Err("e".into()), "Frieren 2", single).unwrap();
+        let shows = or_ani_cli(down, "Frieren 2", single).unwrap();
         assert_eq!(shows.len(), 1);
         assert_eq!(shows[0].name(), "Frieren 2");
         assert_eq!(shows[0].ani_cli.as_ref().unwrap().index, 1);
 
         let none = |_: &str| Err("No results found!".to_string());
-        let e = or_ani_cli(Err("AniList: down".into()), "a", none).unwrap_err();
+        let e = or_ani_cli(down, "a", none).unwrap_err();
         assert_eq!(e, "AniList: down · ani-cli: No results found!");
+    }
+
+    #[test]
+    fn a_typo_is_searched_again_as_the_provider_spells_it() {
+        let show = |romaji: &str, synonym: &str| {
+            let mut m = Media::default();
+            m.title.romaji = Some(romaji.into());
+            m.synonyms = vec![synonym.into()];
+            m
+        };
+        let catalog = |q: &str| {
+            Ok(match q {
+                "Jujutsu Kaisen" => vec![show("Jujutsu Kaisen", "JJK")],
+                "Wooser's Hand-to-Mouth Life" => {
+                    vec![show("Wooser no Sono Higurashi", "Hand-to-Mouth Life")]
+                }
+                _ => Vec::new(),
+            })
+        };
+        let mut asked = Vec::new();
+        let anilist = |q: &str| {
+            asked.push(q.to_string());
+            catalog(q)
+        };
+        let hits = |q: &str| {
+            let hits = match q {
+                "jujutsukaisen" => ["Jujutsu Kaisen (TV)", "Jujutsu Kaisen 2nd Season"],
+                _ => [
+                    "Wooser's Hand-to-Mouth Life",
+                    "Wooser's Hand-to-Mouth Life (Dub)",
+                ],
+            };
+            Ok((hits.map(String::from).into(), None))
+        };
+        let shows = or_ani_cli(anilist, "jujutsukaisen", hits).unwrap();
+        assert!(shows.len() == 1 && shows[0].on_anilist());
+        assert_eq!(asked, ["jujutsukaisen", "Jujutsu Kaisen"]);
+        // the provider's guess for a show it doesn't have either
+        let guess = or_ani_cli(catalog, "Soso no Furiren", hits).unwrap();
+        assert!(guess.is_empty());
+        // one of its other titles starts like the typo
+        assert_eq!(or_ani_cli(catalog, "hand to muoth", hits).unwrap().len(), 1);
+
+        // nothing at the provider either, or one hit without a title: no results, no error
+        for found in [
+            Err("No results found!".to_string()),
+            Ok((vec!["xyz".into()], Some(vec!["1".into()]))),
+        ] {
+            let mut asked = 0;
+            let anilist = |_: &str| {
+                asked += 1;
+                Ok(Vec::new())
+            };
+            assert!(or_ani_cli(anilist, "xyz", |_| found).unwrap().is_empty());
+            assert_eq!(asked, 1);
+        }
+    }
+
+    #[test]
+    fn a_title_as_anilist_spells_it_beats_a_canonical_one() {
+        // the second season: its "?" is all canonical titles would tell it apart by
+        let mut kaguya = Media::default();
+        kaguya.title.english = Some("Kaguya-sama: Love is War?".into());
+        kaguya.title.romaji =
+            Some("Kaguya-sama wa Kokurasetai?: Tensaitachi no Renai Zunousen".into());
+        kaguya.synonyms = vec!["Kaguya-sama: Love is War Season 2".into()];
+        let hits = [
+            "Kaguya-sama: Love is War",
+            "Kaguya-sama: Love is War Season 2",
+            "Kaguya-sama: Love is War - Ultra Romantic",
+        ];
+        assert_eq!(best_matches(&kaguya, &hits.map(String::from)), [1]);
+        let first = pick(
+            "Kaguya-sama wa Kokurasetai",
+            "Kaguya-sama: Love is War",
+            &hits,
+        );
+        assert_eq!(first, 0);
+        // case and spaces aside
+        let hits = [
+            "Kaguya-sama: Love is War",
+            "KAGUYA-SAMA:  love is war season 2",
+        ];
+        assert_eq!(best_matches(&kaguya, &hits.map(String::from)), [1]);
+    }
+
+    #[test]
+    fn searches_on_when_a_title_only_contains_the_show() {
+        let mut pokemon = Media::default();
+        pokemon.title.romaji = Some("Pocket Monsters".into());
+        pokemon.title.english = Some("Pokémon".into());
+        let queries = ["Pocket Monsters", "Pokémon"].map(String::from);
+        let provider = |q: &str| match q {
+            "Pocket Monsters" => [
+                "Pocket Monsters - The Hallowed God, Arceus",
+                "Pokémon Horizons: The Series",
+            ],
+            _ => ["Pokémon", "Pokémon Horizons: The Series"],
+        };
+        let search = |q: &str| Ok((provider(q).map(String::from).into(), None));
+        assert_eq!(first_fit(&pokemon, &queries, search).unwrap().0, "Pokémon");
+        // no query finds the very title: the first one that found a title containing it
+        let loose = |q: &str| match q {
+            "Pocket Monsters" => Ok((vec!["Arpeggio of Blue Steel".into()], None)),
+            _ => Ok((vec!["Pokémon Horizons: The Series".into()], None)),
+        };
+        assert_eq!(first_fit(&pokemon, &queries, loose).unwrap().0, "Pokémon");
+        let loose = |_: &str| Ok((vec!["Pokémon Horizons: The Series".into()], None));
+        assert_eq!(
+            first_fit(&pokemon, &queries, loose).unwrap().0,
+            "Pocket Monsters"
+        );
     }
 
     #[test]
@@ -743,7 +903,12 @@ mod tests {
     fn queries_never_become_ani_cli_options() {
         assert_eq!(ani::plain("-D"), "D");
         assert_eq!(ani::plain("--update"), "update");
-        assert_eq!(ani::plain("Re:Zero -Starting"), "Re:Zero -Starting");
+        assert_eq!(ani::plain("Re:Zero -Starting"), "Re%3AZero -Starting");
         assert_eq!(search("--"), Err("No results found!".into()));
+        // and reach the provider's URL as they are
+        assert_eq!(ani::plain("HUNTER×HUNTER"), "HUNTER%C3%97HUNTER");
+        assert_eq!(ani::plain("Pokémon"), "Pok%C3%A9mon");
+        assert_eq!(ani::plain("A & B+ [1] 100%"), "A %26 B%2B %5B1%5D 100%25");
+        assert_eq!(ani::plain("葬送"), "%E8%91%AC%E9%80%81");
     }
 }

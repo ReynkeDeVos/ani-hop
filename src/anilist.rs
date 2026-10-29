@@ -139,6 +139,14 @@ impl Media {
         }
     }
 
+    /// Its titles as AniList has them, and the other names it goes by.
+    pub fn titles(&self) -> impl Iterator<Item = &String> {
+        let titles = [&self.title.romaji, &self.title.english]
+            .into_iter()
+            .flatten();
+        titles.chain(&self.synonyms)
+    }
+
     pub fn on_anilist(&self) -> bool {
         self.id < ANI_CLI_ONLY
     }
