@@ -71,3 +71,5 @@ From source: `cargo install --locked --git https://github.com/ReynkeDeVos/ani-ho
 ## License
 
 [GPL-3.0-or-later](LICENSE)
+
+<sub>Curious how the code is structured? Here is the [architecture diagram](architecture.png).</sub>
