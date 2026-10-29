@@ -419,7 +419,10 @@ pub fn ani_cli() -> Command {
         std::env::var("PATH").unwrap_or_default()
     );
     let mut c = Command::new("ani-cli");
-    c.env("PATH", path).stdin(Stdio::null());
+    // ANI_CLI_EXACT compares titles with the query as `plain` encodes it; ani-hop matches its own
+    c.env("PATH", path)
+        .env_remove("ANI_CLI_EXACT")
+        .stdin(Stdio::null());
     c
 }
 

@@ -212,9 +212,10 @@ pub fn search(query: &str) -> Result<Hits, String> {
 /// AniList's results for `query`, or if AniList failed, ani-cli's: one show per provider entry,
 /// equal titles numbered so each gets its own id and folder. AniList finds nothing for a typo
 /// or words run together ("frieran", "onepiece") that the provider does find: then AniList's
-/// results for the provider's top title, if one of theirs starts like `query`, as the provider
-/// has a guess for anything ("Soso no Furiren": Wooser). `anilist` searches AniList and
-/// `search` is `search`, passed in for tests.
+/// results for the provider's top title, if one of theirs starts like `query` and the title
+/// has no number `query` hasn't, as the provider has a guess for anything ("Soso no Furiren":
+/// Wooser; "jujutsu kaisen s2": the 3rd season). `anilist` searches AniList and `search` is
+/// `search`, passed in for tests.
 pub fn or_ani_cli(
     mut anilist: impl FnMut(&str) -> Result<Vec<Media>, String>,
     query: &str,
@@ -226,11 +227,16 @@ pub fn or_ani_cli(
             let top = (search(query).ok())
                 .filter(|(_, eps)| eps.is_none())
                 .and_then(|(hits, _)| hits.into_iter().next());
-            let Some(top) = top else {
+            // AniList finds no "Jujutsu Kaisen (TV)"
+            let top = top.as_deref().map(|t| t.split(" (").next().unwrap_or(t));
+            let numbers = |s: &str| -> HashSet<String> {
+                let runs = s.split(|c: char| !c.is_ascii_digit());
+                runs.filter(|n| !n.is_empty()).map(String::from).collect()
+            };
+            let Some(top) = top.filter(|t| numbers(t).is_subset(&numbers(query))) else {
                 return Ok(none); // no results is an answer too
             };
-            // AniList finds no "Jujutsu Kaisen (TV)"
-            let found = anilist(top.split(" (").next().unwrap_or(&top))?;
+            let found = anilist(top)?;
             let start = |s: &str| -> String {
                 let alnum = s.chars().filter(|c| c.is_alphanumeric());
                 alnum.flat_map(char::to_lowercase).take(3).collect()
@@ -705,7 +711,13 @@ mod tests {
         };
         let hits = |q: &str| {
             let hits = match q {
-                "jujutsukaisen" => ["Jujutsu Kaisen (TV)", "Jujutsu Kaisen 2nd Season"],
+                "jujutsukaisen" | "jujutsukaisen 2020" => {
+                    ["Jujutsu Kaisen (TV)", "Jujutsu Kaisen 2nd Season"]
+                }
+                "jujutsu kaisen s2" => [
+                    "Jujutsu Kaisen 3rd Season: The Culling Game Part 1",
+                    "Jujutsu Kaisen 2nd Season",
+                ],
                 _ => [
                     "Wooser's Hand-to-Mouth Life",
                     "Wooser's Hand-to-Mouth Life (Dub)",
@@ -721,6 +733,25 @@ mod tests {
         assert!(guess.is_empty());
         // one of its other titles starts like the typo
         assert_eq!(or_ani_cli(catalog, "hand to muoth", hits).unwrap().len(), 1);
+        // nor another season, asked for with a number the guess hasn't: AniList isn't asked again
+        let mut asked = 0;
+        let counted = |q: &str| {
+            asked += 1;
+            catalog(q)
+        };
+        assert!(
+            or_ani_cli(counted, "jujutsu kaisen s2", hits)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(asked, 1);
+        // one only typed is fine
+        assert_eq!(
+            or_ani_cli(catalog, "jujutsukaisen 2020", hits)
+                .unwrap()
+                .len(),
+            1
+        );
 
         // nothing at the provider either, or one hit without a title: no results, no error
         for found in [
