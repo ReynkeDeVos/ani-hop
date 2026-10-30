@@ -261,7 +261,6 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     .areas(inner);
 
     let label = match &screen.view {
-        View::Input(Input::Search) => "search ",
         View::Input(Input::ClientId) => "client id ",
         View::Input(Input::Token) => "token ",
         View::Input(Input::SourceQuery(_)) => "ani-cli ",
@@ -288,10 +287,15 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         }
     }
 
+    // an input as a fixed menu: its rule alone, and its help where rows would start
     if let View::Input(input) = &screen.view {
+        let rule = "─".repeat(info_area.width as usize);
+        f.render_widget(Line::styled(rule, DIM), info_area);
+        let [_, help_area] =
+            Layout::horizontal([Constraint::Length(3), Constraint::Fill(1)]).areas(list_area);
         f.render_widget(
             Paragraph::new(input_help(input)).wrap(Wrap { trim: false }),
-            list_area,
+            help_area,
         );
         return;
     }
@@ -476,17 +480,25 @@ fn skeleton(area: Rect, tick: usize) -> Text<'static> {
 fn input_help(input: &Input) -> Text<'static> {
     let lines: Vec<Line> = match input {
         // AniList takes the text as it is; fzf's syntax is for the list it finds
-        Input::Search => vec![
-            "A show's English or Japanese name, or a nickname like aot.".into(),
-            "".into(),
-            "Filter the shows it finds:".into(),
-            key_line("'titan", "exact match", ""),
-            key_line("^attack", "starts with", ""),
-            key_line("titan$", "ends with", ""),
-            key_line("!season", "leaves out", ""),
-            key_line("fri | aot", "either one", ""),
-        ],
-        // one line per step or idea, wrapped by the pane, as 80 columns leave it 29
+        Input::Search => {
+            let row = |typed: &'static str, does: &'static str| {
+                Line::from(vec![
+                    Span::styled(format!("{typed:<11}"), Style::new().fg(ACCENT).not_dim()),
+                    does.into(),
+                ])
+            };
+            vec![
+                "A show's English or Japanese name, or a nickname like aot.".into(),
+                "".into(),
+                "Filter the shows it finds:".into(),
+                row("'titan", "exact match"),
+                row("^attack", "starts with"),
+                row("titan$", "ends with"),
+                row("!season", "leaves out"),
+                row("fri | aot", "either one"),
+            ]
+        }
+        // one line per step or idea, wrapped by the pane, as 80 columns leave it 27
         Input::ClientId => vec![
             "One-time setup: ani-hop needs your own AniList API client.".into(),
             "".into(),
@@ -507,11 +519,10 @@ fn input_help(input: &Input) -> Text<'static> {
             "Wrong client ID? Press enter with this empty.".into(),
         ],
         Input::SourceQuery(_) => vec![
-            "Search ani-cli with this text, then pick the right source. ani-hop keeps your pick."
-                .into(),
+            "Search ani-cli with this text, then pick the right source. ani-hop keeps it.".into(),
         ],
         Input::DownloadDir => vec![
-            "Where downloads go. ~ works.".into(),
+            "Downloads go here. ~ works.".into(),
             format!("Empty goes back to {}.", ani::tilde(&ani::default_root())).into(),
             "".into(),
             "Shows downloaded before keep their folder, also for new episodes.".into(),
@@ -716,24 +727,22 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v
 }
 
-/// A key, what it does, and the other keys that do the same, as the start panel lists them.
-fn key_line(k: &'static str, what: &'static str, also: &'static str) -> Line<'static> {
-    // padded only beside other keys: trailing spaces would wrap at 80 columns
-    let (what, also) = match also {
-        "" => (what.to_string(), String::new()),
-        _ => (format!("{what:<18}"), format!("{also:>8}")),
-    };
-    Line::from(vec![
-        // bright in dimmed help too
-        Span::styled(format!("{k:>10}  "), Style::new().fg(ACCENT).not_dim()),
-        Span::raw(what),
-        Span::styled(also, DIM),
-    ])
-}
-
 /// The start panel in `area`: the logo only where everything else fits under it, as a short
 /// screen keeps an update notice (two or three rows at 80 columns) and every key instead.
 fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
+    // a key, what it does, and the other keys that do the same
+    let key = |k: &'static str, what: &'static str, also: &'static str| {
+        // padded only beside other keys: trailing spaces would wrap at 80 columns
+        let (what, also) = match also {
+            "" => (what.to_string(), String::new()),
+            _ => (format!("{what:<18}"), format!("{also:>8}")),
+        };
+        Line::from(vec![
+            Span::styled(format!("{k:>10}  "), ACCENT),
+            Span::raw(what),
+            Span::styled(also, DIM),
+        ])
+    };
     let mut v = vec![Line::styled(
         format!("↓ downloads go to {}", ani::tilde(&ani::download_root())),
         DIM,
@@ -752,20 +761,20 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
         // clears a filter before it goes back
         v.extend([
             "".into(),
-            key_line("↑ ↓", "move", "^k ^j"),
-            key_line("→", "select", "enter ^l"),
-            key_line("←", "back", "^h"),
+            key("↑ ↓", "move", "^k ^j"),
+            key("→", "select", "enter ^l"),
+            key("←", "back", "^h"),
             "".into(),
-            key_line("type", "filter the list", ""),
+            key("type", "filter the list", ""),
             // 40 columns, all 80 leave the preview
             Line::styled(format!("{:12}'word ^start end$ !not a | b", ""), DIM),
-            key_line("esc", "clear the filter, then back", ""),
+            key("esc", "clear the filter, then back", ""),
             "".into(),
-            key_line("tab", "mark for bulk actions", ""),
-            key_line("^a", "mark all", ""),
-            key_line("^f", "load more shows", ""),
-            key_line("shift ↑↓", "scroll the preview", ""),
-            key_line("^c", "quit", ""),
+            key("tab", "mark for bulk actions", ""),
+            key("^a", "mark all", ""),
+            key("^f", "load more shows", ""),
+            key("shift ↑↓", "scroll the preview", ""),
+            key("^c", "quit", ""),
         ]);
     }
     let below = Paragraph::new(v.clone()).wrap(Wrap { trim: false });
