@@ -470,7 +470,27 @@ fn skeleton(area: Rect, tick: usize) -> Text<'static> {
 
 fn input_help(input: &Input) -> Text<'static> {
     let lines: Vec<Line> = match input {
-        Input::Search => vec!["Type a title and press enter.".into()],
+        Input::Search => {
+            // AniList takes the text as it is; fzf's syntax is for the list it finds
+            let row = |typed: &'static str, does: &'static str| {
+                let typed = format!("{typed:<11}");
+                Line::from(vec![
+                    Span::styled(typed, Style::new().fg(ACCENT).not_dim()),
+                    does.into(),
+                ])
+            };
+            vec![
+                "Type a show's name in English or Japanese, or a nickname like aot, and press enter."
+                    .into(),
+                "".into(),
+                "Then filter what it finds:".into(),
+                row("'titan", "exact match"),
+                row("^attack", "starts with"),
+                row("titan$", "ends with"),
+                row("!season", "leaves out"),
+                row("fri | aot", "either one"),
+            ]
+        }
         // one line per step or idea, wrapped by the pane, as 80 columns leave it 29
         Input::ClientId => vec![
             "One-time setup: ani-hop needs your own AniList API client.".into(),
