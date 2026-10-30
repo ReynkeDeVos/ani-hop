@@ -935,6 +935,11 @@ impl App {
                 ),
                 audio_item("Default audio…", ani::audio(None)),
                 Item::new(
+                    "adult",
+                    "Adult shows",
+                    if ani::adult_on() { "on" } else { "off" },
+                ),
+                Item::new(
                     "folder",
                     "Download folder…",
                     ani::tilde(&ani::download_root()),
@@ -1459,7 +1464,7 @@ impl App {
         }
     }
 
-    /// Fetches the next page of the ranking on top, as "More…" and ^f do.
+    /// Fetches the next page of the ranking or search on top, as "More…" and ^f do.
     fn more(&mut self) {
         let screen = self.top();
         let id = screen.id;
@@ -1467,9 +1472,15 @@ impl App {
             return;
         };
         match list.more() {
-            Ok(Some((sort, page))) => {
+            Ok(Some((sort, search, page))) => {
                 let (c, stamp) = (self.client.clone(), self.entries.stamp());
-                self.spawn(move || Msg::More(id, stamp, c.browse(&sort, None, page)));
+                self.spawn(move || {
+                    let more = match search {
+                        Some(q) => c.search(&q, page),
+                        None => c.browse(&sort, None, page),
+                    };
+                    Msg::More(id, stamp, more)
+                });
             }
             Ok(None) => {}
             Err(why) => self.toast(why, false),
@@ -1486,7 +1497,7 @@ impl App {
         if let Some(sort) = key.strip_prefix("browse:") {
             let sort = sort.to_string();
             let cache = self.ranking_key(&sort);
-            let feed = Feed::Pages(sort.clone(), Some(2), false);
+            let feed = Feed::Pages(sort.clone(), None, Some(2), false);
             return self.push_loading(label, feed, Some(cache), move || c.browse(&sort, None, 1));
         }
         match key {
@@ -1513,6 +1524,19 @@ impl App {
                 }
                 let state = if on { "on" } else { "off" };
                 self.toast(format!("Skipping openings and endings: {state}"), false);
+                self.refresh();
+            }
+            "adult" => {
+                let on = !ani::adult_on();
+                if let Err(e) = ani::set_adult(on) {
+                    return self.toast(e.to_string(), true);
+                }
+                lists::changed(); // rankings cached with or without them
+                let state = if on { "on" } else { "off" };
+                self.toast(
+                    format!("Adult shows in searches and rankings: {state}"),
+                    false,
+                );
                 self.refresh();
             }
             "audio" => {
@@ -1562,10 +1586,9 @@ impl App {
             }
             Input::Search => {
                 let c = self.client.clone();
-                let title = text.clone();
-                self.push_loading(&title, Feed::Whole, None, move || {
-                    let found = |q: &str| c.browse("SEARCH_MATCH", Some(q), 1);
-                    source::or_ani_cli(found, &text, source::search)
+                let feed = Feed::Pages("SEARCH_MATCH".into(), Some(text.clone()), None, false);
+                self.push_loading(&text.clone(), feed, None, move || {
+                    source::or_ani_cli(|q| c.search(q, 1), &text, source::search)
                 });
             }
             Input::ClientId => {
@@ -1603,6 +1626,7 @@ impl App {
                 Err(e) => self.toast(e, true),
             },
             Input::SourceQuery(m) => {
+                let text = source::source_query(&m, &text);
                 let id = self.push("Pick source", View::Sources(m, text.clone(), Vec::new()));
                 self.top().waiting = true;
                 self.spawn(move || Msg::Hits(id, source::search(&text).map(|r| r.0)));

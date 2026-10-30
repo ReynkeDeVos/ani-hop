@@ -363,15 +363,38 @@ impl Client {
         search: Option<&str>,
         page: u32,
     ) -> Result<Vec<Media>, String> {
+        // left out, not null: isAdult: null finds nothing
+        let adult = if crate::ani::adult_on() {
+            ""
+        } else {
+            ", isAdult: false"
+        };
         let q = format!(
             "query($sort: [MediaSort], $search: String, $page: Int) {{ Page(page: $page, perPage: {PER_PAGE}) {{
-               media(type: ANIME, sort: $sort, search: $search, isAdult: false) {{ {MEDIA} }} }} }}"
+               media(type: ANIME, sort: $sort, search: $search{adult}) {{ {MEDIA} }} }} }}"
         );
         let d = self.gql(
             &q,
             json!({ "sort": [sort], "search": search, "page": page }),
         )?;
         serde_json::from_value(d["Page"]["media"].clone()).map_err(|e| e.to_string())
+    }
+
+    /// AniList's best matches for `query`, then the ones for it `folded`: AniList finds no
+    /// original "Pokémon" for "Pokémon", nor anything for "JoJo’s", but folding loses some as
+    /// typed ("Sōsō no Furīren" finds Frieren, "Soso no Furiren" nothing).
+    pub fn search(&self, query: &str, page: u32) -> Result<Vec<Media>, String> {
+        let mut shows = self.browse("SEARCH_MATCH", Some(query), page)?;
+        let folded = folded(query);
+        if folded != query
+            && let Ok(more) = self.browse("SEARCH_MATCH", Some(&folded), page)
+        {
+            let new: Vec<Media> = (more.into_iter())
+                .filter(|m| shows.iter().all(|s| s.id != m.id))
+                .collect();
+            shows.extend(new);
+        }
+        Ok(shows)
     }
 
     /// The shows with these AniList ids as AniList has them now: their list entries too, so
@@ -511,8 +534,37 @@ fn follow_sequels(
     Ok(parts)
 }
 
+/// `query` as typed on a plain keyboard: no accents, straight quotes, half-width letters.
+/// Japanese stays, AniList finds it as it is.
+fn folded(query: &str) -> String {
+    let char = |c: char| match c {
+        '‘' | '’' => '\'',
+        '“' | '”' => '"',
+        '\u{3000}' => ' ',
+        // full-width ASCII ("Ｓｔｅｉｎｓ；Ｇａｔｅ")
+        '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+        c => nucleo_matcher::chars::normalize(c),
+    };
+    query.chars().map(char).collect()
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn searches_again_as_typed_on_a_plain_keyboard() {
+        let folded = super::folded;
+        assert_eq!(folded("Pokémon"), "Pokemon");
+        assert_eq!(folded("Sōsō no Furīren"), "Soso no Furiren");
+        assert_eq!(
+            folded("JoJo’s Bizarre Adventure"),
+            "JoJo's Bizarre Adventure"
+        );
+        assert_eq!(folded("Ｓｔｅｉｎｓ；Ｇａｔｅ"), "Steins;Gate");
+        for same in ["葬送のフリーレン", "HUNTER×HUNTER", "Re:Zero"] {
+            assert_eq!(folded(same), same);
+        }
+    }
+
     #[test]
     fn episodes_past_a_split_season_are_its_sequels() {
         use super::Media;

@@ -535,6 +535,19 @@ pub fn set_skip(on: bool) -> std::io::Result<()> {
     }
 }
 
+/// AniList's adult shows in searches and rankings too; off unless turned on.
+pub fn adult_on() -> bool {
+    config_dir().join("adult").exists()
+}
+
+pub fn set_adult(on: bool) -> std::io::Result<()> {
+    let path = config_dir().join("adult");
+    match on {
+        true => fs::create_dir_all(config_dir()).and_then(|()| fs::write(path, "")),
+        false => fs::remove_file(path),
+    }
+}
+
 fn audio_path() -> PathBuf {
     config_dir().join("audio.json")
 }
