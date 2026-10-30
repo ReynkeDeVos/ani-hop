@@ -423,6 +423,69 @@ pub fn default_query(m: &Media) -> String {
         .unwrap_or_default()
 }
 
+/// What ani-cli searches for `query`, typed to change `m`'s source: a nickname AniList knows
+/// it by ("aot", "fmab") is its title, as the provider finds another show for one, or none.
+pub fn source_query(m: &Media, query: &str) -> String {
+    let nickname = m
+        .synonyms
+        .iter()
+        .any(|s| s.eq_ignore_ascii_case(query.trim()));
+    match m.title.english.as_ref().or(m.title.romaji.as_ref()) {
+        Some(title) if nickname => title.clone(),
+        _ => query.to_string(),
+    }
+}
+
+/// A finished show's source when its search found a single hit with another episode count than
+/// its `n`, which may be another season ("86: Eighty Six" finds just the 2nd): a hit with `n`
+/// episodes for its title up to the colon ("86"), that title or one containing it, closest
+/// first. None if there's none, and the single hit stays. `search` and `episodes` are theirs,
+/// passed in for tests.
+fn by_count(
+    m: &Media,
+    n: usize,
+    mut search: impl FnMut(&str) -> Result<Hits, String>,
+    mut episodes: impl FnMut(&str, usize) -> Result<Vec<String>, String>,
+) -> Option<Source> {
+    // not "Re:Zero"'s "Re"
+    let titles = [&m.title.romaji, &m.title.english].into_iter().flatten();
+    let mut tried = HashSet::new();
+    for short in titles
+        .filter_map(|t| t.split_once(": "))
+        .map(|(s, _)| s.trim())
+    {
+        if short.is_empty() || !tried.insert(short) {
+            continue;
+        }
+        let Ok((hits, None)) = search(short) else {
+            continue; // a single hit shows no title to check
+        };
+        let close = closeness(m, &hits);
+        let mut near: Vec<usize> = (0..hits.len()).filter(|&i| close[i].is_some()).collect();
+        near.sort_by_key(|&i| close[i]);
+        for i in near.into_iter().take(3) {
+            match episodes(short, i + 1) {
+                Ok(eps) if eps.len() == n => return Some(Source::at(short, &hits, i + 1, eps)),
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// A finished show's source by `by_count`, when its search found a single hit with `eps`, of
+/// another length than the show's; none for a source picked by hand.
+fn recount(m: &Media, eps: &[String]) -> Option<Source> {
+    let n = m
+        .episodes
+        .filter(|_| m.status.as_deref() == Some("FINISHED"))? as usize;
+    let by_hand = || overrides().contains_key(&m.id.to_string());
+    if eps.len() == n || by_hand() {
+        return None;
+    }
+    by_count(m, n, search, episodes)
+}
+
 fn resolved_path() -> PathBuf {
     ani::cache_dir().join("resolved.json")
 }
@@ -430,7 +493,11 @@ fn resolved_path() -> PathBuf {
 /// Re-checks a (possibly cached) source right before ani-cli runs: `-S` is positional and
 /// the provider's order shifts when new seasons show up. One search, not a full resolve.
 pub fn locate(m: &Media, src: &Source) -> Result<Source, String> {
-    let (hits, _) = search(&src.query)?;
+    let (hits, eps) = search(&src.query)?;
+    // cached before `resolve` doubted a single hit of another length (86's 2nd season)
+    if let Some(better) = eps.and_then(|eps| recount(m, &eps)) {
+        return Ok(better);
+    }
     match position(src, &hits) {
         Some(index) => Ok(Source::at(&src.query, &hits, index, src.episodes.clone())),
         None => resolve(m),
@@ -505,6 +572,9 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
         None => first_fit(&matched(m), &queries, search)?,
     };
     if let Some(eps) = eps {
+        if let Some(better) = recount(m, &eps) {
+            return Ok(better);
+        }
         return Ok(Source::at(&query, &hits, 1, eps));
     }
     // the very entry picked, the second of two equal titles too
@@ -822,6 +892,48 @@ mod tests {
             first_fit(&pokemon, &queries, loose).unwrap().0,
             "Pocket Monsters"
         );
+    }
+
+    #[test]
+    fn a_single_hit_of_another_length_gives_way_to_a_shorter_title() {
+        let mut m = Media::default();
+        m.title.romaji = Some("86: Eighty Six".into());
+        m.title.english = Some("86 EIGHTY-SIX".into());
+        let hits = [
+            "86",
+            "86 EIGHTY-SIX Season 2 Recap",
+            "Eighty Six: 2nd Season",
+            "86-Eighty Six- Special Edition",
+        ];
+        let lengths = [11, 3, 12, 1];
+        let searched = std::cell::RefCell::new(Vec::new());
+        let search = |q: &str| {
+            searched.borrow_mut().push(q.to_string());
+            Ok((hits.map(String::from).into(), None))
+        };
+        let episodes =
+            |_: &str, i: usize| Ok((1..=lengths[i - 1]).map(|e| e.to_string()).collect());
+        // the recap is closest, but has 3
+        let src = by_count(&m, 11, search, episodes).unwrap();
+        assert_eq!((src.query.as_str(), src.index), ("86", 1));
+        assert_eq!(*searched.borrow(), ["86"], "the English title has no colon");
+        // none with the show's length: the single hit stays
+        assert!(by_count(&m, 13, search, episodes).is_none());
+        let single = |_: &str| Ok((vec!["86".into()], Some(vec!["1".into()])));
+        assert!(by_count(&m, 11, single, episodes).is_none());
+    }
+
+    #[test]
+    fn a_nickname_changes_the_source_by_its_title() {
+        let mut aot = Media::default();
+        aot.title.romaji = Some("Shingeki no Kyojin".into());
+        aot.title.english = Some("Attack on Titan".into());
+        aot.synonyms = vec!["SnK".into(), "AoT".into()];
+        assert_eq!(source_query(&aot, "aot"), "Attack on Titan");
+        assert_eq!(source_query(&aot, "SNK "), "Attack on Titan");
+        assert_eq!(source_query(&aot, "aotu"), "aotu");
+        aot.title.english = None;
+        assert_eq!(source_query(&aot, "AoT"), "Shingeki no Kyojin");
     }
 
     #[test]

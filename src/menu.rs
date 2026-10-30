@@ -1,6 +1,6 @@
 //! fzf-style list: type to filter (fzf syntax via nucleo), tab to mark, enter to accept.
 
-use nucleo_matcher::pattern::{AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::Style;
@@ -133,27 +133,57 @@ impl Menu {
     fn filter(&mut self) {
         let query = self.query.replace(END, "");
         let pattern = Pattern::parse(&query, CaseMatching::Smart, Normalization::Smart);
-        // hidden text is long: fuzzy would match almost anything, so every word as typed
-        let words = Pattern::new(
-            &query,
-            CaseMatching::Smart,
-            Normalization::Smart,
-            AtomKind::Substring,
-        );
+        // as fzf: terms around a lone | are one of them ("core go$ | rb$" is core and either)
+        let mut groups: Vec<Vec<(Atom, Atom)>> = Vec::new();
+        let mut or = false;
+        for atom in pattern.atoms {
+            // a plain one: '|, ^|, |$ and !| look for one
+            let plain = !atom.negative && atom.kind == AtomKind::Fuzzy;
+            if plain && matches!(atom.needle_text(), Utf32Str::Ascii(b"|")) {
+                or = !groups.is_empty();
+                continue;
+            }
+            // hidden text is long: fuzzy would match almost anything, so the term as typed
+            let needle: String = atom.needle_text().chars().collect();
+            let word = Atom::new(
+                &needle,
+                CaseMatching::Smart,
+                Normalization::Smart,
+                AtomKind::Substring,
+                false,
+            );
+            match groups.last_mut() {
+                Some(g) if or => g.push((atom, word)),
+                _ => groups.push(vec![(atom, word)]),
+            }
+            or = false;
+        }
         let mut buf = Vec::new();
         let mut scored: Vec<(usize, u32, Vec<u32>)> = Vec::new();
         for (i, item) in self.items.iter().enumerate() {
             let mut idx = Vec::new();
-            // as `Pattern::indices`, with each atom's own haystack
-            let label = pattern.atoms.iter().try_fold(0, |score, atom| {
+            // each term in the label, as `Pattern::indices` with each atom's own haystack, else
+            // in the hidden text, which ranks it after every label match; a ! term hides what
+            // shows it
+            let mut term = |(atom, word): &(Atom, Atom), idx: &mut Vec<u32>| {
                 let hay = haystack(&item.label, atom.kind, &mut buf);
-                Some(score + atom.indices(hay, &mut self.matcher, &mut idx)? as u32)
-            });
-            let about = || {
+                let label = atom.indices(hay, &mut self.matcher, idx);
+                if atom.negative || label.is_some() {
+                    return label.map(u32::from);
+                }
                 let hay = haystack(&item.about, AtomKind::Substring, &mut buf);
-                words.score(hay, &mut self.matcher).map(|_| 0) // after every label match
+                word.score(hay, &mut self.matcher).map(|_| 0)
             };
-            if let Some(score) = label.or_else(about) {
+            let score = groups.iter().try_fold(0, |score, group| {
+                let best = group.iter().filter_map(|t| {
+                    let mut at = Vec::new();
+                    term(t, &mut at).map(|s| (s, at))
+                });
+                let (s, at) = best.max_by_key(|(s, _)| *s)?;
+                idx.extend(at);
+                Some(score + s)
+            });
+            if let Some(score) = score {
                 idx.sort_unstable();
                 idx.dedup();
                 scored.push((i, score, idx));
@@ -391,6 +421,25 @@ mod tests {
         m.query = "!season fri".into();
         m.filter();
         assert_eq!(m.matches.len(), 1);
+        let shown = |m: &mut Menu, q: &str| {
+            m.edit(|query| *query = q.into());
+            let mut labels: Vec<String> = (m.matches.iter())
+                .map(|(i, _)| m.items[*i].label.clone())
+                .collect();
+            labels.sort();
+            labels
+        };
+        assert_eq!(shown(&mut m, "frieren | titan").len(), 3);
+        // either term, but with the others: f and (2$ or force$)
+        assert_eq!(
+            shown(&mut m, "f 2$ | force$"),
+            ["Fire Force", "Frieren Season 2"]
+        );
+        assert_eq!(shown(&mut m, "| titan |"), ["Attack on Titan"]);
+        m.items[0].label = "A | B |".into();
+        for q in ["'|", "^A\\ |", "|$"] {
+            assert_eq!(shown(&mut m, q), ["A | B |"], "{q}");
+        }
     }
 
     #[test]
@@ -422,5 +471,16 @@ mod tests {
         let order: Vec<usize> = m.matches.iter().map(|(i, _)| *i).collect();
         assert_eq!(order.first(), Some(&2));
         assert_eq!(order.last(), Some(&1));
+        // term by term: one in the label, one in the hidden text, as typed with fzf's syntax
+        m.edit(|q| *q = "season sleeps".into());
+        assert_eq!(m.current_index(), Some(3));
+        m.edit(|q| *q = "'sleeps".into());
+        assert_eq!(m.current_index(), Some(3));
+        m.edit(|q| *q = "titan | sleeps".into());
+        assert_eq!(m.matches.len(), 2);
+        // what ! hides in a label, hidden text that has it doesn't bring back
+        m.items[2].about = "A wall with !force painted on it.".into();
+        m.edit(|q| *q = "!force".into());
+        assert!(m.matches.iter().all(|(i, _)| *i != 2));
     }
 }

@@ -127,7 +127,14 @@ enum Want {
 
 enum Msg {
     /// a list's refreshed shows
-    Shows(u64, Stamp, Result<Vec<Media>, String>, lists::Ask),
+    /// a list's shows; for a search, also what found them, as a typo was spelled again
+    Shows(
+        u64,
+        Stamp,
+        Result<Vec<Media>, String>,
+        lists::Ask,
+        Option<String>,
+    ),
     /// the downloaded shows as AniList has them now
     Local(Stamp, Result<Vec<Media>, String>),
     /// the next page of a ranking
@@ -721,7 +728,7 @@ impl App {
         let id = self.push(title, View::Shows(list));
         if let Some(ask) = ask {
             let stamp = self.entries.stamp();
-            self.spawn(move || Msg::Shows(id, stamp, f(), ask));
+            self.spawn(move || Msg::Shows(id, stamp, f(), ask, None));
         }
     }
 
@@ -934,6 +941,11 @@ impl App {
                     if ani::skip_on() { "on" } else { "off" },
                 ),
                 audio_item("Default audio…", ani::audio(None)),
+                Item::new(
+                    "adult",
+                    "Adult shows",
+                    if ani::adult_on() { "on" } else { "off" },
+                ),
                 Item::new(
                     "folder",
                     "Download folder…",
@@ -1459,7 +1471,7 @@ impl App {
         }
     }
 
-    /// Fetches the next page of the ranking on top, as "More…" and ^f do.
+    /// Fetches the next page of the ranking or search on top, as "More…" and ^f do.
     fn more(&mut self) {
         let screen = self.top();
         let id = screen.id;
@@ -1467,9 +1479,15 @@ impl App {
             return;
         };
         match list.more() {
-            Ok(Some((sort, page))) => {
+            Ok(Some((sort, search, page))) => {
                 let (c, stamp) = (self.client.clone(), self.entries.stamp());
-                self.spawn(move || Msg::More(id, stamp, c.browse(&sort, None, page)));
+                self.spawn(move || {
+                    let more = match search {
+                        Some(q) => c.search(&q, page),
+                        None => c.browse(&sort, None, page),
+                    };
+                    Msg::More(id, stamp, more)
+                });
             }
             Ok(None) => {}
             Err(why) => self.toast(why, false),
@@ -1486,7 +1504,7 @@ impl App {
         if let Some(sort) = key.strip_prefix("browse:") {
             let sort = sort.to_string();
             let cache = self.ranking_key(&sort);
-            let feed = Feed::Pages(sort.clone(), Some(2), false);
+            let feed = Feed::Pages(sort.clone(), None, Some(2), false);
             return self.push_loading(label, feed, Some(cache), move || c.browse(&sort, None, 1));
         }
         match key {
@@ -1513,6 +1531,19 @@ impl App {
                 }
                 let state = if on { "on" } else { "off" };
                 self.toast(format!("Skipping openings and endings: {state}"), false);
+                self.refresh();
+            }
+            "adult" => {
+                let on = !ani::adult_on();
+                if let Err(e) = ani::set_adult(on) {
+                    return self.toast(e.to_string(), true);
+                }
+                lists::changed(); // rankings cached with or without them
+                let state = if on { "on" } else { "off" };
+                self.toast(
+                    format!("Adult shows in searches and rankings: {state}"),
+                    false,
+                );
                 self.refresh();
             }
             "audio" => {
@@ -1562,10 +1593,19 @@ impl App {
             }
             Input::Search => {
                 let c = self.client.clone();
-                let title = text.clone();
-                self.push_loading(&title, Feed::Whole, None, move || {
-                    let found = |q: &str| c.browse("SEARCH_MATCH", Some(q), 1);
-                    source::or_ani_cli(found, &text, source::search)
+                let feed = Feed::Pages("SEARCH_MATCH".into(), Some(text.clone()), None, false);
+                let (list, ask) = List::open(feed, None, std::time::SystemTime::now());
+                let (id, stamp) = (self.push(&text, View::Shows(list)), self.entries.stamp());
+                self.spawn(move || {
+                    // the last AniList search is what found them: More… goes on with it
+                    let mut searched = text.clone();
+                    let found = |q: &str| {
+                        searched = q.to_string();
+                        c.search(q, 1)
+                    };
+                    let res = source::or_ani_cli(found, &text, source::search);
+                    // a list without a cache always asks
+                    Msg::Shows(id, stamp, res, ask.unwrap(), Some(searched))
                 });
             }
             Input::ClientId => {
@@ -1603,6 +1643,7 @@ impl App {
                 Err(e) => self.toast(e, true),
             },
             Input::SourceQuery(m) => {
+                let text = source::source_query(&m, &text);
                 let id = self.push("Pick source", View::Sources(m, text.clone(), Vec::new()));
                 self.top().waiting = true;
                 self.spawn(move || Msg::Hits(id, source::search(&text).map(|r| r.0)));
@@ -1780,14 +1821,17 @@ impl App {
 
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Shows(id, stamp, res, ask) => {
+            Msg::Shows(id, stamp, res, ask, searched) => {
                 let res = self.observed(stamp, res);
                 let fallback = res
                     .as_ref()
                     .is_ok_and(|l| l.iter().any(|m| !m.on_anilist()))
                     && self.stack.iter().any(|s| s.id == id);
                 self.fill(id, |v| match v {
-                    View::Shows(list) => list.refreshed(ask, res),
+                    View::Shows(list) => {
+                        list.searched(searched);
+                        list.refreshed(ask, res)
+                    }
                     _ => Ok(()),
                 });
                 // a show's page on top shows their Entries too, the newest now

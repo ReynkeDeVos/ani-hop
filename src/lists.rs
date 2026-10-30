@@ -13,11 +13,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub enum Feed {
     /// the download folder, rescanned on refresh
     Local,
-    /// an AniList list or search, all at once
+    /// an AniList list, all at once
     Whole,
-    /// an AniList ranking (MediaSort) in pages: the next page if there is one, and whether
-    /// it's on its way (the first page may refresh on its own, without "More…")
-    Pages(String, Option<u32>, bool),
+    /// an AniList ranking (MediaSort) or search in pages: its sort, what it searches, the next
+    /// page if there is one, and whether it's on its way (the first page may refresh on its
+    /// own, without "More…")
+    Pages(String, Option<String>, Option<u32>, bool),
 }
 
 /// A list on screen: its shows, where they come from, and its cache.
@@ -34,6 +35,9 @@ pub struct Ask(u64);
 
 /// Bumped on every list change, so refreshes that started before it don't count as fresh.
 static CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// A page "More…" asks for: its sort, what it searches, its number.
+type Page = (String, Option<String>, u32);
 
 /// A cached list: its shows and, for a ranking, the page "More…" fetches next.
 type Cached = (Vec<Media>, Option<u32>);
@@ -99,7 +103,7 @@ impl List {
         };
         let fresh = cached.is_some() && age.is_some_and(|a| a < Duration::from_secs(ttl));
         let (mut shows, next) = cached.unwrap_or_default();
-        if let Feed::Pages(_, n, _) = &mut feed {
+        if let Feed::Pages(_, _, n, _) = &mut feed {
             match fresh {
                 true => *n = next,
                 false => shows.truncate(PER_PAGE),
@@ -123,7 +127,7 @@ impl List {
     pub fn refreshed(&mut self, ask: Ask, res: Result<Vec<Media>, String>) -> Result<(), String> {
         self.refreshing = false;
         let shows = res?;
-        if let Feed::Pages(_, next, _) = &mut self.feed {
+        if let Feed::Pages(_, _, next, _) = &mut self.feed {
             *next = (shows.len() >= PER_PAGE).then_some(2);
         }
         self.shows = shows;
@@ -136,11 +140,18 @@ impl List {
         Ok(())
     }
 
-    /// The next page to fetch for "More…": (its sort, its number), none while one is on its
-    /// way, or why there's none. One page at a time; the first one's refresh would drop
-    /// what comes after it.
-    pub fn more(&mut self) -> Result<Option<(String, u32)>, &'static str> {
-        let Feed::Pages(sort, next, fetching) = &mut self.feed else {
+    /// What a search searched in the end, for More… to go on with: the provider's spelling of
+    /// a typo AniList found nothing for ("gundm": "Gundam").
+    pub fn searched(&mut self, query: Option<String>) {
+        if let (Feed::Pages(_, Some(q), ..), Some(query)) = (&mut self.feed, query) {
+            *q = query;
+        }
+    }
+
+    /// The next page to fetch for "More…", none while one is on its way, or why there's none.
+    /// One page at a time; the first one's refresh would drop what comes after it.
+    pub fn more(&mut self) -> Result<Option<Page>, &'static str> {
+        let Feed::Pages(sort, search, next, fetching) = &mut self.feed else {
             return Ok(None);
         };
         let Some(page) = *next else {
@@ -151,7 +162,7 @@ impl List {
             (false, true) => Err("Still refreshing the first page…"),
             (false, false) => {
                 *fetching = true;
-                Ok(Some((sort.clone(), page)))
+                Ok(Some((sort.clone(), search.clone(), page)))
             }
         }
     }
@@ -162,7 +173,7 @@ impl List {
     /// page's age stays the cache's, so loading more never keeps that page longer than an
     /// hour.
     pub fn more_came(&mut self, res: Result<Vec<Media>, String>) -> Result<Option<String>, String> {
-        let Feed::Pages(_, next, fetching) = &mut self.feed else {
+        let Feed::Pages(_, _, next, fetching) = &mut self.feed else {
             return Ok(None);
         };
         *fetching = false;
@@ -184,26 +195,26 @@ impl List {
         Ok(self.shows.get(start).map(|m| m.id.to_string()))
     }
 
-    /// The page "More…" fetches next, for a ranking that has one.
+    /// The page "More…" fetches next, for a ranking or search that has one.
     pub fn more_page(&self) -> Option<u32> {
         match self.feed {
-            Feed::Pages(_, next, _) => next,
+            Feed::Pages(_, _, next, _) => next,
             _ => None,
         }
     }
 
-    /// A search's results, which have no cache.
+    /// A search's results.
     pub fn is_search(&self) -> bool {
-        matches!(self.feed, Feed::Whole) && self.cache.is_none()
+        matches!(self.feed, Feed::Pages(_, Some(_), ..))
     }
 
     pub fn is_local(&self) -> bool {
         matches!(self.feed, Feed::Local)
     }
 
-    /// A ranking whose next page is on its way.
+    /// A ranking or search whose next page is on its way.
     pub fn fetching(&self) -> bool {
-        matches!(self.feed, Feed::Pages(_, _, true))
+        matches!(self.feed, Feed::Pages(.., true))
     }
 
     /// Its refresh or its next page is on its way.
@@ -236,7 +247,7 @@ mod tests {
     }
 
     fn trending() -> Feed {
-        Feed::Pages("TRENDING_DESC".into(), Some(2), false)
+        Feed::Pages("TRENDING_DESC".into(), None, Some(2), false)
     }
 
     /// When the cache was last written, as its freshness counts it.
@@ -279,7 +290,7 @@ mod tests {
         list.refreshed(ask.unwrap(), Ok(shows(0..50))).unwrap();
         assert!(!list.loading());
         let first = written(&path);
-        let page = |n| Ok(Some(("TRENDING_DESC".to_string(), n)));
+        let page = |n| Ok(Some(("TRENDING_DESC".to_string(), None, n)));
         assert_eq!(list.more(), page(2));
         assert_eq!(list.more(), Ok(None), "on its way");
         assert!(list.loading());
@@ -303,6 +314,21 @@ mod tests {
         assert_eq!(list.more(), Err("No more shows"));
         assert_eq!(list.more_came(Ok(shows(0..3))), Ok(None), "nothing new");
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_search_goes_on_with_what_it_searches() {
+        let feed = Feed::Pages("SEARCH_MATCH".into(), Some("gundam".into()), None, false);
+        let (mut list, ask) = List::open(feed, None, SystemTime::now());
+        assert!(list.is_search() && list.loading());
+        list.refreshed(ask.unwrap(), Ok(shows(0..50))).unwrap();
+        list.searched(Some("Gundam".into())); // "gundam" spelled as the provider does
+        let page = ("SEARCH_MATCH".to_string(), Some("Gundam".to_string()), 2);
+        assert_eq!(list.more(), Ok(Some(page)));
+        assert_eq!(list.more_came(Ok(shows(50..54))), Ok(Some("50".into())));
+        assert_eq!(list.more(), Err("No more shows"));
+        let (ranking, _) = List::open(trending(), None, SystemTime::now());
+        assert!(!ranking.is_search());
     }
 
     #[test]
