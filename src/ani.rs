@@ -419,14 +419,28 @@ pub fn ani_cli() -> Command {
         std::env::var("PATH").unwrap_or_default()
     );
     let mut c = Command::new("ani-cli");
-    c.env("PATH", path).stdin(Stdio::null());
+    // ANI_CLI_EXACT compares titles with the query as `plain` encodes it; ani-hop matches its own
+    c.env("PATH", path)
+        .env_remove("ANI_CLI_EXACT")
+        .stdin(Stdio::null());
     c
 }
 
 /// A query as ani-cli takes it: one starting with "-" would be one of its options (-D clears
-/// its history, -U updates it).
-pub fn plain(query: &str) -> &str {
-    query.trim_start_matches('-')
+/// its history, -U updates it), and ani-cli puts the rest in the provider's URL unencoded,
+/// where "×", "é", "’" or Japanese get an HTTP 400, "&" cuts it short and "[" trips curl.
+/// Spaces stay, ani-cli makes them "+".
+/// shortcut: assumes ani-cli 5.1 doesn't encode; drop the encoding if it starts to.
+pub fn plain(query: &str) -> String {
+    let mut out = String::new();
+    for b in query.trim_start_matches('-').bytes() {
+        match b {
+            b' ' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            _ if b.is_ascii_alphanumeric() => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// What the system says, through ffmpeg or yt-dlp, when there's no connection: ani-cli got the
@@ -623,7 +637,7 @@ pub fn stream(src: &Source, ep: &str, audio: &str, mut up: impl FnMut()) -> Resu
             &src.index.to_string(),
             "-e",
             ep,
-            plain(&src.query),
+            &plain(&src.query),
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1104,7 +1118,7 @@ pub fn start_download(src: &Source, ep: &str, dub: bool, dir: &Path) -> Result<C
             &src.index.to_string(),
             "-e",
             ep,
-            plain(&src.query),
+            &plain(&src.query),
         ])
         .env("ANI_CLI_DOWNLOAD_DIR", dir)
         .env("ANI_CLI_MODE", mode(dub))
