@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.8.4 – 2026-10-30
+
+### Changed
+
+- Search looks like every other list: a bare "❯" prompt with the rule under it and its text where rows start. The "search" label is gone, since the header already says Search. Its filter examples line up on their first character.
+- Every input (Change source, the download folder, the AniList login) draws the rule under its prompt and starts its text where list rows do.
+
 ## 0.8.3 – 2026-10-30
 
 ### Changed
