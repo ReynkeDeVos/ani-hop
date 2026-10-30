@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.2 – 2026-10-30
+
+### Added
+
+- Search says what it takes before you type: a show's name in English or Japanese, or a nickname like "aot". It also lists the filters for the shows it finds: `'titan` for an exact match, `^attack` for how a name starts, `titan$` for how it ends, `!season` to leave shows out, and `fri | aot` for either one.
+
 ## 0.8.1 – 2026-10-30
 
 ### Removed
