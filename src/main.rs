@@ -674,10 +674,12 @@ impl App {
     pub fn enter_verb(&self) -> Option<&'static str> {
         let screen = self.stack.last().unwrap();
         let m = match &screen.view {
-            View::Episodes(m, EpMode::Download) => m,
-            View::Episodes(_, EpMode::Play) => return Some("play"),
             View::Input(Input::Search | Input::SourceQuery(_)) => return Some("search"),
             View::Input(_) => return Some("save"),
+            // as accept: no row under the cursor and none marked
+            _ if screen.menu.selection().is_empty() => return None,
+            View::Episodes(m, EpMode::Download) => m,
+            View::Episodes(_, EpMode::Play) => return Some("play"),
             _ => return Some("select"),
         };
         let eps: Vec<String> = (screen.menu.selection().iter())
@@ -1203,8 +1205,11 @@ impl App {
         {
             return self.preview.scroll(k.code == KeyCode::Down);
         }
+        // typing is the text itself on an input: ← doesn't throw it away, esc clears it first
+        let typed = matches!(self.top().view, View::Input(_)) && !self.top().menu.query.is_empty();
         match self.top().menu.key(k) {
             Some(Act::Accept) => self.accept(),
+            Some(Act::Back) if typed => {}
             Some(Act::Back) => self.pop(1),
             None => {}
         }
@@ -1819,7 +1824,7 @@ impl App {
                 // a show's page on top shows their Entries too, the newest now
                 self.rebuild();
                 if fallback {
-                    self.toast("AniList search failed, showing ani-cli's matches", true);
+                    self.toast("AniList search failed · showing ani-cli's shows", true);
                 }
             }
             Msg::Local(stamp, res) => {
@@ -1847,7 +1852,11 @@ impl App {
             }
             Msg::Hits(id, res) => self.fill(id, |v| {
                 if let View::Sources(_, _, h) = v {
-                    *h = res?;
+                    // back on the search, which says so in its own words
+                    *h = res.map_err(|e| match e.starts_with("No results") {
+                        true => "ani-cli: no shows found · try other words".into(),
+                        false => format!("ani-cli: {}", e.trim_start_matches("ani-cli: ")),
+                    })?;
                 }
                 Ok(())
             }),
