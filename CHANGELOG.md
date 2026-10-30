@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.8.5 – 2026-10-30
+
+### Changed
+
+- When ani-cli finds no stream for an episode, ani-hop says "the provider has no sub stream ani-cli can play (none, or only on servers it can't read)" instead of ani-cli's "No sources found for sub!". Attack on Skytree is one: the provider has its only episode on a server ani-cli doesn't read.
+
+### Fixed
+
+- A typo in a search's first letters found nothing: "fieren" and "freiren" found no Frieren. The first six letters may now hold one typo (a letter missed, added or changed, or two swapped); before, the first three had to be right.
+
 ## 0.8.4 – 2026-10-30
 
 ### Changed

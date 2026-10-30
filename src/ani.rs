@@ -481,7 +481,18 @@ pub fn last_error(stderr: &[u8]) -> String {
                 .and_then(|(_, u)| u.split(['/', ':', ' ']).next());
             format!("can't reach {}", host.unwrap_or("its site"))
         }
-        None => lines.last().map_or("ani-cli failed".into(), String::clone),
+        None => {
+            let last = lines.last().map_or("ani-cli failed", String::as_str);
+            // ani-cli says so for a server it can't read too: it reads just one kind
+            let mode =
+                (last.strip_prefix("No sources found for ")).and_then(|m| m.strip_suffix('!'));
+            match mode {
+                Some(mode) => format!(
+                    "the provider has no {mode} stream ani-cli can play (none, or only on servers it can't read)"
+                ),
+                None => last.into(),
+            }
+        }
     }
 }
 
@@ -1843,6 +1854,11 @@ mod tests {
         assert_eq!(
             last_error(b"info\n\x1b[2K\r\x1b[1;31mEpisode not released!\x1b[0m\n"),
             "Episode not released!"
+        );
+        // playback's dub fallback looks for "dub" in it
+        assert_eq!(
+            last_error(b"\x1b[2K\x1b[1;31mNo sources found for dub!\x1b[0m\n"),
+            "the provider has no dub stream ani-cli can play (none, or only on servers it can't read)"
         );
     }
 }

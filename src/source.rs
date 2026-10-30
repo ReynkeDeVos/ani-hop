@@ -212,10 +212,10 @@ pub fn search(query: &str) -> Result<Hits, String> {
 /// AniList's results for `query`, or if AniList failed, ani-cli's: one show per provider entry,
 /// equal titles numbered so each gets its own id and folder. AniList finds nothing for a typo
 /// or words run together ("frieran", "onepiece") that the provider does find: then AniList's
-/// results for the provider's top title, if one of theirs starts like `query` and the title
-/// has no number `query` hasn't, as the provider has a guess for anything ("Soso no Furiren":
-/// Wooser; "jujutsu kaisen s2": the 3rd season). `anilist` searches AniList and `search` is
-/// `search`, passed in for tests.
+/// results for the provider's top title, if one of theirs starts like `query`, a typo aside
+/// ("fieren", "freiren": Frieren), and the title has no number `query` hasn't, as the provider
+/// has a guess for anything ("Soso no Furiren": Wooser; "jujutsu kaisen s2": the 3rd season).
+/// `anilist` searches AniList and `search` is `search`, passed in for tests.
 pub fn or_ani_cli(
     mut anilist: impl FnMut(&str) -> Result<Vec<Media>, String>,
     query: &str,
@@ -237,12 +237,16 @@ pub fn or_ani_cli(
                 return Ok(none); // no results is an answer too
             };
             let found = anilist(top)?;
-            let start = |s: &str| -> String {
+            let letters = |s: &str| -> Vec<char> {
                 let alnum = s.chars().filter(|c| c.is_alphanumeric());
-                alnum.flat_map(char::to_lowercase).take(3).collect()
+                alnum.flat_map(char::to_lowercase).collect()
             };
-            let typed = start(query);
-            let close = |t: &String| !typed.is_empty() && start(t).starts_with(&typed);
+            // its first 6 letters, one typo among them allowed once there are 4
+            let mut typed = letters(query);
+            typed.truncate(6);
+            let typos = usize::from(typed.len() > 3);
+            let close =
+                |t: &String| !typed.is_empty() && typos_to_start(&typed, &letters(t)) <= typos;
             let found_it = found.iter().flat_map(Media::titles).any(close);
             return Ok(if found_it { found } else { none });
         }
@@ -265,6 +269,33 @@ pub fn or_ani_cli(
         Media::from_ani_cli(&name, Source::at(query, &hits, i + 1, Vec::new()))
     });
     Ok(shows.collect())
+}
+
+/// The fewest typos (a letter missed, added or changed, or two swapped) that make `typed` the
+/// start of `title`.
+fn typos_to_start(typed: &[char], title: &[char]) -> usize {
+    // edit distance (optimal string alignment) to each of `title`'s starts: d[i][j] for
+    // typed[..i] and title[..j]
+    let mut d = vec![vec![0; title.len() + 1]; typed.len() + 1];
+    for (i, row) in d.iter_mut().enumerate() {
+        row[0] = i;
+    }
+    for (j, cell) in d[0].iter_mut().enumerate() {
+        *cell = j;
+    }
+    for i in 1..=typed.len() {
+        for j in 1..=title.len() {
+            let changed = usize::from(typed[i - 1] != title[j - 1]);
+            let mut best = (d[i - 1][j] + 1)
+                .min(d[i][j - 1] + 1)
+                .min(d[i - 1][j - 1] + changed);
+            if i > 1 && j > 1 && typed[i - 1] == title[j - 2] && typed[i - 2] == title[j - 1] {
+                best = best.min(d[i - 2][j - 2] + 1);
+            }
+            d[i][j] = best;
+        }
+    }
+    d[typed.len()].iter().copied().min().unwrap_or_default()
 }
 
 fn episodes(query: &str, index: usize) -> Result<Vec<String>, String> {
@@ -771,6 +802,7 @@ mod tests {
                 "Wooser's Hand-to-Mouth Life" => {
                     vec![show("Wooser no Sono Higurashi", "Hand-to-Mouth Life")]
                 }
+                "Frieren: Beyond Journey's End" => vec![show("Sousou no Frieren", "Frieren")],
                 _ => Vec::new(),
             })
         };
@@ -788,6 +820,10 @@ mod tests {
                     "Jujutsu Kaisen 3rd Season: The Culling Game Part 1",
                     "Jujutsu Kaisen 2nd Season",
                 ],
+                "fieren" | "freiren" | "fie" => [
+                    "Frieren: Beyond Journey's End",
+                    "Frieren: Beyond Journey's End Season 2",
+                ],
                 _ => [
                     "Wooser's Hand-to-Mouth Life",
                     "Wooser's Hand-to-Mouth Life (Dub)",
@@ -803,6 +839,11 @@ mod tests {
         assert!(guess.is_empty());
         // one of its other titles starts like the typo
         assert_eq!(or_ani_cli(catalog, "hand to muoth", hits).unwrap().len(), 1);
+        // a letter missed or two swapped in its first ones, but not in just 3
+        for typo in ["fieren", "freiren"] {
+            assert_eq!(or_ani_cli(catalog, typo, hits).unwrap().len(), 1, "{typo}");
+        }
+        assert!(or_ani_cli(catalog, "fie", hits).unwrap().is_empty());
         // nor another season, asked for with a number the guess hasn't: AniList isn't asked again
         let mut asked = 0;
         let counted = |q: &str| {
