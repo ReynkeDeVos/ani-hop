@@ -264,14 +264,16 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         View::Input(Input::Search) => "search ",
         View::Input(Input::ClientId) => "client id ",
         View::Input(Input::Token) => "token ",
-        View::Input(Input::SourceQuery(_)) => "ani-cli search ",
+        View::Input(Input::SourceQuery(_)) => "ani-cli ",
         View::Input(Input::DownloadDir) => "folder ",
         _ => "",
     };
+    // a long text keeps its end in view, where typing goes, with the cursor after it
+    let room = (prompt_area.width as usize).saturating_sub(Span::raw(label).width() + 3);
     let prompt = Line::from(vec![
         Span::styled(label, ACCENT),
         Span::styled("❯ ", Style::new().fg(ACCENT).bold()),
-        Span::raw(screen.menu.query.as_str()),
+        Span::raw(fit_start(&screen.menu.query, room)),
     ]);
     let cursor_x =
         (prompt_area.x + prompt.width() as u16).min(prompt_area.right().saturating_sub(1));
@@ -319,7 +321,9 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         DIM,
     )];
     if screen.loading() {
-        info.push(Span::styled(format!(" {spin}"), ACCENT));
+        // where the count comes, while there's none yet
+        let gap = if info[0].content.is_empty() { "" } else { " " };
+        info.push(Span::styled(format!("{gap}{spin}"), ACCENT));
     }
     if screen.loading() && m.items.is_empty() {
         f.render_widget(skeleton(list_area, shimmer), list_area);
@@ -338,6 +342,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     f.render_widget(Line::from(info), info_area);
     // an empty list says so, instead of a bare 0
     let empty = match &screen.view {
+        _ if !m.items.is_empty() && m.matches.is_empty() => Some("Nothing matches the filter"),
         _ if !m.items.is_empty() || screen.loading() => None,
         View::Shows(list) if list.is_local() => Some("Nothing downloaded yet"),
         View::Shows(list) if list.is_search() => Some("No shows found"),
@@ -470,27 +475,17 @@ fn skeleton(area: Rect, tick: usize) -> Text<'static> {
 
 fn input_help(input: &Input) -> Text<'static> {
     let lines: Vec<Line> = match input {
-        Input::Search => {
-            // AniList takes the text as it is; fzf's syntax is for the list it finds
-            let row = |typed: &'static str, does: &'static str| {
-                let typed = format!("{typed:<11}");
-                Line::from(vec![
-                    Span::styled(typed, Style::new().fg(ACCENT).not_dim()),
-                    does.into(),
-                ])
-            };
-            vec![
-                "Type a show's name in English or Japanese, or a nickname like aot, and press enter."
-                    .into(),
-                "".into(),
-                "Then filter what it finds:".into(),
-                row("'titan", "exact match"),
-                row("^attack", "starts with"),
-                row("titan$", "ends with"),
-                row("!season", "leaves out"),
-                row("fri | aot", "either one"),
-            ]
-        }
+        // AniList takes the text as it is; fzf's syntax is for the list it finds
+        Input::Search => vec![
+            "A show's English or Japanese name, or a nickname like aot.".into(),
+            "".into(),
+            "Filter the shows it finds:".into(),
+            key_line("'titan", "exact match", ""),
+            key_line("^attack", "starts with", ""),
+            key_line("titan$", "ends with", ""),
+            key_line("!season", "leaves out", ""),
+            key_line("fri | aot", "either one", ""),
+        ],
         // one line per step or idea, wrapped by the pane, as 80 columns leave it 29
         Input::ClientId => vec![
             "One-time setup: ani-hop needs your own AniList API client.".into(),
@@ -512,7 +507,7 @@ fn input_help(input: &Input) -> Text<'static> {
             "Wrong client ID? Press enter with this empty.".into(),
         ],
         Input::SourceQuery(_) => vec![
-            "Search ani-cli with this text, then pick the right entry. ani-hop remembers it."
+            "Search ani-cli with this text, then pick the right source. ani-hop keeps your pick."
                 .into(),
         ],
         Input::DownloadDir => vec![
@@ -721,22 +716,24 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v
 }
 
+/// A key, what it does, and the other keys that do the same, as the start panel lists them.
+fn key_line(k: &'static str, what: &'static str, also: &'static str) -> Line<'static> {
+    // padded only beside other keys: trailing spaces would wrap at 80 columns
+    let (what, also) = match also {
+        "" => (what.to_string(), String::new()),
+        _ => (format!("{what:<18}"), format!("{also:>8}")),
+    };
+    Line::from(vec![
+        // bright in dimmed help too
+        Span::styled(format!("{k:>10}  "), Style::new().fg(ACCENT).not_dim()),
+        Span::raw(what),
+        Span::styled(also, DIM),
+    ])
+}
+
 /// The start panel in `area`: the logo only where everything else fits under it, as a short
 /// screen keeps an update notice (two or three rows at 80 columns) and every key instead.
 fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
-    // a key, what it does, and the other keys that do the same
-    let key = |k: &'static str, what: &'static str, also: &'static str| {
-        // padded only beside other keys: trailing spaces would wrap at 80 columns
-        let (what, also) = match also {
-            "" => (what.to_string(), String::new()),
-            _ => (format!("{what:<18}"), format!("{also:>8}")),
-        };
-        Line::from(vec![
-            Span::styled(format!("{k:>10}  "), ACCENT),
-            Span::raw(what),
-            Span::styled(also, DIM),
-        ])
-    };
     let mut v = vec![Line::styled(
         format!("↓ downloads go to {}", ani::tilde(&ani::download_root())),
         DIM,
@@ -747,25 +744,28 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
             ACCENT,
         ));
     }
-    // on an input typing is the text itself, and there's nothing to mark
-    if !matches!(app.stack.last().unwrap().view, View::Input(_)) {
+    // on an input typing is the text itself, and there's nothing to mark; on an empty list
+    // only esc and ^c do something, and the footer has them
+    let top = app.stack.last().unwrap();
+    if !matches!(top.view, View::Input(_)) && !top.menu.items.is_empty() {
         // grouped by what they're for, the everyday ones first; the arrows lead, as esc
         // clears a filter before it goes back
         v.extend([
             "".into(),
-            key("↑ ↓", "move", "^k ^j"),
-            key("→", "select", "enter ^l"),
-            key("←", "back", "^h"),
+            key_line("↑ ↓", "move", "^k ^j"),
+            key_line("→", "select", "enter ^l"),
+            key_line("←", "back", "^h"),
             "".into(),
-            key("type", "filter the list", ""),
-            Line::styled(format!("{:12}'exact ^start end$ !not", ""), DIM),
-            key("esc", "clear the filter, then back", ""),
+            key_line("type", "filter the list", ""),
+            // 40 columns, all 80 leave the preview
+            Line::styled(format!("{:12}'word ^start end$ !not a | b", ""), DIM),
+            key_line("esc", "clear the filter, then back", ""),
             "".into(),
-            key("tab", "mark for bulk actions", ""),
-            key("^a", "mark all", ""),
-            key("^f", "load more shows", ""),
-            key("shift ↑↓", "scroll the preview", ""),
-            key("^c", "quit", ""),
+            key_line("tab", "mark for bulk actions", ""),
+            key_line("^a", "mark all", ""),
+            key_line("^f", "load more shows", ""),
+            key_line("shift ↑↓", "scroll the preview", ""),
+            key_line("^c", "quit", ""),
         ]);
     }
     let below = Paragraph::new(v.clone()).wrap(Wrap { trim: false });
@@ -791,7 +791,8 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     if app.stack.len() > 1 || !screen.menu.query.is_empty() {
         keys.push(("esc", esc));
     }
-    if screen.menu.multi && !screen.menu.items.is_empty() {
+    // not while a filter hides every row: there's nothing to mark
+    if screen.menu.multi && !screen.menu.matches.is_empty() {
         keys.splice(0..0, [("tab", "mark"), ("^a", "all")]);
     }
     if matches!(&screen.view, View::Shows(list) if list.more_page().is_some()) {
@@ -955,6 +956,28 @@ fn fit(s: String, room: usize) -> String {
     cut + "…"
 }
 
+/// `s` cut to `room` columns as `fit` cuts it, but at its start: "…the end".
+fn fit_start(s: &str, room: usize) -> String {
+    let width = |s: &str| Span::raw(s).width();
+    if width(s) <= room {
+        return s.to_string();
+    }
+    // the cursor's column stays free, even of the "…"
+    if room == 0 {
+        return String::new();
+    }
+    let span = Span::raw(s);
+    let graphemes: Vec<&str> = (span.styled_graphemes(Style::new()))
+        .map(|g| g.symbol)
+        .collect();
+    let (mut start, mut used) = (graphemes.len(), 1); // the "…"
+    while start > 0 && used + width(graphemes[start - 1]) <= room {
+        start -= 1;
+        used += width(graphemes[start]);
+    }
+    format!("…{}", graphemes[start..].concat())
+}
+
 pub fn hex(s: &str) -> Option<Color> {
     let v = u32::from_str_radix(s.strip_prefix('#')?, 16).ok()?;
     Some(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
@@ -984,6 +1007,16 @@ mod tests {
         // and questions whose preview lists what they act on
         assert!(!widens(&View::Confirm(Pending::Delete(Vec::new()))));
         assert!(widens(&View::Confirm(Pending::Remove(Media::default()))));
+    }
+
+    #[test]
+    fn a_long_prompt_keeps_its_end() {
+        assert_eq!(fit_start("frieren", 7), "frieren");
+        assert_eq!(fit_start("Fate/stay night", 6), "…night");
+        // two columns a character: never half of one
+        assert_eq!(fit_start("葬送のフリーレン", 6), "…レン");
+        assert_eq!(fit_start("frieren", 1), "…");
+        assert_eq!(fit_start("frieren", 0), "");
     }
 
     #[test]

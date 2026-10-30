@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.8.3 – 2026-10-30
+
+### Changed
+
+- Search says what it takes in fewer words, and its filters line up like the keys on the start screen.
+- Change source's prompt is "ani-cli ❯", and it says "pick the right source. ani-hop keeps your pick." When ani-cli finds nothing, it says "ani-cli: no shows found · try other words" instead of "No results found!".
+- A filter that hides every row says "Nothing matches the filter". The start screen's keys list `a | b` with the other filters, and an empty list leaves its keys out.
+
+### Fixed
+
+- A search longer than its prompt showed only its start, and the cursor sat on the cut text: at 80 columns Change source showed "Sousou no Fri". The prompt keeps the end in view now, where typing goes.
+- ← in Search with text typed left Search and lost the text. Now it does nothing there; esc still clears the text first.
+- The footer offered enter, tab and ^a on lists with nothing to act on, like "No shows found" or a filter matching nothing.
+
 ## 0.8.2 – 2026-10-30
 
 ### Added
