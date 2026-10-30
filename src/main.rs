@@ -127,7 +127,14 @@ enum Want {
 
 enum Msg {
     /// a list's refreshed shows
-    Shows(u64, Stamp, Result<Vec<Media>, String>, lists::Ask),
+    /// a list's shows; for a search, also what found them, as a typo was spelled again
+    Shows(
+        u64,
+        Stamp,
+        Result<Vec<Media>, String>,
+        lists::Ask,
+        Option<String>,
+    ),
     /// the downloaded shows as AniList has them now
     Local(Stamp, Result<Vec<Media>, String>),
     /// the next page of a ranking
@@ -721,7 +728,7 @@ impl App {
         let id = self.push(title, View::Shows(list));
         if let Some(ask) = ask {
             let stamp = self.entries.stamp();
-            self.spawn(move || Msg::Shows(id, stamp, f(), ask));
+            self.spawn(move || Msg::Shows(id, stamp, f(), ask, None));
         }
     }
 
@@ -1587,8 +1594,18 @@ impl App {
             Input::Search => {
                 let c = self.client.clone();
                 let feed = Feed::Pages("SEARCH_MATCH".into(), Some(text.clone()), None, false);
-                self.push_loading(&text.clone(), feed, None, move || {
-                    source::or_ani_cli(|q| c.search(q, 1), &text, source::search)
+                let (list, ask) = List::open(feed, None, std::time::SystemTime::now());
+                let (id, stamp) = (self.push(&text, View::Shows(list)), self.entries.stamp());
+                self.spawn(move || {
+                    // the last AniList search is what found them: More… goes on with it
+                    let mut searched = text.clone();
+                    let found = |q: &str| {
+                        searched = q.to_string();
+                        c.search(q, 1)
+                    };
+                    let res = source::or_ani_cli(found, &text, source::search);
+                    // a list without a cache always asks
+                    Msg::Shows(id, stamp, res, ask.unwrap(), Some(searched))
                 });
             }
             Input::ClientId => {
@@ -1804,14 +1821,17 @@ impl App {
 
     fn on_msg(&mut self, msg: Msg) {
         match msg {
-            Msg::Shows(id, stamp, res, ask) => {
+            Msg::Shows(id, stamp, res, ask, searched) => {
                 let res = self.observed(stamp, res);
                 let fallback = res
                     .as_ref()
                     .is_ok_and(|l| l.iter().any(|m| !m.on_anilist()))
                     && self.stack.iter().any(|s| s.id == id);
                 self.fill(id, |v| match v {
-                    View::Shows(list) => list.refreshed(ask, res),
+                    View::Shows(list) => {
+                        list.searched(searched);
+                        list.refreshed(ask, res)
+                    }
                     _ => Ok(()),
                 });
                 // a show's page on top shows their Entries too, the newest now

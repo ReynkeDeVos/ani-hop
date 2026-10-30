@@ -137,7 +137,9 @@ impl Menu {
         let mut groups: Vec<Vec<(Atom, Atom)>> = Vec::new();
         let mut or = false;
         for atom in pattern.atoms {
-            if !atom.negative && matches!(atom.needle_text(), Utf32Str::Ascii(b"|")) {
+            // a plain one: '|, ^|, |$ and !| look for one
+            let plain = !atom.negative && atom.kind == AtomKind::Fuzzy;
+            if plain && matches!(atom.needle_text(), Utf32Str::Ascii(b"|")) {
                 or = !groups.is_empty();
                 continue;
             }
@@ -434,6 +436,10 @@ mod tests {
             ["Fire Force", "Frieren Season 2"]
         );
         assert_eq!(shown(&mut m, "| titan |"), ["Attack on Titan"]);
+        m.items[0].label = "A | B |".into();
+        for q in ["'|", "^A\\ |", "|$"] {
+            assert_eq!(shown(&mut m, q), ["A | B |"], "{q}");
+        }
     }
 
     #[test]

@@ -140,6 +140,14 @@ impl List {
         Ok(())
     }
 
+    /// What a search searched in the end, for More… to go on with: the provider's spelling of
+    /// a typo AniList found nothing for ("gundm": "Gundam").
+    pub fn searched(&mut self, query: Option<String>) {
+        if let (Feed::Pages(_, Some(q), ..), Some(query)) = (&mut self.feed, query) {
+            *q = query;
+        }
+    }
+
     /// The next page to fetch for "More…", none while one is on its way, or why there's none.
     /// One page at a time; the first one's refresh would drop what comes after it.
     pub fn more(&mut self) -> Result<Option<Page>, &'static str> {
@@ -314,7 +322,8 @@ mod tests {
         let (mut list, ask) = List::open(feed, None, SystemTime::now());
         assert!(list.is_search() && list.loading());
         list.refreshed(ask.unwrap(), Ok(shows(0..50))).unwrap();
-        let page = ("SEARCH_MATCH".to_string(), Some("gundam".to_string()), 2);
+        list.searched(Some("Gundam".into())); // "gundam" spelled as the provider does
+        let page = ("SEARCH_MATCH".to_string(), Some("Gundam".to_string()), 2);
         assert_eq!(list.more(), Ok(Some(page)));
         assert_eq!(list.more_came(Ok(shows(50..54))), Ok(Some("50".into())));
         assert_eq!(list.more(), Err("No more shows"));

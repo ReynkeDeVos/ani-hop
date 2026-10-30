@@ -473,6 +473,19 @@ fn by_count(
     None
 }
 
+/// A finished show's source by `by_count`, when its search found a single hit with `eps`, of
+/// another length than the show's; none for a source picked by hand.
+fn recount(m: &Media, eps: &[String]) -> Option<Source> {
+    let n = m
+        .episodes
+        .filter(|_| m.status.as_deref() == Some("FINISHED"))? as usize;
+    let by_hand = || overrides().contains_key(&m.id.to_string());
+    if eps.len() == n || by_hand() {
+        return None;
+    }
+    by_count(m, n, search, episodes)
+}
+
 fn resolved_path() -> PathBuf {
     ani::cache_dir().join("resolved.json")
 }
@@ -480,7 +493,11 @@ fn resolved_path() -> PathBuf {
 /// Re-checks a (possibly cached) source right before ani-cli runs: `-S` is positional and
 /// the provider's order shifts when new seasons show up. One search, not a full resolve.
 pub fn locate(m: &Media, src: &Source) -> Result<Source, String> {
-    let (hits, _) = search(&src.query)?;
+    let (hits, eps) = search(&src.query)?;
+    // cached before `resolve` doubted a single hit of another length (86's 2nd season)
+    if let Some(better) = eps.and_then(|eps| recount(m, &eps)) {
+        return Ok(better);
+    }
     match position(src, &hits) {
         Some(index) => Ok(Source::at(&src.query, &hits, index, src.episodes.clone())),
         None => resolve(m),
@@ -554,15 +571,9 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
         Some(found) => found,
         None => first_fit(&matched(m), &queries, search)?,
     };
-    // a finished show's episode count: it decides between equal titles (HUNTER×HUNTER
-    // 1999/2011), and doubts a single hit
-    let want = m
-        .episodes
-        .filter(|_| m.status.as_deref() == Some("FINISHED"));
     if let Some(eps) = eps {
-        let other = want.filter(|&n| saved.is_none() && eps.len() != n as usize);
-        if let Some(src) = other.and_then(|n| by_count(m, n as usize, search, episodes)) {
-            return Ok(src);
+        if let Some(better) = recount(m, &eps) {
+            return Ok(better);
         }
         return Ok(Source::at(&query, &hits, 1, eps));
     }
@@ -579,6 +590,10 @@ pub fn resolve(m: &Media) -> Result<Source, String> {
     if candidates.is_empty() {
         candidates.push(0); // nothing close: trust the provider's ranking
     }
+    // same title twice (HUNTER×HUNTER 1999/2011): a finished show's episode count decides
+    let want = m
+        .episodes
+        .filter(|_| m.status.as_deref() == Some("FINISHED"));
     let mut pick = None;
     for &i in candidates.iter().take(3) {
         let eps = episodes(&query, i + 1)?;
