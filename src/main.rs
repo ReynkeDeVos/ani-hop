@@ -942,11 +942,6 @@ impl App {
                 ),
                 audio_item("Default audio…", ani::audio(None)),
                 Item::new(
-                    "adult",
-                    "Adult shows",
-                    if ani::adult_on() { "on" } else { "off" },
-                ),
-                Item::new(
                     "folder",
                     "Download folder…",
                     ani::tilde(&ani::download_root()),
@@ -1531,19 +1526,6 @@ impl App {
                 }
                 let state = if on { "on" } else { "off" };
                 self.toast(format!("Skipping openings and endings: {state}"), false);
-                self.refresh();
-            }
-            "adult" => {
-                let on = !ani::adult_on();
-                if let Err(e) = ani::set_adult(on) {
-                    return self.toast(e.to_string(), true);
-                }
-                lists::changed(); // rankings cached with or without them
-                let state = if on { "on" } else { "off" };
-                self.toast(
-                    format!("Adult shows in searches and rankings: {state}"),
-                    false,
-                );
                 self.refresh();
             }
             "audio" => {

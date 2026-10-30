@@ -363,15 +363,9 @@ impl Client {
         search: Option<&str>,
         page: u32,
     ) -> Result<Vec<Media>, String> {
-        // left out, not null: isAdult: null finds nothing
-        let adult = if crate::ani::adult_on() {
-            ""
-        } else {
-            ", isAdult: false"
-        };
         let q = format!(
             "query($sort: [MediaSort], $search: String, $page: Int) {{ Page(page: $page, perPage: {PER_PAGE}) {{
-               media(type: ANIME, sort: $sort, search: $search{adult}) {{ {MEDIA} }} }} }}"
+               media(type: ANIME, sort: $sort, search: $search, isAdult: false) {{ {MEDIA} }} }} }}"
         );
         let d = self.gql(
             &q,
