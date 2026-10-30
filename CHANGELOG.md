@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.1 – 2026-10-30
+
+### Removed
+
+- The "Adult shows" setting from 0.8.0. ani-cli's provider doesn't have the shows AniList marks as adult, and opening one played an unrelated show instead, like "Boku no Hero Academia: Training of the Dead" for "Boku no Pico". Searches and rankings leave them out again.
+
 ## 0.8.0 – 2026-10-30
 
 ### Added
