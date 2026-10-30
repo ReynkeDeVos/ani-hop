@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.0 – 2026-10-30
+
+### Added
+
+- Settings has "Adult shows", off by default. Turned on, searches and rankings include the shows AniList marks as adult, as AniList's own 18+ setting does.
+- Searches show More… past their first 50 shows, as rankings do: "gundam" has 54.
+- List filters take fzf's `|`: "frieren | titan" keeps both, and "fri 2$ | 3$" keeps the second and third seasons.
+
+### Changed
+
+- Search finds a show through a typo or words run together, like "frieran", "onepiece" or "jujutsukaisen": when AniList finds nothing, it searches ani-cli's spelling again. A guess that doesn't start like what you typed, or has a number you didn't type, isn't shown: "jujutsu kaisen s2" doesn't show the third season.
+- Search also looks for what you typed without accents, curly quotes and full-width letters: "Pokémon" finds the original series, "JoJo’s" and "Ｓｔｅｉｎｓ；Ｇａｔｅ" find their shows.
+- Filtering a list finds a show by its other titles: "attack on titan" or "aot" on Shingeki no Kyojin. A filter's words can match a title and an episode summary together, like "season sleeps", and `'sleeps` finds a word in a summary too.
+- Change source takes a nickname AniList knows the show by, like "aot", "fmab" or "jjk", and searches its title.
+
+### Fixed
+
+- Titles with ×, accents, Japanese, curly apostrophes, & or [ ] failed at the provider with HTTP 400 or a curl error, in Change source, opening, playing and downloading: HUNTER×HUNTER, Pokémon, 葬送のフリーレン, Fate/stay night [Unlimited Blade Works].
+- Kaguya-sama: Love is War season 2 played season 1, the original Pokémon played Pokémon Horizons, and 86 EIGHTY-SIX played its second season. A source already saved as the wrong 86 season is checked again.
+- A filter word hidden with `!` came back when an episode summary had the same text.
+
 ## 0.7.6 – 2026-10-28
 
 ### Added
