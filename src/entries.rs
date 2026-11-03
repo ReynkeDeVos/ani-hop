@@ -228,7 +228,14 @@ impl Entries {
             // what's on screen was old: AniList's Entry, and lists that refresh
             Ok(Answer::Moved(entry)) => {
                 let now = entry.as_ref().map_or(0, |e| e.progress);
-                let text = format!("{name} not saved · AniList has {now}/{total} now, try again");
+                let text = match (&done.change, &entry) {
+                    // the same progress: it's the list that isn't what the question showed
+                    (Change::Progress(k), Some(e)) if k.was == now => {
+                        let list = crate::list_label(&e.status);
+                        format!("{name} not saved · it's on {list} now, try again")
+                    }
+                    _ => format!("{name} not saved · AniList has {now}/{total} now, try again"),
+                };
                 (entry, notice(text, true, None))
             }
         };
@@ -287,11 +294,9 @@ impl Work {
                 }
                 // the question showed `was`: Yes mustn't undo a save it didn't know of
                 Change::Progress(k) => match self.anilist.entry(k.entry.id)? {
-                    now if now.as_ref().map_or(0, |e| e.progress) != k.was => {
-                        Ok(Answer::Moved(now))
-                    }
-                    now => (self.anilist)
-                        .save(k.entry.id, Some(k.saved_status(now.as_ref())), Some(k.to))
+                    now if k.outdated(now.as_ref()) => Ok(Answer::Moved(now)),
+                    _ => (self.anilist)
+                        .save(k.entry.id, Some(k.status), Some(k.to))
                         .map(saved),
                 },
             }?;
@@ -457,16 +462,24 @@ mod tests {
         let n = entries.finish(done).unwrap();
         assert_eq!(n.text, "Show not saved · AniList has 6/12 now, try again");
         assert_eq!(fake.entry(stale.id).unwrap().unwrap().progress, 6);
-        // another ani-hop moved it to another list since the question: it stays there
+        // or moved it to another list, which the question didn't say what it does to
         let moved = watching(70_006, 5);
         let (fake, mut entries) = anilist(&moved, false);
         let none = entries.progress(&moved, &[]).none().remove(0);
         fake.save(moved.id, Some("PAUSED"), None).unwrap();
         let done = entries.begin(Change::Progress(none)).run();
         let n = entries.finish(done).unwrap();
-        assert_eq!(n.text, "Saved Show · Paused · 0/12");
+        assert_eq!(n.text, "Show not saved · it's on Paused now, try again");
+        assert!(n.error);
         let now = fake.entry(moved.id).unwrap().unwrap();
-        assert_eq!((now.status.as_str(), now.progress), ("PAUSED", 0));
+        assert_eq!((now.status.as_str(), now.progress), ("PAUSED", 5));
+        // asked again, it's known: it stays on that list
+        let none = entries.progress(&moved, &[]).none().remove(0);
+        let done = entries.begin(Change::Progress(none)).run();
+        assert_eq!(
+            entries.finish(done).unwrap().text,
+            "Saved Show · Paused · 0/12"
+        );
     }
 
     #[test]

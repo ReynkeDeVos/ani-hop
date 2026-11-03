@@ -31,7 +31,7 @@ pub struct Mark {
     pub to: u32,
     /// the list the entry is on afterwards
     pub status: &'static str,
-    /// none watched: it stays on the list AniList has it on when it saves, not the question's
+    /// none watched, which stays on the list the question showed: it must still be on that one
     keeps_list: bool,
 }
 
@@ -223,12 +223,12 @@ impl<'a> Progress<'a> {
 }
 
 impl Mark {
-    /// The list to save it on, with AniList's Entry `now`.
-    pub fn saved_status(&self, now: Option<&Entry>) -> &'static str {
-        match self.keeps_list {
-            true => stays(now),
-            false => self.status,
-        }
+    /// Whether AniList's Entry `now` isn't what the question showed, whose answer would then
+    /// undo a save it didn't know of, or do something else than it said.
+    pub fn outdated(&self, now: Option<&Entry>) -> bool {
+        let list = |e: Option<&Entry>| e.map(|e| e.status.clone());
+        now.map_or(0, |e| e.progress) != self.was
+            || self.keeps_list && list(now) != list(self.entry.media_list_entry.as_ref())
     }
 
     /// Whether it changes no other episode, so Yes can go first.
@@ -399,17 +399,20 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(Progress::of(&airing, &[]).none()[0].status, "CURRENT");
-        // what's saved goes by the list AniList has it on by then
+        // saved only while it's what the question showed, its list included
         let k = none(&watching(1, 12, 5)).remove(0);
-        let paused = show(1, 12, Some((5, "PAUSED")));
-        assert_eq!(k.saved_status(paused.media_list_entry.as_ref()), "PAUSED");
-        let done = show(1, 12, Some((5, "COMPLETED")));
-        assert_eq!(k.saved_status(done.media_list_entry.as_ref()), "CURRENT");
+        let entry = |progress, status| show(1, 12, Some((progress, status))).media_list_entry;
+        assert!(!k.outdated(entry(5, "CURRENT").as_ref()));
+        assert!(k.outdated(entry(6, "CURRENT").as_ref()));
+        assert!(k.outdated(entry(5, "PAUSED").as_ref()));
+        assert!(k.outdated(None));
         // a provider's own episode 0 is an episode: marking it still means watching it
         let planned = show(1, 12, Some((0, "PLANNING")));
         let k = Progress::of(&planned, &[]).mark("0").unwrap();
         assert_eq!((k.to, k.status), (0, "CURRENT"));
-        assert_eq!(k.saved_status(planned.media_list_entry.as_ref()), "CURRENT");
+        // and an ordinary mark goes by progress alone, as marking moves it anyway
+        assert!(!k.outdated(entry(0, "PAUSED").as_ref()));
+        assert!(k.outdated(entry(1, "PLANNING").as_ref()));
         assert_eq!(
             (Progress::of(&show(1, 12, Some((2, "PAUSED"))), &[]).mark("3")).map(|k| k.status),
             Some("CURRENT")
