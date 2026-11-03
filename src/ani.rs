@@ -251,12 +251,16 @@ pub fn missing_deps() -> Vec<(&'static str, &'static str, &'static str)> {
 pub const INSTALL_SH: &str =
     "curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh";
 
-/// install.sh for what's missing. It leaves a mise ani-hop alone: a second copy in
-/// ~/.local/bin could come first on PATH, and mise would update one that doesn't run.
-fn install_sh(exe: &Path) -> String {
-    match from_mise(exe) {
-        true => INSTALL_SH.replace("| sh", "| ANI_HOP_KEEP=1 sh"),
-        false => INSTALL_SH.into(),
+/// install.sh for what's missing, on Linux unless Homebrew put ani-hop here. It leaves a mise
+/// ani-hop alone: a second copy in ~/.local/bin could come first on PATH, and mise would
+/// update one that doesn't run.
+fn install_sh(exe: &Path) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        None
+    } else if from_mise(exe) {
+        Some(INSTALL_SH.replace("| sh", "| ANI_HOP_KEEP=1 sh"))
+    } else {
+        (!from_brew(exe)).then(|| INSTALL_SH.into())
     }
 }
 
@@ -279,8 +283,8 @@ pub fn install_command(pkgs: &[&str]) -> Option<String> {
     if have("pacman") && !aur {
         return Some(format!("sudo pacman -S --needed {list}"));
     }
-    if cfg!(target_os = "linux") && !from_brew(&exe()) {
-        return Some(install_sh(&exe()));
+    if let Some(sh) = install_sh(&exe()) {
+        return Some(sh);
     }
     let brew: Vec<&str> = pkgs
         .iter()
@@ -1402,11 +1406,23 @@ mod tests {
             "/opt/Cellar".into(),
         ] {
             assert_eq!(update_command_for(&dir.join(mise)), up);
-            assert!(install_sh(&dir.join(mise)).ends_with("| ANI_HOP_KEEP=1 sh"));
+            #[cfg(target_os = "linux")]
+            assert!(
+                install_sh(&dir.join(mise))
+                    .unwrap()
+                    .ends_with("| ANI_HOP_KEEP=1 sh")
+            );
         }
         let ours = home().join(".local/bin/ani-hop");
         assert_eq!(update_command_for(&ours), INSTALL_SH);
-        assert_eq!(install_sh(&ours), INSTALL_SH);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(install_sh(&ours).as_deref(), Some(INSTALL_SH));
+            assert_eq!(
+                install_sh(Path::new("/opt/Cellar/ani-hop/1/bin/ani-hop")),
+                None
+            );
+        }
     }
 
     #[test]

@@ -243,7 +243,7 @@ main() {
 		place skip.lua "$SKIP_LUA" 644
 	fi
 
-	if [ "$hop" = "$BIN/ani-hop" ]; then
+	if [ "$hop" = "$BIN/ani-hop" ] && [ -z "${ANI_HOP_KEEP-}" ]; then
 		say "Installing ani-hop into $BIN"
 		get "$RELEASE/$archive" "$archive"
 		get "$RELEASE/$archive.sha256" "$archive.sha256"
