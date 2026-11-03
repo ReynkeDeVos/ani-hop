@@ -251,6 +251,19 @@ pub fn missing_deps() -> Vec<(&'static str, &'static str, &'static str)> {
 pub const INSTALL_SH: &str =
     "curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh";
 
+/// install.sh for what's missing, on Linux unless Homebrew put ani-hop here. It leaves a mise
+/// ani-hop alone: a second copy in ~/.local/bin could come first on PATH, and mise would
+/// update one that doesn't run.
+fn install_sh(exe: &Path) -> Option<String> {
+    if !cfg!(target_os = "linux") {
+        None
+    } else if from_mise(exe) {
+        Some(INSTALL_SH.replace("| sh", "| ANI_HOP_KEEP=1 sh"))
+    } else {
+        (!from_brew(exe)).then(|| INSTALL_SH.into())
+    }
+}
+
 fn aur_helper() -> Option<&'static str> {
     ["yay", "paru"].into_iter().find(|h| have(h))
 }
@@ -270,8 +283,8 @@ pub fn install_command(pkgs: &[&str]) -> Option<String> {
     if have("pacman") && !aur {
         return Some(format!("sudo pacman -S --needed {list}"));
     }
-    if cfg!(target_os = "linux") && !from_brew(&exe()) {
-        return Some(INSTALL_SH.into());
+    if let Some(sh) = install_sh(&exe()) {
+        return Some(sh);
     }
     let brew: Vec<&str> = pkgs
         .iter()
@@ -325,6 +338,12 @@ fn from_brew(p: &Path) -> bool {
     p.components().any(|c| c.as_os_str() == "Cellar")
 }
 
+/// Installed by `mise use github:ReynkeDeVos/ani-hop`, wherever MISE_DATA_DIR puts it.
+fn from_mise(p: &Path) -> bool {
+    p.components()
+        .any(|c| c.as_os_str() == "github-reynke-de-vos-ani-hop")
+}
+
 /// How to update ani-cli, judged by where it lives (None: only its package manager knows).
 pub fn ani_cli_update() -> Option<String> {
     let path = located("ani-cli")?;
@@ -361,13 +380,20 @@ fn exe() -> PathBuf {
 
 /// How to update this ani-hop, judged by where it lives.
 pub fn update_command() -> String {
-    let exe = exe();
-    if exe.starts_with(home().join(".local/bin")) {
+    update_command_for(&exe())
+}
+
+fn update_command_for(exe: &Path) -> String {
+    // first: MISE_DATA_DIR can put it anywhere, even under the paths below
+    if from_mise(exe) {
+        // the full name: `mise up ani-hop` matches nothing and says all is up to date
+        "mise up github:ReynkeDeVos/ani-hop".into()
+    } else if exe.starts_with(home().join(".local/bin")) {
         INSTALL_SH.into()
-    } else if from_brew(&exe) {
+    } else if from_brew(exe) {
         "brew upgrade ani-hop".into()
     } else if exe.starts_with("/nix/store") {
-        nix_update(&exe)
+        nix_update(exe)
     } else if exe.starts_with("/usr") {
         system_update()
     } else {
@@ -1369,6 +1395,35 @@ fn left(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mise_install_updates_with_mise_and_keeps_its_ani_hop() {
+        let mise = "mise/installs/github-reynke-de-vos-ani-hop/0.9.0/ani-hop";
+        let up = "mise up github:ReynkeDeVos/ani-hop";
+        for dir in [
+            home().join(".local/share"),
+            home().join(".local/bin"),
+            "/opt/Cellar".into(),
+        ] {
+            assert_eq!(update_command_for(&dir.join(mise)), up);
+            #[cfg(target_os = "linux")]
+            assert!(
+                install_sh(&dir.join(mise))
+                    .unwrap()
+                    .ends_with("| ANI_HOP_KEEP=1 sh")
+            );
+        }
+        let ours = home().join(".local/bin/ani-hop");
+        assert_eq!(update_command_for(&ours), INSTALL_SH);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(install_sh(&ours).as_deref(), Some(INSTALL_SH));
+            assert_eq!(
+                install_sh(Path::new("/opt/Cellar/ani-hop/1/bin/ani-hop")),
+                None
+            );
+        }
+    }
 
     #[test]
     fn keeps_the_newest_entries_of_downloaded_or_queued_shows() {

@@ -8,6 +8,7 @@
 # distro's is too old (Debian, Ubuntu), yt-dlp go into ~/.local/bin, so `ani-cli -U` needs no sudo.
 # Run it again to update them. ANI_HOP_RELEASE_URL picks another release, for example
 # https://github.com/ReynkeDeVos/ani-hop/releases/download/v0.6.0
+# ANI_HOP_KEEP=1 leaves ani-hop alone, for one installed another way, such as with mise.
 set -eu
 
 BIN=$HOME/.local/bin
@@ -134,7 +135,9 @@ main() {
 	# the system. The steps below still run, to fill in what the packages leave out (an ani-cli
 	# too old, a skip script mpv doesn't load); only the release download is skipped.
 	hop=$BIN/ani-hop
-	if [ "$os" = arch ]; then
+	if [ -n "${ANI_HOP_KEEP-}" ]; then
+		hop=$(command -v ani-hop) || die "ANI_HOP_KEEP is set, but there's no ani-hop on your PATH"
+	elif [ "$os" = arch ]; then
 		for helper in yay paru; do
 			have "$helper" || continue
 			"$helper" -Si ani-hop-bin >/dev/null 2>&1 || continue
@@ -240,7 +243,7 @@ main() {
 		place skip.lua "$SKIP_LUA" 644
 	fi
 
-	if [ "$hop" = "$BIN/ani-hop" ]; then
+	if [ "$hop" = "$BIN/ani-hop" ] && [ -z "${ANI_HOP_KEEP-}" ]; then
 		say "Installing ani-hop into $BIN"
 		get "$RELEASE/$archive" "$archive"
 		get "$RELEASE/$archive.sha256" "$archive.sha256"
