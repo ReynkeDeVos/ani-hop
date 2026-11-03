@@ -490,7 +490,7 @@ fn flow(text: &[(&str, Style)], narrow: usize, first: u16, rest: u16) -> Vec<Lin
 }
 
 /// AniList enums like TV_SHORT or NOT_YET_RELEASED, for humans.
-fn pretty(s: &str) -> String {
+pub fn pretty(s: &str) -> String {
     match s {
         "RELEASING" => "Airing".into(),
         "NOT_YET_RELEASED" => "Upcoming".into(),

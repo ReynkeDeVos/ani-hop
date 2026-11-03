@@ -1,3 +1,4 @@
+use crate::related::{Link, Linked, Series};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -451,6 +452,28 @@ impl Client {
             .transpose()
     }
 
+    /// The shows `ids` with what each one links to, through which a series is walked.
+    fn linked(&self, ids: &[u64]) -> Result<Vec<Linked>, String> {
+        // the links' own fields stay few: AniList answers more than this with a 500, or nested
+        // deeper with empty links
+        let q = format!(
+            "query($ids: [Int]) {{ Page(perPage: {PER_PAGE}) {{
+               media(id_in: $ids, type: ANIME, isAdult: false) {{ {MEDIA}
+                 relations {{ edges {{ relationType node {{ id type format isAdult }} }} }} }} }} }}"
+        );
+        linked_shows(&self.gql(&q, json!({ "ids": ids }))?)
+    }
+
+    /// Whether AniList links show `id` to another one worth going to.
+    pub fn has_related(&self, id: u64) -> Result<bool, String> {
+        Ok((self.linked(&[id])?.iter()).any(|l| !l.links.is_empty()))
+    }
+
+    /// Every show `id` leads to through what it links to, itself too.
+    pub fn series(&self, id: u64) -> Result<Series, String> {
+        crate::related::walk(id, |ids| self.linked(ids))
+    }
+
     /// The sequels a provider that lists `m`'s split cours as one show runs on into, up to
     /// its episode `last`, each with the episodes before it.
     pub fn parts(&self, m: &Media, last: u32) -> Result<Vec<(u32, Media)>, String> {
@@ -491,6 +514,46 @@ impl crate::entries::AniList for Client {
         let q = "mutation($id: Int) { DeleteMediaListEntry(id: $id) { deleted } }";
         self.gql(q, json!({ "id": entry })).map(|_| ())
     }
+}
+
+/// The shows in an answer to `Client::linked`, each with the links worth following: not a
+/// manga it adapts, a music video, an adult show (which ani-cli can't play), or one that only
+/// shares a character (One Piece has Dragon Ball Z).
+fn linked_shows(d: &Value) -> Result<Vec<Linked>, String> {
+    let media = d["Page"]["media"].as_array().into_iter().flatten();
+    media
+        .map(|m| {
+            let show: Media = serde_json::from_value(m.clone()).map_err(|e| e.to_string())?;
+            let edges = m["relations"]["edges"].as_array().into_iter().flatten();
+            let links = edges
+                .filter(|e| {
+                    let n = &e["node"];
+                    let wanted = matches!(
+                        e["relationType"].as_str(),
+                        Some(
+                            "PREQUEL"
+                                | "SEQUEL"
+                                | "PARENT"
+                                | "SIDE_STORY"
+                                | "SUMMARY"
+                                | "ALTERNATIVE"
+                                | "SPIN_OFF"
+                                | "COMPILATION"
+                                | "CONTAINS"
+                        )
+                    );
+                    wanted && n["type"] == "ANIME" && n["format"] != "MUSIC" && n["isAdult"] != true
+                })
+                .filter_map(|e| {
+                    Some(Link {
+                        relation: e["relationType"].as_str()?.to_string(),
+                        to: e["node"]["id"].as_u64().filter(|to| *to != show.id)?,
+                    })
+                })
+                .collect();
+            Ok(Linked { show, links })
+        })
+        .collect()
 }
 
 /// Sequels after `m` until they reach episode `last`. None unless they have all finished
@@ -544,6 +607,36 @@ fn folded(query: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_show_links_only_to_what_can_be_played_as_part_of_its_series() {
+        let edge = |relation: &str, id: u64, kind: &str, format: &str, adult: bool| {
+            serde_json::json!({ "relationType": relation, "node": {
+                "id": id, "type": kind, "format": format, "isAdult": adult } })
+        };
+        let answer = serde_json::json!({ "Page": { "media": [
+            { "id": 21, "title": { "romaji": "ONE PIECE" }, "relations": { "edges": [
+                edge("SIDE_STORY", 1, "ANIME", "MOVIE", false),
+                edge("SEQUEL", 2, "ANIME", "TV", false),
+                edge("PREQUEL", 3, "ANIME", "ONA", false),
+                edge("ALTERNATIVE", 4, "ANIME", "OVA", false),
+                edge("ADAPTATION", 5, "MANGA", "MANGA", false),
+                edge("SOURCE", 6, "MANGA", "MANGA", false),
+                edge("CHARACTER", 7, "ANIME", "TV", false),
+                edge("OTHER", 8, "ANIME", "SPECIAL", false),
+                edge("SIDE_STORY", 9, "ANIME", "MUSIC", false),
+                edge("SPIN_OFF", 10, "ANIME", "TV", true),
+                edge("SEQUEL", 21, "ANIME", "TV", false),
+            ] } },
+            { "id": 22, "relations": { "edges": [] } },
+        ] } });
+        let shows = super::linked_shows(&answer).unwrap();
+        let to: Vec<u64> = shows[0].links.iter().map(|l| l.to).collect();
+        assert_eq!(to, [1, 2, 3, 4]);
+        assert_eq!(shows[0].links[1].relation, "SEQUEL");
+        assert_eq!((shows[0].show.id, shows[0].show.name()), (21, "ONE PIECE"));
+        assert!(shows[1].links.is_empty());
+    }
+
     #[test]
     fn searches_again_as_typed_on_a_plain_keyboard() {
         let folded = super::folded;

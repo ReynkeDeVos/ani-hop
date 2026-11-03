@@ -19,6 +19,8 @@ pub enum Feed {
     /// page if there is one, and whether it's on its way (the first page may refresh on its
     /// own, without "More…")
     Pages(String, Option<String>, Option<u32>, bool),
+    /// the shows related to a show: its id, and how many of the first are its seasons
+    Related(u64, usize),
 }
 
 /// A list on screen: its shows, where they come from, and its cache.
@@ -85,6 +87,36 @@ impl List {
     /// What a rescan of the download folder found.
     pub fn scanned(&mut self, shows: Vec<Media>) {
         (self.shows, self.refreshing) = (shows, false);
+    }
+
+    /// The shows related to `seed` and how many of the first are its seasons, as `Series::list`
+    /// has them; loading until those are known.
+    pub fn related(seed: u64, found: Option<(Vec<Media>, usize)>) -> List {
+        let refreshing = found.is_none();
+        let (shows, seasons) = found.unwrap_or_default();
+        List {
+            shows,
+            feed: Feed::Related(seed, seasons),
+            cache: None,
+            refreshing,
+        }
+    }
+
+    /// The show whose related shows it lists.
+    pub fn related_to(&self) -> Option<u64> {
+        match self.feed {
+            Feed::Related(seed, _) => Some(seed),
+            _ => None,
+        }
+    }
+
+    /// The group of the list's `i`th show: a show's seasons have no name, as a list's first
+    /// group never shows one, and what comes after them is said to be something else.
+    pub fn group(&self, i: usize) -> &'static str {
+        match self.feed {
+            Feed::Related(_, seasons) if seasons > 0 && i >= seasons => "Also related",
+            _ => "",
+        }
     }
 
     /// A list as its cache has it at `now`, and the refresh to ask for unless that's fresh
@@ -329,6 +361,23 @@ mod tests {
         assert_eq!(list.more(), Err("No more shows"));
         let (ranking, _) = List::open(trending(), None, SystemTime::now());
         assert!(!ranking.is_search());
+    }
+
+    #[test]
+    fn related_shows_load_and_set_apart_what_comes_after_the_seasons() {
+        let list = List::related(7, None);
+        assert!(list.loading() && list.shows.is_empty());
+        assert_eq!(list.related_to(), Some(7));
+        assert!(!list.paged() && list.more_page().is_none() && !list.is_local());
+        let list = List::related(7, Some((shows(0..4), 2)));
+        assert!(!list.loading());
+        let groups: Vec<&str> = (0..4).map(|i| list.group(i)).collect();
+        assert_eq!(groups, ["", "", "Also related", "Also related"]);
+        // no seasons to set anything apart from
+        let list = List::related(7, Some((shows(0..2), 0)));
+        assert_eq!((list.group(0), list.group(1)), ("", ""));
+        let (ranking, _) = List::open(trending(), None, SystemTime::now());
+        assert_eq!((ranking.related_to(), ranking.group(3)), (None, ""));
     }
 
     #[test]

@@ -137,6 +137,21 @@ impl<'a> Progress<'a> {
         let (p, n) = self.entry(ep);
         let n = ep_num(&n);
         let to = p.episodes.map_or(n, |e| n.min(e as f64)) as u32;
+        Some(self.saving(p, to))
+    }
+
+    /// What going back to no episodes watched saves: for AniList to count none, the show and
+    /// each part it has any of go to 0, one save each. Nothing when it counts none already.
+    pub fn none(&self) -> Vec<Mark> {
+        let parts = self.parts.iter().map(|(_, p)| p);
+        (std::iter::once(self.show).chain(parts))
+            .filter(|p| self.count(p) > 0)
+            .map(|p| self.saving(p, 0))
+            .collect()
+    }
+
+    /// Progress `to` on entry `p`, the show's or a part's.
+    fn saving(&self, p: &'a Media, to: u32) -> Mark {
         let part = match p.id == self.show.id {
             true => String::new(),
             false => self.part_name(p).to_string(),
@@ -144,13 +159,13 @@ impl<'a> Progress<'a> {
         let now = self.known(p);
         let mut entry = p.clone();
         entry.media_list_entry = now.cloned();
-        Some(Mark {
+        Mark {
             entry,
             part,
             was: self.count(p),
             to,
             status: status(now, p.episodes, to),
-        })
+        }
     }
 
     /// Marking `ep` watched, when that adds anything: asked after playing it.
@@ -174,6 +189,15 @@ impl Mark {
             Some((first, rest)) => format!("{}{rest}.", first.to_uppercase()),
             None => also,
         }
+    }
+
+    /// What else several saves change, the show's first: "Unmarks 1–12. Part 2: Unmarks 1–3."
+    pub fn also_each(marks: &[Mark]) -> String {
+        let each = marks.iter().map(|k| match k.part.as_str() {
+            "" => k.also(),
+            part => format!("{part}: {}", k.also()),
+        });
+        each.collect::<Vec<_>>().join(" ")
     }
 
     /// What Save saves: "3/12", "1/10 to Part 2".
@@ -201,11 +225,16 @@ impl Mark {
     }
 }
 
-/// The list an entry is on once its progress is `to` of `episodes`.
+/// The list an entry is on once its progress is `to` of `episodes`. Marking an episode means
+/// watching it, and no episodes watched doesn't: that stays on its list, unless the list says
+/// all of them are.
 fn status(entry: Option<&Entry>, episodes: Option<u32>, to: u32) -> &'static str {
     match entry.map(|e| e.status.as_str()) {
-        _ if episodes == Some(to) => "COMPLETED",
+        _ if to > 0 && episodes == Some(to) => "COMPLETED",
         Some("REPEATING") => "REPEATING",
+        Some("PLANNING") if to == 0 => "PLANNING",
+        Some("PAUSED") if to == 0 => "PAUSED",
+        Some("DROPPED") if to == 0 => "DROPPED",
         _ => "CURRENT",
     }
 }
@@ -272,6 +301,86 @@ mod tests {
         assert_eq!(mark(&watching(1, 12, 6), "5").also(), "Unmarks 6.");
         assert_eq!(mark(&watching(1, 12, 5), "7").also(), "Also marks 6.");
         assert!(Progress::of(&fresh, &[]).mark("SP").is_none());
+    }
+
+    #[test]
+    fn no_episodes_watched_unmarks_all_of_them_on_the_list_it_was_on() {
+        let none = |m: &Media| Progress::of(m, &[]).none();
+        // nothing to go back from: no entry, or one at 0
+        assert!(none(&show(1, 12, None)).is_empty());
+        assert!(none(&watching(1, 12, 0)).is_empty());
+        let k = &none(&watching(1, 12, 1))[0];
+        assert_eq!((k.was, k.to, k.hint()), (1, 0, "0/12".to_string()));
+        assert_eq!(k.also(), "Unmarks 1.", "episode 1 deselected");
+        assert!(!k.only_this(), "starts on Don't save");
+        let on = |status: &str| {
+            let m = show(1, 12, Some((5, status)));
+            let k = none(&m).remove(0);
+            (k.status, k.also())
+        };
+        assert_eq!(on("CURRENT"), ("CURRENT", "Unmarks 1–5.".to_string()));
+        assert_eq!(on("PLANNING"), ("PLANNING", "Unmarks 1–5.".to_string()));
+        assert_eq!(on("PAUSED"), ("PAUSED", "Unmarks 1–5.".to_string()));
+        assert_eq!(on("DROPPED"), ("DROPPED", "Unmarks 1–5.".to_string()));
+        assert_eq!(on("REPEATING"), ("REPEATING", "Unmarks 1–5.".to_string()));
+        // Completed can't say none are watched, which the question says too
+        assert_eq!(
+            on("COMPLETED"),
+            (
+                "CURRENT",
+                "Unmarks 1–5 and moves it to Watching.".to_string()
+            )
+        );
+        // a show that has no episodes on AniList yet isn't Completed by counting none
+        let airing = Media {
+            episodes: Some(0),
+            media_list_entry: watching(1, 12, 3).media_list_entry,
+            ..Default::default()
+        };
+        assert_eq!(Progress::of(&airing, &[]).none()[0].status, "CURRENT");
+        // and marking an episode still means watching
+        assert_eq!(
+            (Progress::of(&show(1, 12, Some((2, "PAUSED"))), &[]).mark("3")).map(|k| k.status),
+            Some("CURRENT")
+        );
+    }
+
+    #[test]
+    fn no_episodes_watched_goes_for_the_parts_too() {
+        // watched counts either the show's progress or its part's: both have to go
+        let mut s3 = watching(1, 12, 12);
+        s3.title.romaji = Some("Attack on Titan Season 3".into());
+        let mut p2 = watching(2, 10, 3);
+        p2.title.romaji = Some("Attack on Titan Season 3 Part 2".into());
+        let parts = [(12, p2)];
+        let marks = Progress::of(&s3, &parts).none();
+        let saved: Vec<(u64, u32, String)> = (marks.iter())
+            .map(|k| (k.entry.id, k.was, k.hint()))
+            .collect();
+        assert_eq!(
+            saved,
+            [
+                (1, 12, "0/12".to_string()),
+                (2, 3, "0/10 to Part 2".to_string())
+            ]
+        );
+        assert_eq!(
+            Mark::also_each(&marks),
+            "Unmarks 1–12. Part 2: Unmarks 1–3."
+        );
+        // one of them at 0 has nothing to save
+        let mut fresh = watching(1, 12, 0);
+        fresh.title.romaji = s3.title.romaji.clone();
+        let marks = Progress::of(&fresh, &parts).none();
+        assert_eq!(marks.len(), 1);
+        assert_eq!((marks[0].entry.id, marks[0].part.as_str()), (2, "Part 2"));
+        assert_eq!(Mark::also_each(&marks), "Part 2: Unmarks 1–3.");
+        // with both at 0 nothing reads as watched, and it starts over
+        let parts = [(12, watching(2, 10, 0))];
+        let run = Progress::of(&fresh, &parts);
+        assert!(run.none().is_empty());
+        assert!(!run.watched("1") && !run.watched("13"));
+        assert_eq!(run.next(), 1);
     }
 
     #[test]

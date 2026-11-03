@@ -552,7 +552,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         | View::Confirm(Pending::Remove(m) | Pending::Stop(m, _) | Pending::Pause(m, _)) => {
             Some(m.clone())
         }
-        View::Confirm(Pending::Progress(mark)) => Some(mark.entry.clone()),
+        View::Confirm(Pending::Progress(marks)) => marks.first().map(|k| k.entry.clone()),
         _ => None,
     };
     // posters just below the cursor load ahead, so scrolling shows them instantly
@@ -573,7 +573,10 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         _ => Vec::new(),
     };
     let ep = match &screen.view {
-        View::Episodes(..) => screen.menu.current().map(|it| it.key.clone()),
+        // a row that's no episode shows the show
+        View::Episodes(..) => (screen.menu.current())
+            .filter(|it| !it.action)
+            .map(|it| it.key.clone()),
         _ => None,
     };
     app.preview.read(media.as_ref().map(|m| (m.id, ep.clone())));

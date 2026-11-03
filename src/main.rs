@@ -10,6 +10,7 @@ mod menu;
 mod playback;
 mod preview;
 mod progress;
+mod related;
 mod show_downloads;
 mod source;
 mod ui;
@@ -27,6 +28,7 @@ use ratatui::crossterm::event::{
     KeyModifiers,
 };
 use ratatui::crossterm::execute;
+use related::Series;
 use show_downloads::{Action, ShowDownloads, which};
 use source::{Lookup, Source, Sources};
 use std::collections::HashMap;
@@ -42,6 +44,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const PIN_REDIRECT: &str = "https://anilist.co/api/v2/oauth/pin";
+/// The row of "Watched up to…" that goes back to none: not an episode a provider could list.
+const NO_EPISODES: &str = "none";
 const LISTS: [(&str, &str); 6] = [
     ("CURRENT", "Watching"),
     ("PLANNING", "Planning"),
@@ -91,8 +95,8 @@ pub enum Input {
 
 pub enum Pending {
     Delete(Vec<PathBuf>),
-    /// marking an episode watched: what Yes saves, as the question says it
-    Progress(Mark),
+    /// marking an episode watched, or none of them: what Yes saves, as the question says it
+    Progress(Vec<Mark>),
     /// taking a show off the list, which loses its progress and score
     Remove(Media),
     Quit,
@@ -125,6 +129,16 @@ enum Want {
     Play(String),
 }
 
+/// What AniList links a show to, as far as this session knows.
+enum Related {
+    /// nothing, or it hasn't said yet: a page offers nothing to go to
+    Nothing,
+    /// another show at least
+    Links,
+    /// the show's whole series, walked once for all of its shows
+    Series(Arc<Series>),
+}
+
 enum Msg {
     /// a list's refreshed shows
     /// a list's shows; for a search, also what found them, as a typo was spelled again
@@ -145,6 +159,10 @@ enum Msg {
     EpInfo(u64, HashMap<String, EpInfo>),
     /// sequels of a show, looked up for its episode counts (App::parts_key)
     Parts(u64, (u32, u32), Stamp, Result<Parts, String>),
+    /// whether AniList links a show to another
+    Linked(u64, Result<bool, String>),
+    /// for the screen waiting on it, a show's series as AniList has it
+    Series(u64, u64, Stamp, Result<Series, String>),
     /// a lookup's answer, with its ticket (Sources::ask)
     Resolved(Media, u64, Result<Source, String>),
     /// a change to the user's list, answered
@@ -180,6 +198,8 @@ pub struct App {
     /// before it (empty while loading or when there are none), and the episode counts they
     /// were looked up for
     parts: HashMap<u64, ((u32, u32), Parts)>,
+    /// what AniList links each show opened this session to
+    related: HashMap<u64, Related>,
     pub sources: Sources,
     /// downloaded episodes per show, as the last rescan found them
     pub local: HashMap<u64, OnDisk>,
@@ -475,6 +495,7 @@ impl App {
             entries,
             ep_info: HashMap::new(),
             parts: HashMap::new(),
+            related: HashMap::new(),
             sources: Sources::load(),
             local: HashMap::new(),
             downloaded: None,
@@ -546,7 +567,9 @@ impl App {
         let _ = fs::remove_file(user_path());
         (self.client.token, self.user) = (None, None);
         self.entries.login(Arc::new(self.client.clone()));
-        self.parts.clear(); // they carry this login's progress
+        // they carry this login's progress
+        self.parts.clear();
+        self.related.clear();
     }
 
     /// Back to the main menu; an unanswered resume question stays.
@@ -973,9 +996,18 @@ impl App {
                 v
             }
             View::Shows(list) => {
-                let mut v: Vec<Item> = (list.shows.iter())
-                    .map(|m| {
+                let related = list.related_to();
+                let mut v: Vec<Item> = (list.shows.iter().enumerate())
+                    .map(|(i, m)| {
                         let mut hint = Vec::new();
+                        // the one it opened from; on a series, movies and specials say so
+                        if related == Some(m.id) {
+                            hint.push("this show".to_string());
+                        }
+                        if related.is_some() {
+                            let what = m.format.as_deref().filter(|f| *f != "TV");
+                            hint.extend(what.map(preview::pretty));
+                        }
                         if let Some(n) = self.local.get(&m.id).map(Vec::len).filter(|n| *n > 0) {
                             hint.push(format!("↓ {n}"));
                         }
@@ -985,13 +1017,17 @@ impl App {
                                 e.progress,
                                 m.episodes.map_or("?".into(), |e| e.to_string())
                             ));
-                        } else if let Some(e) = m.episodes {
+                        } else if let Some(e) = m.episodes
+                            // a movie's one episode goes without saying, when it says it's one
+                            && !(related.is_some() && m.format.as_deref() == Some("MOVIE") && e == 1)
+                        {
                             hint.push(format!("{e} ep"));
                         }
                         hint.extend(m.season_year.map(|y| y.to_string()));
                         let mut it = Item::new(m.id.to_string(), m.name(), hint.join(" · "));
                         // found by its other titles too: "attack on titan", "aot"
                         it.about = m.titles().cloned().collect::<Vec<_>>().join(" · ");
+                        it.group = list.group(i).to_string();
                         it
                     })
                     .collect();
@@ -1043,6 +1079,13 @@ impl App {
                 if m.on_anilist() {
                     v.push(Item::new("web", "↗  Open on AniList", ""));
                 }
+                // last, as it comes once AniList says so: no other row moves, and ↑ gets here
+                if matches!(
+                    self.related.get(&m.id),
+                    Some(Related::Links | Related::Series(_))
+                ) {
+                    v.push(Item::new("related", "⇅  Related shows…", ""));
+                }
                 v
             }
             View::Episodes(m, mode) => {
@@ -1073,9 +1116,18 @@ impl App {
                     it
                 };
                 let sizes = *mode == EpMode::Download;
-                (eps.iter().zip(seasons))
+                let mut rows: Vec<Item> = (eps.iter().zip(seasons))
                     .map(|(ep, season)| item(ep, ep, dl.hint(ep, sizes), season))
-                    .collect()
+                    .collect();
+                // AniList counts up to an episode, so none is before the first
+                if *mode == EpMode::Watched && !run.none().is_empty() {
+                    let mut none = Item::new(NO_EPISODES, "No episodes", "");
+                    none.action = true;
+                    // no rule between it and the first group, which never names itself
+                    none.group = rows.first().map_or(String::new(), |r| r.group.clone());
+                    rows.insert(0, none);
+                }
+                rows
             }
             View::DlChoice(m, eps) => self.show_downloads(m).choices(eps),
             View::Status(m) => {
@@ -1159,7 +1211,10 @@ impl App {
                     Pending::Remove(_) => ("Keep on list", "Remove", "", String::new()),
                     // what it saves, as that can be the entry's last (the second half of a
                     // special) or a part's
-                    Pending::Progress(mark) => ("Don't save", "Save", "", mark.hint()),
+                    Pending::Progress(marks) => {
+                        let hints: Vec<String> = marks.iter().map(Mark::hint).collect();
+                        ("Don't save", "Save", "", hints.join(" · "))
+                    }
                     Pending::Quit => {
                         // when it asks about downloads, which it doesn't while they're paused
                         let s = self.downloads.snapshot();
@@ -1286,8 +1341,13 @@ impl App {
                 if picked.len() > 1 {
                     self.push(format!("{} shows", picked.len()), View::Bulk(picked));
                 } else if let Some(m) = picked.into_iter().next() {
+                    // back on the page it came from, not another one of it
+                    let here = list.related_to() == Some(m.id);
                     self.top().menu.marked.clear();
-                    self.open_show(m);
+                    match here {
+                        true => self.pop(1),
+                        false => self.open_show(m),
+                    }
                 }
             }
             View::Show(m) => {
@@ -1299,6 +1359,7 @@ impl App {
                 match mode {
                     EpMode::Play => self.play(m, key),
                     EpMode::Download => self.dl_act(m, keys, None),
+                    EpMode::Watched if key == NO_EPISODES => self.ask_none(&m),
                     EpMode::Watched => {
                         let title = format!("Watched up to episode {key} of {}?", m.name());
                         let mark = self.progress(&m).mark(&key);
@@ -1459,10 +1520,12 @@ impl App {
                         let work = self.entries.begin(Change::Remove(m, entry));
                         self.spawn(move || Msg::Entry(work.run()));
                     }
-                    Pending::Progress(k) => {
+                    Pending::Progress(marks) => {
                         // saved only while AniList still has the progress the question showed
-                        let work = self.entries.begin(Change::Progress(k.clone()));
-                        self.spawn(move || Msg::Entry(work.run()));
+                        for k in marks.clone() {
+                            let work = self.entries.begin(Change::Progress(k));
+                            self.spawn(move || Msg::Entry(work.run()));
+                        }
                         self.pop(1);
                     }
                 }
@@ -1617,6 +1680,7 @@ impl App {
                 self.client.token = Some(token);
                 self.entries.login(Arc::new(self.client.clone()));
                 self.parts.clear();
+                self.related.clear();
                 let c = self.client.clone();
                 self.spawn(move || Msg::Viewer(c.token.clone(), c.viewer()));
                 self.toast("Checking token…", false);
@@ -1642,7 +1706,53 @@ impl App {
         if !self.upcoming(&m) {
             self.resolve(&m, None); // warm up so "Episodes…" opens instantly
         }
+        self.want_related(&m);
         self.push(m.name().to_string(), View::Show(m));
+    }
+
+    /// Asks AniList once a session whether `m` links to another show, which puts "Related
+    /// shows…" on its page. Its series is only walked if that's opened: that takes up to
+    /// MOST_REQUESTS of a limit that everything else shares.
+    fn want_related(&mut self, m: &Media) {
+        if !m.on_anilist() {
+            return;
+        }
+        if let Vacant(e) = self.related.entry(m.id) {
+            e.insert(Related::Nothing);
+            let (id, c) = (m.id, self.client.clone());
+            self.spawn(move || Msg::Linked(id, c.has_related(id)));
+        }
+    }
+
+    /// The shows related to `m`: at once when this session knows its series, whose other shows
+    /// that goes for too, so hopping along its seasons asks AniList nothing.
+    fn open_related(&mut self, m: &Media) {
+        let seed = m.id;
+        let series = match self.related.get(&seed) {
+            Some(Related::Series(s)) => Some(s.clone()),
+            _ => None,
+        };
+        let list = List::related(seed, series.as_ref().map(|s| s.list(seed)));
+        let id = self.push("Related shows", View::Shows(list));
+        match series {
+            Some(s) => self.series_shown(id, seed, &s),
+            None => {
+                let (c, stamp) = (self.client.clone(), self.entries.stamp());
+                self.spawn(move || Msg::Series(id, seed, stamp, c.series(seed)));
+            }
+        }
+    }
+
+    /// `seed`'s series on screen `id`: the cursor starts on it, a key from the season before
+    /// or after, and it's said if that isn't all of them.
+    fn series_shown(&mut self, id: u64, seed: u64, series: &Series) {
+        if let Some(screen) = self.stack.iter_mut().find(|s| s.id == id) {
+            screen.menu.select_key(&seed.to_string());
+            if series.cut {
+                let n = series.shows.len();
+                self.toast(format!("Stopped at {n} shows · AniList links more"), false);
+            }
+        }
     }
 
     fn show_action(&mut self, m: Media, key: &str) {
@@ -1668,6 +1778,7 @@ impl App {
             }
             "download" => self.resolve(&m, Some(Want::Episodes(EpMode::Download))),
             "status" => _ = self.push("List status", View::Status(m)),
+            "related" => self.open_related(&m),
             "watched" => self.resolve(&m, Some(Want::Episodes(EpMode::Watched))),
             "source" => {
                 let q = self
@@ -1730,8 +1841,21 @@ impl App {
         // what else Yes changes goes in the question, which wraps; a hint would be cut
         let title = format!("{title} {}", mark.also()).trim_end().to_string();
         let first = if mark.only_this() { "yes" } else { "no" };
-        self.push(title, View::Confirm(Pending::Progress(mark)));
+        self.push(title, View::Confirm(Pending::Progress(vec![mark])));
         self.top().menu.select_key(first);
+    }
+
+    /// Asks before taking `m` back to no episodes watched. It unmarks at least one that was, so
+    /// Don't save goes first.
+    fn ask_none(&mut self, m: &Media) {
+        let marks = self.progress(m).none();
+        if marks.is_empty() {
+            return; // saved in the meantime
+        }
+        let also = Mark::also_each(&marks);
+        let title = format!("Watched no episodes of {}? {also}", m.name());
+        self.push(title.trim_end(), View::Confirm(Pending::Progress(marks)));
+        self.top().menu.select_key("no");
     }
 
     fn fulfill(&mut self, m: Media, want: Want) {
@@ -1746,6 +1870,13 @@ impl App {
                 };
                 self.push(title, View::Episodes(m, mode));
                 self.top().menu.select_key(&next);
+                // all of them watched, so no next: not on a row that unmarks them
+                let menu = &mut self.top().menu;
+                if menu.current().is_some_and(|i| i.key == NO_EPISODES)
+                    && let Some(last) = menu.items.last().map(|i| i.key.clone())
+                {
+                    menu.select_key(&last);
+                }
             }
         }
     }
@@ -1919,6 +2050,40 @@ impl App {
                 self.parts.insert(id, (key, parts));
                 self.refresh();
             }
+            Msg::Linked(id, res) => {
+                // none of it after another login's clean slate; a failed one's asked again
+                let slot = self.related.get_mut(&id);
+                match (slot, res) {
+                    (Some(r @ Related::Nothing), Ok(true)) => {
+                        *r = Related::Links;
+                        self.rebuild();
+                    }
+                    (Some(Related::Nothing), Err(_)) => _ = self.related.remove(&id),
+                    _ => {}
+                }
+            }
+            Msg::Series(id, seed, stamp, res) => {
+                let res = res.and_then(|mut s| {
+                    match self.entries.observe(stamp, &mut s.shows) {
+                        true => Ok(Arc::new(s)),
+                        false => Err(String::new()), // an earlier login's
+                    }
+                });
+                let series = res.as_ref().ok().cloned();
+                self.fill(id, |v| {
+                    if let View::Shows(list) = v {
+                        *list = List::related(seed, Some(res?.list(seed)));
+                    }
+                    Ok(())
+                });
+                if let Some(s) = series {
+                    for m in &s.shows {
+                        self.related.insert(m.id, Related::Series(s.clone()));
+                    }
+                    self.series_shown(id, seed, &s);
+                    self.rebuild();
+                }
+            }
             Msg::Resolved(m, ticket, res) => {
                 // a lookup from before the source was changed by hand
                 if !self.sources.answer(m.id, ticket, &res) {
@@ -1957,7 +2122,12 @@ impl App {
                 let Some(n) = self.entries.finish(done) else {
                     return; // an earlier login's
                 };
-                self.toast(n.text, n.error);
+                // a show and its parts save one by one: one's success doesn't hide another's error
+                let failed =
+                    (self.toast.as_ref()).is_some_and(|t| t.1 && t.2.elapsed().as_secs() < 4);
+                if n.error || !failed {
+                    self.toast(n.text, n.error);
+                }
                 // its list status question is answered, not another show's
                 if matches!(&self.top().view, View::Status(s) if Some(s.id) == n.closes) {
                     self.stack.pop();

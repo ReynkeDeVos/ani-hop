@@ -437,6 +437,29 @@ mod tests {
     }
 
     #[test]
+    fn progress_goes_back_to_none_unless_anilist_moved_on() {
+        let show = watching(70_004, 5);
+        let (fake, mut entries) = anilist(&show, false);
+        let none = entries.progress(&show, &[]).none().remove(0);
+        let done = entries.begin(Change::Progress(none)).run();
+        let n = entries.finish(done).unwrap();
+        assert_eq!(n.text, "Saved Show · Watching · 0/12");
+        assert!(!n.error);
+        assert_eq!(fake.entry(show.id).unwrap().unwrap().progress, 0, "saved");
+        assert!(entries.progress(&show, &[]).none().is_empty());
+        assert!(!entries.progress(&show, &[]).watched("1"));
+        // another ani-hop got further since the question: it isn't undone
+        let stale = watching(70_005, 5);
+        let (fake, mut entries) = anilist(&stale, false);
+        let none = entries.progress(&stale, &[]).none().remove(0);
+        fake.save(stale.id, None, Some(6)).unwrap();
+        let done = entries.begin(Change::Progress(none)).run();
+        let n = entries.finish(done).unwrap();
+        assert_eq!(n.text, "Show not saved · AniList has 6/12 now, try again");
+        assert_eq!(fake.entry(stale.id).unwrap().unwrap().progress, 6);
+    }
+
+    #[test]
     fn answers_for_an_earlier_login_change_nothing() {
         let copy = watching(70_002, 5);
         let (fake, mut entries) = anilist(&copy, false);

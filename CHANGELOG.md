@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.9.0 – 2026-11-03
+
+### Added
+
+- A show's page has "Related shows…", to jump to the rest of its series: its seasons in story order, then, under "Also related", its other movies, OVAs and side stories. The cursor starts on the show you came from, so the season before or after it is one key away. From Attack on Titan Season 3 that's 16 shows, from the first season to the final chapters, with Chronicle and LOST GIRLS below them. Movies, OVAs and specials say so on their row. It's the page's last row, so ↑ from the top gets there, and it's only there when AniList links the show to another. It works logged out too. Manga, music videos and shows that only share a character stay out: One Piece doesn't list Dragon Ball Z.
+- "Watched up to…" has a "No episodes" row above episode 1, which takes a show back to none watched. Until now it could go down to episode 1 and no further. It asks first ("Watched no episodes of Frieren? Unmarks 1."), starting on "Don't save". A show stays on its list, except Completed, which moves to Watching, as the question says. A split season's Part 2 goes to 0 too, or its episodes would stay marked. The row is only there while an episode is marked.
+
 ## 0.8.5 – 2026-11-03
 
 ### Changed
