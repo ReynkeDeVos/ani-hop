@@ -75,20 +75,17 @@ From source: `cargo install --locked --git https://github.com/ReynkeDeVos/ani-ho
 
 ## Inspiration and alternatives
 
-ani-hop was inspired by [viu](https://github.com/viu-media/viu) (formerly FastAnime), especially the way its interface is structured: searchable menus that lead from a main menu to a show and on to its episodes, with a preview of what you're on. Sadly, viu isn't being developed anymore.
+ani-hop was inspired by [viu](https://github.com/viu-media/viu) (formerly FastAnime) and how its interface is structured. Sadly, it isn't being developed anymore.
 
-If you're looking for alternatives to ani-hop, these are well worth a look. Each one does things ani-hop doesn't:
+Looking for alternatives? These are all worth a look:
 
-- [GoAnime](https://github.com/alvarorichard/GoAnime) searches several sources at once for anime, movies and TV shows in English and Brazilian Portuguese. It has a Windows installer and can upscale video with Anime4K as you watch.
-- [weeb-cli](https://github.com/ewgsta/weeb-cli) has sources in Turkish, English, German and Polish, syncs with AniList, MyAnimeList and Kitsu, and comes with an API for your own scripts.
-- [mal-tui](https://github.com/swstl/mal-tui) is a great home for MyAnimeList users, with seasonal browsing and a list that updates as you watch.
-- [anitrack](https://github.com/MiguelRegueiro/anitrack-cli) is a simple, focused companion if you already love `ani-cli`: it remembers where you stopped, so continuing takes one command.
-- [ani-gui](https://github.com/JoaoPucci/ani-gui) is a full desktop app for anyone who prefers a window to a terminal, with a built-in player, Picture-in-Picture and watch parties through Syncplay.
+- [GoAnime](https://github.com/alvarorichard/GoAnime): anime, movies and TV shows from several sources at once, in English and Brazilian Portuguese.
+- [weeb-cli](https://github.com/ewgsta/weeb-cli): sources in four languages, with AniList, MyAnimeList and Kitsu sync.
+- [mal-tui](https://github.com/swstl/mal-tui): a great home for MyAnimeList users.
+- [anitrack](https://github.com/MiguelRegueiro/anitrack-cli): a simple companion that remembers where you stopped in `ani-cli`.
+- [ani-gui](https://github.com/JoaoPucci/ani-gui): a full desktop app with a built-in player and watch parties.
 
-Two things I haven't found in any of them, and what ani-hop adds to the mix:
-
-- **Find an episode by what happens in it, without spoilers.** The filter searches the summaries of the episodes you've watched and leaves the rest blank.
-- **Saves that tell you what they change.** Before it saves your progress, ani-hop says what else moves: "Unmarks 1–15 and moves it to Watching."
+One thing I haven't found in any of them: searching episodes by what happens in them, without spoilers.
 
 <sub>Curious how the code is structured? Here is the architecture diagram:</sub>
 
