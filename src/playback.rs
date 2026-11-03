@@ -4,27 +4,39 @@
 //! id, so an earlier player's end never touches a later one, and a second enter while one
 //! starts doesn't open a second player.
 
-use crate::ani;
+use crate::ani::{self, Held, Replayed};
 use crate::anilist::Media;
-use crate::source::{Lookup, Source};
+use crate::preload::{Key, Preload};
+use crate::source::{self, Focus, Lookup, Source};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 /// What an attempt waits on while it looks the show up: playing waits for that lookup.
 pub const SEARCHING: &str = "searching ani-cli";
+/// What an attempt waits on once the player runs and hasn't shown the episode yet.
+pub const OPENING: &str = "opening the player";
+/// What an attempt waits on while ani-cli gets the episode's links.
+const FETCHING: &str = "fetching the stream";
 
 /// What plays episodes: ani-cli and mpv, or a script in tests.
 pub trait Player: Send + Sync {
-    /// Streams episode `ep` of `src`; `up` once the player shows it.
+    /// Streams episode `ep` of `src`; `step` hears what it waits on, and None once the player
+    /// shows it.
     fn stream(
         &self,
         m: &Media,
         src: &Source,
         ep: &str,
         audio: &str,
-        up: &mut dyn FnMut(),
+        step: &dyn Fn(Option<&'static str>),
     ) -> Result<(), String>;
+    /// Runs ani-cli up to where it would start the player, and keeps what it would start it with.
+    fn hold(&self, m: &Media, src: &Source, ep: &str, audio: &str) -> Result<Held, String>;
+    /// Starts the player with what `hold` kept; `step` hears the same as from `stream`.
+    fn replay(&self, held: &Held, step: &dyn Fn(Option<&'static str>)) -> Replayed;
+    /// Episode `ep` of `m`, if it's downloaded. It may be on a slow disk.
+    fn on_disk(&self, m: &Media, ep: &str) -> Option<PathBuf>;
     /// Plays a downloaded episode.
     fn file(&self, m: &Media, ep: &str, file: &Path, up: &mut dyn FnMut()) -> Result<(), String>;
     /// Where the provider has the show now.
@@ -41,9 +53,22 @@ impl Player for Mpv {
         src: &Source,
         ep: &str,
         audio: &str,
-        up: &mut dyn FnMut(),
+        step: &dyn Fn(Option<&'static str>),
     ) -> Result<(), String> {
-        ani::stream(m, src, ep, audio, up)
+        ani::stream(m, src, ep, audio, step)
+    }
+
+    fn hold(&self, m: &Media, src: &Source, ep: &str, audio: &str) -> Result<Held, String> {
+        ani::hold_stream(m, src, ep, audio)
+    }
+
+    fn replay(&self, held: &Held, step: &dyn Fn(Option<&'static str>)) -> Replayed {
+        ani::play_held(held, || step(None))
+    }
+
+    fn on_disk(&self, m: &Media, ep: &str) -> Option<PathBuf> {
+        let eps = ani::local_episodes(&ani::folder(m));
+        eps.into_iter().find(|(e, _)| e == ep).map(|f| f.1)
     }
 
     fn file(&self, m: &Media, ep: &str, file: &Path, up: &mut dyn FnMut()) -> Result<(), String> {
@@ -72,6 +97,8 @@ pub struct Playback {
     player: Arc<dyn Player>,
     now: Option<Playing>,
     attempts: u64,
+    /// the stream fetched ahead, if any
+    pub preload: Preload,
 }
 
 /// What enter on an episode does.
@@ -87,12 +114,36 @@ pub enum Start {
 /// An attempt to run in the background, once.
 pub struct Run {
     player: Arc<dyn Player>,
+    preload: Preload,
     show: Media,
     ep: String,
-    file: Option<PathBuf>,
+    /// what the last scan of the download folder said, which it says on the pop-up
+    on_disk: bool,
     lookup: Lookup,
     audio: &'static str,
     pub attempt: u64,
+}
+
+/// Fetching a stream ahead, to run in the background, once.
+pub struct Ahead {
+    player: Arc<dyn Player>,
+    preload: Preload,
+    key: Key,
+    show: Media,
+    src: Source,
+    ep: String,
+    audio: &'static str,
+    focus: Focus,
+}
+
+impl Ahead {
+    /// Blocks in ani-cli's turn, unless the show has left the screen by then.
+    pub fn run(self) {
+        let res = source::in_turn(self.show.id, &self.focus, || {
+            (self.player).hold(&self.show, &self.src, &self.ep, self.audio)
+        });
+        self.preload.done(&self.key, res);
+    }
 }
 
 impl Playback {
@@ -101,7 +152,30 @@ impl Playback {
             player,
             now: None,
             attempts: 0,
+            preload: Preload::new(),
         }
+    }
+
+    /// Fetching episode `ep` of `m` ahead, unless that's there or on its way.
+    pub fn ahead(
+        &self,
+        m: &Media,
+        src: &Source,
+        ep: &str,
+        audio: &'static str,
+        focus: Focus,
+    ) -> Option<Ahead> {
+        let key = Key::new(m.id, ep, audio, src);
+        self.preload.begin(&key).then(|| Ahead {
+            player: self.player.clone(),
+            preload: self.preload.clone(),
+            key,
+            show: m.clone(),
+            src: src.clone(),
+            ep: ep.to_string(),
+            audio,
+            focus,
+        })
     }
 
     /// The episode being started or watched.
@@ -109,14 +183,14 @@ impl Playback {
         self.now.as_ref()
     }
 
-    /// Enter on episode `ep` of `m`: its `file` on disk, else a stream from the source
-    /// `lookup` gets, in `audio`. Waiting on a lookup for this very episode, it goes on with
-    /// the same pop-up.
+    /// Enter on episode `ep` of `m`: its file, if the last scan found it `on_disk`, else a
+    /// stream from the source `lookup` gets, in `audio`. Waiting on a lookup for this very
+    /// episode, it goes on with the same pop-up.
     pub fn start(
         &mut self,
         m: &Media,
         ep: &str,
-        file: Option<PathBuf>,
+        on_disk: bool,
         lookup: Lookup,
         audio: &'static str,
     ) -> Start {
@@ -129,11 +203,11 @@ impl Playback {
         {
             return Start::Busy(p.title.clone());
         }
-        let step = match (&file, &lookup) {
-            (Some(_), _) => "opening the player",
-            (None, Lookup::Resolve) => SEARCHING,
-            (None, Lookup::Check(_)) => "checking the source",
-            (None, Lookup::Ready(_)) => "fetching the stream",
+        let step = match (on_disk, &lookup) {
+            (true, _) => OPENING,
+            (false, Lookup::Resolve) => SEARCHING,
+            (false, Lookup::Check(_)) => "checking the source",
+            (false, Lookup::Ready(_)) => FETCHING,
         };
         self.attempts += 1;
         self.now = Some(Playing {
@@ -146,14 +220,17 @@ impl Playback {
             color: m.cover_image.color.clone(),
             attempt: self.attempts,
         });
-        if file.is_none() && matches!(lookup, Lookup::Resolve) {
+        // shortcut: a file the first scan hasn't got to yet waits for this lookup, and fails with
+        // it offline, until a second enter; a scan takes milliseconds unless the disk sleeps
+        if !on_disk && matches!(lookup, Lookup::Resolve) {
             return Start::Lookup;
         }
         Start::Run(Run {
             player: self.player.clone(),
+            preload: self.preload.clone(),
             show: m.clone(),
             ep: ep.to_string(),
-            file,
+            on_disk,
             lookup,
             audio,
             attempt: self.attempts,
@@ -184,27 +261,38 @@ impl Run {
     /// Blocks until the player closes; `step` hears what it waits on, and None once the
     /// player shows the episode.
     pub fn run(self, step: &dyn Fn(Option<&'static str>)) -> Result<(), String> {
-        let mut up = || step(None);
-        if let Some(file) = &self.file {
-            return self.player.file(&self.show, &self.ep, file, &mut up);
+        // only here, with the pop-up up, as the folder may be on a slow disk
+        if let Some(file) = self.player.on_disk(&self.show, &self.ep) {
+            step(Some(OPENING));
+            return (self.player).file(&self.show, &self.ep, &file, &mut || step(None));
         }
         let src = match self.lookup {
+            // the last scan found a file that's gone
+            Lookup::Ready(src) if self.on_disk => {
+                step(Some(FETCHING));
+                src
+            }
             Lookup::Ready(src) => src,
             lookup => {
                 let src = self.player.locate(&self.show, lookup)?;
-                step(Some("fetching the stream"));
+                step(Some(FETCHING));
                 src
             }
         };
         let show = &self.show;
-        match self
-            .player
-            .stream(show, &src, &self.ep, self.audio, &mut up)
-        {
+        let key = Key::new(show.id, &self.ep, self.audio, &src);
+        if let Some(held) = self.preload.take(&key) {
+            step(Some(OPENING));
+            match self.player.replay(&held, step) {
+                Replayed::Ended(res) => return res,
+                Replayed::TooOld => step(Some(FETCHING)),
+            }
+        }
+        match self.player.stream(show, &src, &self.ep, self.audio, step) {
             // dubs come later or not at all, the subtitled one is the next best
             Err(e) if ani::dub(self.audio) && e.contains("dub") => {
                 step(Some("no dub yet, fetching it with subtitles"));
-                self.player.stream(show, &src, &self.ep, "sub", &mut up)
+                self.player.stream(show, &src, &self.ep, "sub", step)
             }
             res => res,
         }
@@ -220,6 +308,10 @@ mod tests {
     #[derive(Default)]
     struct Script {
         no_dub: bool,
+        /// what's downloaded
+        files: Vec<String>,
+        /// links that are too old by the time they're used
+        old_links: bool,
         played: Mutex<Vec<String>>,
     }
 
@@ -230,17 +322,44 @@ mod tests {
             _: &Source,
             ep: &str,
             audio: &str,
-            up: &mut dyn FnMut(),
+            step: &dyn Fn(Option<&'static str>),
         ) -> Result<(), String> {
             if self.no_dub && audio == "dub" {
                 return Err("No sources found for dub!".into());
             }
-            up();
+            step(None);
             self.played
                 .lock()
                 .unwrap()
                 .push(format!("stream {ep} {audio}"));
             Ok(())
+        }
+
+        fn hold(&self, _: &Media, _: &Source, ep: &str, audio: &str) -> Result<Held, String> {
+            self.played
+                .lock()
+                .unwrap()
+                .push(format!("hold {ep} {audio}"));
+            Ok(Held {
+                args: vec![format!("link {ep}")],
+                subs: None,
+            })
+        }
+
+        fn replay(&self, held: &Held, step: &dyn Fn(Option<&'static str>)) -> Replayed {
+            if self.old_links {
+                return Replayed::TooOld;
+            }
+            step(None);
+            self.played
+                .lock()
+                .unwrap()
+                .push(format!("replay {}", held.args[0]));
+            Replayed::Ended(Ok(()))
+        }
+
+        fn on_disk(&self, _: &Media, ep: &str) -> Option<PathBuf> {
+            self.files.iter().find(|f| *f == ep).map(PathBuf::from)
         }
 
         fn file(&self, _: &Media, ep: &str, _: &Path, up: &mut dyn FnMut()) -> Result<(), String> {
@@ -288,15 +407,18 @@ mod tests {
     fn a_downloaded_episode_plays_its_file_and_a_missing_dub_plays_subtitled() {
         let script = Arc::new(Script {
             no_dub: true,
+            files: vec!["1".into()],
             ..Default::default()
         });
         let mut playback = Playback::new(script.clone());
-        let file = Some(PathBuf::from("Show Episode 1.mp4"));
-        let start = playback.start(&show(), "1", file, Lookup::Resolve, "sub");
-        assert_eq!(playback.now().unwrap().step, Some("opening the player"));
-        assert_eq!(run(&script, start), (vec!["file 1".into()], vec![None]));
+        let start = playback.start(&show(), "1", true, Lookup::Resolve, "sub");
+        assert_eq!(playback.now().unwrap().step, Some(OPENING));
+        assert_eq!(
+            run(&script, start),
+            (vec!["file 1".into()], vec![Some(OPENING), None])
+        );
         playback.ended(playback.now().unwrap().attempt);
-        let start = playback.start(&show(), "2", None, Lookup::Check(source()), "dub");
+        let start = playback.start(&show(), "2", false, Lookup::Check(source()), "dub");
         let (played, steps) = run(&script, start);
         assert_eq!(played, ["stream 2 sub"]);
         let expected = [
@@ -308,29 +430,94 @@ mod tests {
     }
 
     #[test]
+    fn a_file_the_last_scan_missed_still_plays_and_one_gone_since_streams() {
+        let script = Arc::new(Script {
+            files: vec!["1".into()],
+            ..Default::default()
+        });
+        let mut playback = Playback::new(script.clone());
+        let start = playback.start(&show(), "1", false, Lookup::Ready(source()), "sub");
+        assert_eq!(run(&script, start).0, ["file 1"]);
+        playback.ended(playback.now().unwrap().attempt);
+        let start = playback.start(&show(), "2", true, Lookup::Ready(source()), "sub");
+        let (played, steps) = run(&script, start);
+        assert_eq!(played, ["stream 2 sub"]);
+        assert_eq!(steps, [Some(FETCHING), None]);
+    }
+
+    #[test]
+    fn a_stream_fetched_ahead_starts_the_player_without_ani_cli() {
+        let script = Arc::new(Script::default());
+        let mut playback = Playback::new(script.clone());
+        let focus = Focus::default();
+        focus.on_screen(1);
+        let ahead = playback.ahead(&show(), &source(), "2", "sub", focus.clone());
+        ahead.unwrap().run();
+        assert!(
+            (playback.ahead(&show(), &source(), "2", "sub", focus)).is_none(),
+            "it's there"
+        );
+        let start = playback.start(&show(), "2", false, Lookup::Ready(source()), "sub");
+        let (played, steps) = run(&script, start);
+        assert_eq!(played, ["hold 2 sub", "replay link 2"]);
+        assert_eq!(steps, [Some(OPENING), None]);
+    }
+
+    #[test]
+    fn links_too_old_are_fetched_again_and_nothing_counts_as_watched() {
+        let script = Arc::new(Script {
+            old_links: true,
+            ..Default::default()
+        });
+        let mut playback = Playback::new(script.clone());
+        let focus = Focus::default();
+        focus.on_screen(1);
+        (playback
+            .ahead(&show(), &source(), "2", "sub", focus)
+            .unwrap())
+        .run();
+        let start = playback.start(&show(), "2", false, Lookup::Ready(source()), "sub");
+        let (played, steps) = run(&script, start);
+        assert_eq!(played, ["hold 2 sub", "stream 2 sub"]);
+        assert_eq!(steps, [Some(OPENING), Some(FETCHING), None]);
+    }
+
+    #[test]
+    fn a_show_that_left_the_screen_fetches_nothing_ahead() {
+        let script = Arc::new(Script::default());
+        let mut playback = Playback::new(script.clone());
+        let focus = Focus::default();
+        focus.on_screen(99);
+        (playback
+            .ahead(&show(), &source(), "2", "sub", focus)
+            .unwrap())
+        .run();
+        assert!(script.played.lock().unwrap().is_empty());
+        let start = playback.start(&show(), "2", false, Lookup::Ready(source()), "sub");
+        assert_eq!(run(&script, start).0, ["stream 2 sub"]);
+    }
+
+    #[test]
     fn a_second_enter_while_one_starts_opens_no_second_player() {
         let mut playback = Playback::new(Arc::new(Script::default()));
         let ready = || Lookup::Ready(source());
         assert!(matches!(
-            playback.start(&show(), "1", None, ready(), "sub"),
+            playback.start(&show(), "1", false, ready(), "sub"),
             Start::Run(_)
         ));
-        let again = playback.start(&show(), "2", None, ready(), "sub");
+        let again = playback.start(&show(), "2", false, ready(), "sub");
         assert!(matches!(again, Start::Busy(t) if t == "Episode 1 · Show"));
         // once its player is up, another one may start
         let first = playback.now().unwrap().attempt;
         playback.step(first, None);
-        let Start::Run(second) = playback.start(&show(), "1", None, ready(), "sub") else {
+        let Start::Run(second) = playback.start(&show(), "1", false, ready(), "sub") else {
             panic!("not started");
         };
         // and the first player's end leaves the second's pop-up alone
         playback.ended(first);
         playback.step(first, Some("late"));
         let now = playback.now().unwrap();
-        assert_eq!(
-            (now.attempt, now.step),
-            (second.attempt, Some("fetching the stream"))
-        );
+        assert_eq!((now.attempt, now.step), (second.attempt, Some(FETCHING)));
         playback.ended(second.attempt);
         assert!(playback.now().is_none());
     }
@@ -339,12 +526,12 @@ mod tests {
     fn a_play_waiting_on_the_lookup_goes_on_with_the_same_pop_up() {
         let mut playback = Playback::new(Arc::new(Script::default()));
         assert!(matches!(
-            playback.start(&show(), "1", None, Lookup::Resolve, "sub"),
+            playback.start(&show(), "1", false, Lookup::Resolve, "sub"),
             Start::Lookup
         ));
         let since = playback.now().unwrap().since;
         // found: started again, as the same pop-up
-        let start = playback.start(&show(), "1", None, Lookup::Ready(source()), "sub");
+        let start = playback.start(&show(), "1", false, Lookup::Ready(source()), "sub");
         assert!(matches!(start, Start::Run(_)));
         playback.give_up(1);
         assert_eq!(
@@ -354,7 +541,7 @@ mod tests {
         );
         // not found: the wait is over
         playback.ended(playback.now().unwrap().attempt);
-        playback.start(&show(), "2", None, Lookup::Resolve, "sub");
+        playback.start(&show(), "2", false, Lookup::Resolve, "sub");
         playback.give_up(1);
         assert!(playback.now().is_none());
     }

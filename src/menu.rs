@@ -226,6 +226,13 @@ impl Menu {
         self.state.select(Some(next as usize));
     }
 
+    /// The cursor one row down, if there's one: no wrapping round to the first.
+    pub fn down(&mut self) {
+        if let Some(i) = (self.state.selected()).filter(|i| i + 1 < self.matches.len()) {
+            self.state.select(Some(i + 1));
+        }
+    }
+
     fn toggle(&mut self) {
         if let (true, Some(i)) = (self.multi, self.current_index())
             && !self.items[i].action

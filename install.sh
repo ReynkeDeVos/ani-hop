@@ -239,8 +239,13 @@ main() {
 	fi
 	# its mpv script also when ani-skip is packaged but brings none mpv loads
 	if [ -z "$sys_lua" ]; then
-		get "$ANI_SKIP/integrations/mpv.lua" skip.lua
-		place skip.lua "$SKIP_LUA" 644
+		# a script by that name that isn't ani-skip's is the user's own
+		if [ -e "$SKIP_LUA" ] && ! grep -q "$SKIP_MARK" "$SKIP_LUA"; then
+			warn "$SKIP_LUA is another script, so ani-hop left it alone; ani-skip needs its mpv script there to skip openings and endings"
+		else
+			get "$ANI_SKIP/integrations/mpv.lua" skip.lua
+			place skip.lua "$SKIP_LUA" 644
+		fi
 	fi
 
 	if [ "$hop" = "$BIN/ani-hop" ] && [ -z "${ANI_HOP_KEEP-}" ]; then

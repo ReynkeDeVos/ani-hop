@@ -121,12 +121,14 @@ pub fn page(s: &Shown) -> Page {
     }
     if let Some(src) = s.source {
         let n = episodes(src.episodes.len());
-        // a wrong match keeps its title, so it stands out
+        // a wrong match keeps its title, so it stands out; what's still out comes up on a show
+        // that's airing; the show's own title and count say nothing the facts don't
         let line = match same_title(&src.title, m) {
-            true => format!("ani-cli: {n}"),
-            false => format!("ani-cli: {} · {n}", src.title),
+            true if m.episodes == Some(src.episodes.len() as u32) || ep.is_some() => None,
+            true => Some(format!("ani-cli: {n}")),
+            false => Some(format!("ani-cli: {} · {n}", src.title)),
         };
-        lines.push(Line::styled(line, DIM));
+        lines.extend(line.map(|l| Line::styled(l, DIM)));
     }
     let mut about = String::new();
     if let Some(ep) = ep
@@ -427,6 +429,8 @@ fn same_title(source: &str, show: &Media) -> bool {
     let titles = [&show.title.english, &show.title.romaji]
         .into_iter()
         .flatten();
+    // the provider marks a series that also has movies: "Jujutsu Kaisen (TV)"
+    let source = source.strip_suffix(" (TV)").unwrap_or(source);
     (titles.map(String::as_str).chain([show.name()])).any(|t| key(t) == key(source))
 }
 
@@ -597,6 +601,7 @@ mod tests {
         m.title.romaji = Some("Sousou no Frieren".into());
         assert!(same_title("Frieren: Beyond Journey's End", &m)); // ’ and '
         assert!(same_title("SOUSOU NO FRIEREN", &m));
+        assert!(same_title("Sousou no Frieren (TV)", &m));
         assert!(!same_title("Aoki Hagane no Arpeggio: Ars Nova Cadenza", &m));
         assert!(!same_title("Frieren: Beyond Journey's End Season 2", &m));
         assert_eq!(episodes(1), "1\u{a0}episode");
