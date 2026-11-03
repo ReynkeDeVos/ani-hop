@@ -4,9 +4,10 @@
 
 A fast terminal UI for anime: find a show, then stream or download it through [ani-cli](https://github.com/pystardust/ani-cli).
 
-- **No scraper of its own.** Every source comes from `ani-cli`, which a large community keeps working on. When a site changes, updating `ani-cli` is enough. One small exception: an episode `ani-cli` finds no subtitles for gets its English ones from the provider's other server, if that has them.
+- **No scraper of its own.** Every source comes from `ani-cli`, which a large community keeps working on. When a site changes, updating `ani-cli` is enough. One small exception: if `ani-cli` finds no subtitles for an episode, ani-hop gets English fallback subtitles itself.
 - **Posters in the terminal.** In Ghostty and kitty, even inside tmux/herdr, though slower there.
-- **AniList built in.** Your lists, with watched episodes marked. After each episode it asks to save your progress, and "Watched up to…" sets it for many episodes at once.
+- **AniList built in.** Your lists, with watched episodes marked. After each episode it asks to save your progress, and "Watched up to…" sets it for many episodes at once, or back to none.
+- **Jump to related seasons and shows.** A show's page lists its seasons in story order, then its movies, OVAs and side stories.
 - **Find an episode by what happens in it.** The filter searches the titles and summaries of watched episodes. Unwatched ones stay blank, so nothing spoils.
 - **Downloads in the background.** Pause them or quit; unfinished ones come back after a restart.
 - **Sub or dub.** Japanese or English audio, with or without subtitles, for all shows or just one.
@@ -72,4 +73,20 @@ From source: `cargo install --locked --git https://github.com/ReynkeDeVos/ani-ho
 
 [GPL-3.0-or-later](LICENSE)
 
-<sub>Curious how the code is structured? Here is the [architecture diagram](architecture.png).</sub>
+## Inspiration and alternatives
+
+ani-hop was inspired by [viu](https://github.com/viu-media/viu) (formerly FastAnime) and how its interface is structured. Sadly, it isn't being developed anymore.
+
+Looking for alternatives? These are all worth a look:
+
+- [GoAnime](https://github.com/alvarorichard/GoAnime): anime, movies and TV shows from several sources at once, in English and Brazilian Portuguese.
+- [weeb-cli](https://github.com/ewgsta/weeb-cli): sources in four languages, with AniList, MyAnimeList and Kitsu sync.
+- [mal-tui](https://github.com/swstl/mal-tui): a great home for MyAnimeList users.
+- [anitrack](https://github.com/MiguelRegueiro/anitrack-cli): a simple companion that remembers where you stopped in `ani-cli`.
+- [ani-gui](https://github.com/JoaoPucci/ani-gui): a full desktop app with a built-in player and watch parties.
+
+Like mal-tui and anitrack, ani-hop leaves finding streams to `ani-cli`, so when a site changes, updating `ani-cli` is enough. One thing I haven't found in any of them: searching episodes by what happens in them, without spoilers.
+
+<sub>Curious how the code is structured? Here is the architecture diagram:</sub>
+
+<a href="architecture.png"><img src="architecture.png" alt="Architecture diagram: how ani-hop's modules, ani-cli, mpv and AniList fit together" width="240"></a>

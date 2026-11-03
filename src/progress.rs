@@ -31,6 +31,8 @@ pub struct Mark {
     pub to: u32,
     /// the list the entry is on afterwards
     pub status: &'static str,
+    /// none watched, which stays on the list the question showed: it must still be on that one
+    keeps_list: bool,
 }
 
 impl<'a> Progress<'a> {
@@ -137,6 +139,66 @@ impl<'a> Progress<'a> {
         let (p, n) = self.entry(ep);
         let n = ep_num(&n);
         let to = p.episodes.map_or(n, |e| n.min(e as f64)) as u32;
+        Some(self.saving(p, to, status(self.known(p), p.episodes, to)))
+    }
+
+    /// The show and its parts, each with the episodes before it.
+    fn entries(&self) -> impl Iterator<Item = (u32, &'a Media)> {
+        let parts = self.parts.iter().map(|(before, p)| (*before, p));
+        std::iter::once((0, self.show)).chain(parts)
+    }
+
+    /// What going back to no episodes watched saves: for AniList to count none, the show and
+    /// each part it has any of go to 0, one save each. Nothing when it counts none already.
+    pub fn none(&self) -> Vec<Mark> {
+        (self.entries().map(|(_, p)| p))
+            .filter(|p| self.count(p) > 0)
+            .map(|p| Mark {
+                keeps_list: true,
+                ..self.saving(p, 0, stays(self.known(p)))
+            })
+            .collect()
+    }
+
+    /// What `none` changes, in the numbers the episode list has: "Unmarks 1–15 and moves it to
+    /// Watching.", "Unmarks 1–3 and 13–22."
+    pub fn none_also(&self) -> String {
+        let mut spans: Vec<(u32, u32)> = Vec::new();
+        let mut moved = Vec::new();
+        for (before, p) in self.entries() {
+            let n = self.count(p);
+            if n == 0 {
+                continue;
+            }
+            match spans.last_mut() {
+                Some(last) if before <= last.1 => last.1 = last.1.max(before + n),
+                _ => spans.push((before + 1, before + n)),
+            }
+            if self
+                .saving(p, 0, stays(self.known(p)))
+                .list_move()
+                .is_some()
+            {
+                moved.push(if p.id == self.show.id {
+                    "it"
+                } else {
+                    self.part_name(p)
+                });
+            }
+        }
+        let spans: Vec<String> = spans.iter().map(|(a, b)| span(*a, *b)).collect();
+        match moved.as_slice() {
+            [] => format!("Unmarks {}.", spans.join(" and ")),
+            who => format!(
+                "Unmarks {} and moves {} to Watching.",
+                spans.join(" and "),
+                who.join(" and ")
+            ),
+        }
+    }
+
+    /// Progress `to` on entry `p`, the show's or a part's, which is then on list `status`.
+    fn saving(&self, p: &'a Media, to: u32, status: &'static str) -> Mark {
         let part = match p.id == self.show.id {
             true => String::new(),
             false => self.part_name(p).to_string(),
@@ -144,13 +206,14 @@ impl<'a> Progress<'a> {
         let now = self.known(p);
         let mut entry = p.clone();
         entry.media_list_entry = now.cloned();
-        Some(Mark {
+        Mark {
             entry,
             part,
             was: self.count(p),
             to,
-            status: status(now, p.episodes, to),
-        })
+            status,
+            keeps_list: false,
+        }
     }
 
     /// Marking `ep` watched, when that adds anything: asked after playing it.
@@ -160,6 +223,14 @@ impl<'a> Progress<'a> {
 }
 
 impl Mark {
+    /// Whether AniList's Entry `now` isn't what the question showed, whose answer would then
+    /// undo a save it didn't know of, or do something else than it said.
+    pub fn outdated(&self, now: Option<&Entry>) -> bool {
+        let list = |e: Option<&Entry>| e.map(|e| e.status.clone());
+        now.map_or(0, |e| e.progress) != self.was
+            || self.keeps_list && list(now) != list(self.entry.media_list_entry.as_ref())
+    }
+
     /// Whether it changes no other episode, so Yes can go first.
     pub fn only_this(&self) -> bool {
         recounts(self.was, self.to).is_none()
@@ -210,13 +281,28 @@ fn status(entry: Option<&Entry>, episodes: Option<u32>, to: u32) -> &'static str
     }
 }
 
+/// The list an entry is on with no episodes watched. That isn't watching it, so it stays on its
+/// list, unless the list says all of them are.
+fn stays(entry: Option<&Entry>) -> &'static str {
+    match entry.map(|e| e.status.as_str()) {
+        Some("PLANNING") => "PLANNING",
+        Some("PAUSED") => "PAUSED",
+        Some("DROPPED") => "DROPPED",
+        Some("REPEATING") => "REPEATING",
+        _ => "CURRENT",
+    }
+}
+
+fn span(a: u32, b: u32) -> String {
+    match a == b {
+        true => a.to_string(),
+        false => format!("{a}–{b}"),
+    }
+}
+
 /// What saving progress `to` over `from` does to the episodes between, since AniList counts
 /// every one up to the progress as watched.
 fn recounts(from: u32, to: u32) -> Option<String> {
-    let span = |a: u32, b: u32| match a == b {
-        true => a.to_string(),
-        false => format!("{a}–{b}"),
-    };
     match to {
         _ if to > from + 1 => Some(format!("also marks {}", span(from + 1, to - 1))),
         _ if to < from => Some(format!("unmarks {}", span(to + 1, from))),
@@ -272,6 +358,125 @@ mod tests {
         assert_eq!(mark(&watching(1, 12, 6), "5").also(), "Unmarks 6.");
         assert_eq!(mark(&watching(1, 12, 5), "7").also(), "Also marks 6.");
         assert!(Progress::of(&fresh, &[]).mark("SP").is_none());
+    }
+
+    #[test]
+    fn no_episodes_watched_unmarks_all_of_them_on_the_list_it_was_on() {
+        let none = |m: &Media| Progress::of(m, &[]).none();
+        // nothing to go back from: no entry, or one at 0
+        assert!(none(&show(1, 12, None)).is_empty());
+        assert!(none(&watching(1, 12, 0)).is_empty());
+        let k = &none(&watching(1, 12, 1))[0];
+        assert_eq!((k.was, k.to, k.hint()), (1, 0, "0/12".to_string()));
+        assert_eq!(k.status, "CURRENT");
+        let also = |m: &Media| Progress::of(m, &[]).none_also();
+        assert_eq!(
+            also(&watching(1, 12, 1)),
+            "Unmarks 1.",
+            "episode 1 deselected"
+        );
+        let on = |status: &str| {
+            let m = show(1, 12, Some((5, status)));
+            (none(&m).remove(0).status, also(&m))
+        };
+        assert_eq!(on("CURRENT"), ("CURRENT", "Unmarks 1–5.".to_string()));
+        assert_eq!(on("PLANNING"), ("PLANNING", "Unmarks 1–5.".to_string()));
+        assert_eq!(on("PAUSED"), ("PAUSED", "Unmarks 1–5.".to_string()));
+        assert_eq!(on("DROPPED"), ("DROPPED", "Unmarks 1–5.".to_string()));
+        assert_eq!(on("REPEATING"), ("REPEATING", "Unmarks 1–5.".to_string()));
+        // Completed can't say none are watched, which the question says too
+        assert_eq!(
+            on("COMPLETED"),
+            (
+                "CURRENT",
+                "Unmarks 1–5 and moves it to Watching.".to_string()
+            )
+        );
+        // a show that has no episodes on AniList yet isn't Completed by counting none
+        let airing = Media {
+            episodes: Some(0),
+            media_list_entry: watching(1, 12, 3).media_list_entry,
+            ..Default::default()
+        };
+        assert_eq!(Progress::of(&airing, &[]).none()[0].status, "CURRENT");
+        // saved only while it's what the question showed, its list included
+        let k = none(&watching(1, 12, 5)).remove(0);
+        let entry = |progress, status| show(1, 12, Some((progress, status))).media_list_entry;
+        assert!(!k.outdated(entry(5, "CURRENT").as_ref()));
+        assert!(k.outdated(entry(6, "CURRENT").as_ref()));
+        assert!(k.outdated(entry(5, "PAUSED").as_ref()));
+        assert!(k.outdated(None));
+        // a provider's own episode 0 is an episode: marking it still means watching it
+        let planned = show(1, 12, Some((0, "PLANNING")));
+        let k = Progress::of(&planned, &[]).mark("0").unwrap();
+        assert_eq!((k.to, k.status), (0, "CURRENT"));
+        // and an ordinary mark goes by progress alone, as marking moves it anyway
+        assert!(!k.outdated(entry(0, "PAUSED").as_ref()));
+        assert!(k.outdated(entry(1, "PLANNING").as_ref()));
+        assert_eq!(
+            (Progress::of(&show(1, 12, Some((2, "PAUSED"))), &[]).mark("3")).map(|k| k.status),
+            Some("CURRENT")
+        );
+    }
+
+    #[test]
+    fn no_episodes_watched_goes_for_the_parts_too() {
+        // watched counts either the show's progress or its part's: both have to go
+        let mut s3 = watching(1, 12, 12);
+        s3.title.romaji = Some("Attack on Titan Season 3".into());
+        let mut p2 = watching(2, 10, 3);
+        p2.title.romaji = Some("Attack on Titan Season 3 Part 2".into());
+        let parts = [(12, p2)];
+        let marks = Progress::of(&s3, &parts).none();
+        let saved: Vec<(u64, u32, String)> = (marks.iter())
+            .map(|k| (k.entry.id, k.was, k.hint()))
+            .collect();
+        assert_eq!(
+            saved,
+            [
+                (1, 12, "0/12".to_string()),
+                (2, 3, "0/10 to Part 2".to_string())
+            ]
+        );
+        // said in the numbers of the list behind the question
+        assert_eq!(Progress::of(&s3, &parts).none_also(), "Unmarks 1–15.");
+        let mut low = s3.clone();
+        low.media_list_entry = watching(1, 12, 3).media_list_entry;
+        assert_eq!(
+            Progress::of(&low, &parts).none_also(),
+            "Unmarks 1–3 and 13–15."
+        );
+        // progress saved past the show's own episodes before parts counted is one span too
+        let mut past = s3.clone();
+        past.media_list_entry = watching(1, 12, 22).media_list_entry;
+        assert_eq!(Progress::of(&past, &parts).none_also(), "Unmarks 1–22.");
+        // what leaves Completed says which: the show, a part, or both
+        let mut done = s3.clone();
+        done.media_list_entry = show(1, 12, Some((12, "COMPLETED"))).media_list_entry;
+        assert_eq!(
+            Progress::of(&done, &parts).none_also(),
+            "Unmarks 1–15 and moves it to Watching."
+        );
+        let mut p2_done = parts[0].1.clone();
+        p2_done.media_list_entry = show(2, 10, Some((10, "COMPLETED"))).media_list_entry;
+        let both = [(12, p2_done)];
+        assert_eq!(
+            Progress::of(&done, &both).none_also(),
+            "Unmarks 1–22 and moves it and Part 2 to Watching."
+        );
+        // one of them at 0 has nothing to save
+        let mut fresh = watching(1, 12, 0);
+        fresh.title.romaji = s3.title.romaji.clone();
+        let marks = Progress::of(&fresh, &parts).none();
+        assert_eq!(marks.len(), 1);
+        assert_eq!((marks[0].entry.id, marks[0].part.as_str()), (2, "Part 2"));
+        assert_eq!(Progress::of(&fresh, &parts).none_also(), "Unmarks 13–15.");
+        // with both at 0 nothing reads as watched, and it starts over
+        let parts = [(12, watching(2, 10, 0))];
+        let run = Progress::of(&fresh, &parts);
+        assert!(run.none().is_empty());
+        assert!(!run.watched("1") && !run.watched("13"));
+        assert_eq!(run.next(), 1);
     }
 
     #[test]
