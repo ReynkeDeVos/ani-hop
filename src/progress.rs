@@ -31,6 +31,8 @@ pub struct Mark {
     pub to: u32,
     /// the list the entry is on afterwards
     pub status: &'static str,
+    /// none watched: it stays on the list AniList has it on when it saves, not the question's
+    keeps_list: bool,
 }
 
 impl<'a> Progress<'a> {
@@ -151,7 +153,10 @@ impl<'a> Progress<'a> {
     pub fn none(&self) -> Vec<Mark> {
         (self.entries().map(|(_, p)| p))
             .filter(|p| self.count(p) > 0)
-            .map(|p| self.saving(p, 0, stays(self.known(p))))
+            .map(|p| Mark {
+                keeps_list: true,
+                ..self.saving(p, 0, stays(self.known(p)))
+            })
             .collect()
     }
 
@@ -207,6 +212,7 @@ impl<'a> Progress<'a> {
             was: self.count(p),
             to,
             status,
+            keeps_list: false,
         }
     }
 
@@ -217,6 +223,14 @@ impl<'a> Progress<'a> {
 }
 
 impl Mark {
+    /// The list to save it on, with AniList's Entry `now`.
+    pub fn saved_status(&self, now: Option<&Entry>) -> &'static str {
+        match self.keeps_list {
+            true => stays(now),
+            false => self.status,
+        }
+    }
+
     /// Whether it changes no other episode, so Yes can go first.
     pub fn only_this(&self) -> bool {
         recounts(self.was, self.to).is_none()
@@ -385,10 +399,17 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(Progress::of(&airing, &[]).none()[0].status, "CURRENT");
+        // what's saved goes by the list AniList has it on by then
+        let k = none(&watching(1, 12, 5)).remove(0);
+        let paused = show(1, 12, Some((5, "PAUSED")));
+        assert_eq!(k.saved_status(paused.media_list_entry.as_ref()), "PAUSED");
+        let done = show(1, 12, Some((5, "COMPLETED")));
+        assert_eq!(k.saved_status(done.media_list_entry.as_ref()), "CURRENT");
         // a provider's own episode 0 is an episode: marking it still means watching it
         let planned = show(1, 12, Some((0, "PLANNING")));
         let k = Progress::of(&planned, &[]).mark("0").unwrap();
         assert_eq!((k.to, k.status), (0, "CURRENT"));
+        assert_eq!(k.saved_status(planned.media_list_entry.as_ref()), "CURRENT");
         assert_eq!(
             (Progress::of(&show(1, 12, Some((2, "PAUSED"))), &[]).mark("3")).map(|k| k.status),
             Some("CURRENT")

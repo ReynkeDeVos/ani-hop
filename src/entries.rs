@@ -290,8 +290,8 @@ impl Work {
                     now if now.as_ref().map_or(0, |e| e.progress) != k.was => {
                         Ok(Answer::Moved(now))
                     }
-                    _ => (self.anilist)
-                        .save(k.entry.id, Some(k.status), Some(k.to))
+                    now => (self.anilist)
+                        .save(k.entry.id, Some(k.saved_status(now.as_ref())), Some(k.to))
                         .map(saved),
                 },
             }?;
@@ -457,6 +457,16 @@ mod tests {
         let n = entries.finish(done).unwrap();
         assert_eq!(n.text, "Show not saved · AniList has 6/12 now, try again");
         assert_eq!(fake.entry(stale.id).unwrap().unwrap().progress, 6);
+        // another ani-hop moved it to another list since the question: it stays there
+        let moved = watching(70_006, 5);
+        let (fake, mut entries) = anilist(&moved, false);
+        let none = entries.progress(&moved, &[]).none().remove(0);
+        fake.save(moved.id, Some("PAUSED"), None).unwrap();
+        let done = entries.begin(Change::Progress(none)).run();
+        let n = entries.finish(done).unwrap();
+        assert_eq!(n.text, "Saved Show · Paused · 0/12");
+        let now = fake.entry(moved.id).unwrap().unwrap();
+        assert_eq!((now.status.as_str(), now.progress), ("PAUSED", 0));
     }
 
     #[test]
