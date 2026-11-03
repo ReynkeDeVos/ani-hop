@@ -251,6 +251,15 @@ pub fn missing_deps() -> Vec<(&'static str, &'static str, &'static str)> {
 pub const INSTALL_SH: &str =
     "curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh";
 
+/// install.sh for what's missing. It leaves a mise ani-hop alone: a second copy in
+/// ~/.local/bin could come first on PATH, and mise would update one that doesn't run.
+fn install_sh(exe: &Path) -> String {
+    match from_mise(exe) {
+        true => INSTALL_SH.replace("| sh", "| ANI_HOP_KEEP=1 sh"),
+        false => INSTALL_SH.into(),
+    }
+}
+
 fn aur_helper() -> Option<&'static str> {
     ["yay", "paru"].into_iter().find(|h| have(h))
 }
@@ -271,7 +280,7 @@ pub fn install_command(pkgs: &[&str]) -> Option<String> {
         return Some(format!("sudo pacman -S --needed {list}"));
     }
     if cfg!(target_os = "linux") && !from_brew(&exe()) {
-        return Some(INSTALL_SH.into());
+        return Some(install_sh(&exe()));
     }
     let brew: Vec<&str> = pkgs
         .iter()
@@ -367,16 +376,20 @@ fn exe() -> PathBuf {
 
 /// How to update this ani-hop, judged by where it lives.
 pub fn update_command() -> String {
-    let exe = exe();
-    if exe.starts_with(home().join(".local/bin")) {
-        INSTALL_SH.into()
-    } else if from_brew(&exe) {
-        "brew upgrade ani-hop".into()
-    } else if from_mise(&exe) {
+    update_command_for(&exe())
+}
+
+fn update_command_for(exe: &Path) -> String {
+    // first: MISE_DATA_DIR can put it anywhere, even under the paths below
+    if from_mise(exe) {
         // the full name: `mise up ani-hop` matches nothing and says all is up to date
         "mise up github:ReynkeDeVos/ani-hop".into()
+    } else if exe.starts_with(home().join(".local/bin")) {
+        INSTALL_SH.into()
+    } else if from_brew(exe) {
+        "brew upgrade ani-hop".into()
     } else if exe.starts_with("/nix/store") {
-        nix_update(&exe)
+        nix_update(exe)
     } else if exe.starts_with("/usr") {
         system_update()
     } else {
@@ -1380,10 +1393,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_mise_install_is_told_apart_by_its_folder() {
-        let dir = "/home/a/.local/share/mise/installs/github-reynke-de-vos-ani-hop/0.9.0";
-        assert!(from_mise(&Path::new(dir).join("ani-hop")));
-        assert!(!from_mise(Path::new("/home/a/.local/bin/ani-hop")));
+    fn a_mise_install_updates_with_mise_and_keeps_its_ani_hop() {
+        let mise = "mise/installs/github-reynke-de-vos-ani-hop/0.9.0/ani-hop";
+        let up = "mise up github:ReynkeDeVos/ani-hop";
+        for dir in [
+            home().join(".local/share"),
+            home().join(".local/bin"),
+            "/opt/Cellar".into(),
+        ] {
+            assert_eq!(update_command_for(&dir.join(mise)), up);
+            assert!(install_sh(&dir.join(mise)).ends_with("| ANI_HOP_KEEP=1 sh"));
+        }
+        let ours = home().join(".local/bin/ani-hop");
+        assert_eq!(update_command_for(&ours), INSTALL_SH);
+        assert_eq!(install_sh(&ours), INSTALL_SH);
     }
 
     #[test]

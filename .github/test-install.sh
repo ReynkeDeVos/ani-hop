@@ -141,4 +141,13 @@ if grep -q '^ID=arch' /etc/os-release; then
 	[ -x ~tester/.local/bin/ani-hop ] || fail "no ani-hop of ours after the AUR failed"
 fi
 
+step "ANI_HOP_KEEP leaves an ani-hop from elsewhere alone"
+printf '#!/bin/sh\necho ani-hop kept\n' >/usr/local/bin/ani-hop
+chmod 755 /usr/local/bin/ani-hop
+rm -f ~tester/.local/bin/ani-hop
+as_tester 'ANI_HOP_KEEP=1 sh /install.sh' >/tmp/keep.log 2>&1 || { cat /tmp/keep.log; fail "keep run"; }
+cat /tmp/keep.log
+[ ! -e ~tester/.local/bin/ani-hop ] || fail "installed a second ani-hop"
+grep -q 'Done: ani-hop kept' /tmp/keep.log || fail "didn't report the kept ani-hop"
+
 step "PASS"
