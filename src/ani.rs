@@ -325,6 +325,12 @@ fn from_brew(p: &Path) -> bool {
     p.components().any(|c| c.as_os_str() == "Cellar")
 }
 
+/// Installed by `mise use github:ReynkeDeVos/ani-hop`, wherever MISE_DATA_DIR puts it.
+fn from_mise(p: &Path) -> bool {
+    p.components()
+        .any(|c| c.as_os_str() == "github-reynke-de-vos-ani-hop")
+}
+
 /// How to update ani-cli, judged by where it lives (None: only its package manager knows).
 pub fn ani_cli_update() -> Option<String> {
     let path = located("ani-cli")?;
@@ -366,6 +372,9 @@ pub fn update_command() -> String {
         INSTALL_SH.into()
     } else if from_brew(&exe) {
         "brew upgrade ani-hop".into()
+    } else if from_mise(&exe) {
+        // the full name: `mise up ani-hop` matches nothing and says all is up to date
+        "mise up github:ReynkeDeVos/ani-hop".into()
     } else if exe.starts_with("/nix/store") {
         nix_update(&exe)
     } else if exe.starts_with("/usr") {
@@ -1369,6 +1378,13 @@ fn left(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mise_install_is_told_apart_by_its_folder() {
+        let dir = "/home/a/.local/share/mise/installs/github-reynke-de-vos-ani-hop/0.9.0";
+        assert!(from_mise(&Path::new(dir).join("ani-hop")));
+        assert!(!from_mise(Path::new("/home/a/.local/bin/ani-hop")));
+    }
 
     #[test]
     fn keeps_the_newest_entries_of_downloaded_or_queued_shows() {

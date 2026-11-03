@@ -23,6 +23,14 @@ curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh
 
 Installs ani-hop, ani-cli, mpv and the rest. Run it again to update; ani-hop tells you when there's a new version.
 
+### mise, on Linux or macOS (Apple silicon)
+
+```sh
+mise use -g github:ReynkeDeVos/ani-hop
+```
+
+Installs only ani-hop. It checks for ani-cli, mpv and the rest at the start and offers to install what's missing. Update with `mise up github:ReynkeDeVos/ani-hop`. By default, mise only installs releases that are at least a day old.
+
 ### macOS (Apple silicon)
 
 ```sh
