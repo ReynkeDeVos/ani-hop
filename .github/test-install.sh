@@ -105,6 +105,15 @@ as_tester 'sh /install.sh' >/tmp/nolua.log 2>&1 || { cat /tmp/nolua.log; fail "n
 grep -q "read_options" ~tester/.config/mpv/scripts/skip.lua || fail "no skip.lua although mpv has no skip script"
 [ ! -e ~tester/.local/bin/ani-skip ] || fail "ani-skip should still be the package's"
 
+step "a skip.lua of the user's own: left alone"
+as_tester 'printf -- "-- my hotkeys\n" >~/.config/mpv/scripts/skip.lua'
+as_tester 'sh /install.sh' >/tmp/ownlua.log 2>&1 || { cat /tmp/ownlua.log; fail "own-script run"; }
+grep -q 'my hotkeys' ~tester/.config/mpv/scripts/skip.lua || fail "the user's skip.lua was replaced"
+grep -q 'is another script' /tmp/ownlua.log || fail "no word about leaving the user's skip.lua alone"
+as_tester 'rm ~/.config/mpv/scripts/skip.lua'
+as_tester 'sh /install.sh' >/tmp/ownlua2.log 2>&1 || { cat /tmp/ownlua2.log; fail "run after the own script went"; }
+grep -q "read_options" ~tester/.config/mpv/scripts/skip.lua || fail "no skip.lua after the user's went"
+
 step "a packaged ani-cli that's too old: ours again"
 printf '#!/bin/sh\necho 4.10\n' >/usr/bin/ani-cli
 as_tester 'sh /install.sh' >/tmp/old.log 2>&1 || { cat /tmp/old.log; fail "too-old run"; }

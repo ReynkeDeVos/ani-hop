@@ -21,7 +21,7 @@ const SELECTED: Style = Style::new()
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const LOGO: [&str; 2] = ["▄▀█ █▄ █ █ ▄▄ █ █ █▀█ █▀█", "█▀█ █ ▀█ █    █▀█ █▄█ █▀▀"];
 const SHADES: [&str; 4] = ["░", "▒", "▓", "█"];
-const BOOT_MS: u128 = 500;
+const BOOT_MS: u128 = 240;
 const POP_MS: u128 = 160;
 
 pub fn render(app: &mut App, f: &mut Frame) {
@@ -45,9 +45,7 @@ pub fn render(app: &mut App, f: &mut Frame) {
 
 // Effects never hide content for long: speed first, the shine comes on top.
 pub fn effects_running(app: &App) -> bool {
-    app.started.elapsed().as_millis() < BOOT_MS
-        || app.preview.animating()
-        || app.playback.now().is_some_and(|p| p.step.is_some())
+    booting(app) || app.preview.animating() || app.playback.now().is_some_and(|p| p.step.is_some())
 }
 
 /// While an episode starts, a box pops up in the middle with a running bar, so enter
@@ -101,6 +99,11 @@ fn starting(app: &App, f: &mut Frame) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// The start-up sweep plays, until its time is up or a key shows someone's already going.
+fn booting(app: &App) -> bool {
+    !app.pressed && app.started.elapsed().as_millis() < BOOT_MS
+}
+
 /// How far a left-to-right front with a `band`-wide tail has passed `x`, at progress `t`.
 pub fn swept(t: f32, x: u16, width: u16, band: f32) -> f32 {
     t * (width as f32 + band) - x as f32
@@ -109,11 +112,11 @@ pub fn swept(t: f32, x: u16, width: u16, band: f32) -> f32 {
 /// Start-up: every glyph runs ░▒▓█ behind a sweeping front, then turns into the real UI.
 /// Image cells stay untouched: the Kitty image travels inside them and is sent only once.
 fn boot(app: &App, buf: &mut Buffer) {
-    let t = app.started.elapsed().as_millis() as f32 / BOOT_MS as f32;
-    let area = buf.area;
-    if t >= 1.0 {
+    if !booting(app) {
         return;
     }
+    let t = app.started.elapsed().as_millis() as f32 / BOOT_MS as f32;
+    let area = buf.area;
     for (x, y) in area.positions().map(|p| (p.x, p.y)) {
         let cell = &mut buf[(x, y)];
         let d = swept(t, x, area.width, 25.0);
@@ -371,8 +374,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         };
         Some((
             key,
-            p.step
-                .map_or("▶ playing".into(), |s| format!("{spin} {s}…")),
+            p.step.map_or("playing".into(), |s| format!("{spin} {s}…")),
         ))
     });
     // and the next page right on "More…"
@@ -392,7 +394,18 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
             };
             let mut spans = vec![Span::styled(mark, Color::Green), " ".into()];
             let plain = if item.done { SOFT } else { Style::new() };
-            let room = titles.then_some(width - 2);
+            // a title makes room for what's short and always worth seeing (a show's progress),
+            // unless too little of the title would be left to tell which show it is
+            let short = match item.short.as_str() {
+                "" => 0,
+                s => Span::raw(s).width() + 1,
+            };
+            let room = titles
+                .then_some((width - 2).saturating_sub(short))
+                .map(|r| match r {
+                    r if r >= 20 => r,
+                    _ => width - 2,
+                });
             spans.extend(row_label(&item.label, hits, plain, room));
             let mut used: usize = spans.iter().map(|s| s.width()).sum();
             // a title too long for the row ends in "…", like a cut hint
@@ -405,7 +418,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 spans.push(Span::styled("…", plain));
                 used += 1;
             }
-            let room = width.saturating_sub(used + 2);
+            let room = width.saturating_sub(used + 1);
             let (hint, color) = match &busy {
                 Some((key, text)) if *key == item.key => (text.clone(), ACCENT),
                 _ => (item.hint.clone(), DIM),
@@ -552,7 +565,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         | View::Confirm(Pending::Remove(m) | Pending::Stop(m, _) | Pending::Pause(m, _)) => {
             Some(m.clone())
         }
-        View::Confirm(Pending::Progress(marks)) => marks.first().map(|k| k.entry.clone()),
+        View::Confirm(Pending::Progress(marks, _)) => marks.first().map(|k| k.entry.clone()),
         _ => None,
     };
     // posters just below the cursor load ahead, so scrolling shows them instantly
@@ -746,24 +759,23 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
             Span::styled(also, DIM),
         ])
     };
-    let mut v = vec![Line::styled(
-        format!("↓ downloads go to {}", ani::tilde(&ani::download_root())),
-        DIM,
-    )];
+    let mut v = Vec::new();
     if let Some((new, cmd)) = &app.release {
         v.push(Line::styled(
             format!("↑ ani-hop {new} is out: {cmd}"),
             ACCENT,
         ));
     }
-    // on an input typing is the text itself, and there's nothing to mark; on an empty list
-    // only esc and ^c do something, and the footer has them
+    // on an input typing is the text itself; on an empty list only esc and ^c do something.
+    // Only what nothing else says: the footer and the preview's border name the other keys
+    // where they work
     let top = app.stack.last().unwrap();
     if !matches!(top.view, View::Input(_)) && !top.menu.items.is_empty() {
-        // grouped by what they're for, the everyday ones first; the arrows lead, as esc
-        // clears a filter before it goes back
+        // the arrows lead, as esc clears a filter before it goes back
+        if !v.is_empty() {
+            v.push("".into());
+        }
         v.extend([
-            "".into(),
             key("↑ ↓", "move", "^k ^j"),
             key("→", "select", "enter ^l"),
             key("←", "back", "^h"),
@@ -772,12 +784,6 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
             // 40 columns, all 80 leave the preview
             Line::styled(format!("{:12}'word ^start end$ !not a | b", ""), DIM),
             key("esc", "clear the filter, then back", ""),
-            "".into(),
-            key("tab", "mark for bulk actions", ""),
-            key("^a", "mark all", ""),
-            key("^f", "load more shows", ""),
-            key("shift ↑↓", "scroll the preview", ""),
-            key("^c", "quit", ""),
         ]);
     }
     let below = Paragraph::new(v.clone()).wrap(Wrap { trim: false });
@@ -825,7 +831,8 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
             })
             .collect::<Vec<_>>(),
     );
-    let toast = app.toast.as_ref().filter(|t| t.2.elapsed().as_secs() < 4);
+    // what went wrong stays until a key: it may have happened while the player had the screen
+    let toast = (app.toast.as_ref()).filter(|t| t.1 || t.2.elapsed().as_secs() < 4);
     // read once: the worker can take the last one off between two reads
     let dl = app.downloads.snapshot();
     let n = dl.pending;
@@ -869,7 +876,8 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         _ => Line::default(),
     };
     // a toast that doesn't fit beside the hints gets the line until it fades
-    let crowded = toast.is_some() && status.width() + hints.width() > area.width as usize;
+    // and the column between them
+    let crowded = toast.is_some() && status.width() + hints.width() + 1 > area.width as usize;
     let hints_width = if crowded { 0 } else { hints.width() as u16 };
     // a column between them, so a cut status line doesn't run into the keys
     let [status_area, hints_area] =

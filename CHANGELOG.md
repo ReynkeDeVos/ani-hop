@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.10.0 – 2026-11-03
+
+### Added
+
+- Settings has "Preload next episode", off by default. Turned on, ani-hop gets the next episode's stream ready while its show's page is open, so enter starts the player at once. On a fast connection, after 3 seconds on the page, the first frame came after 1.1 seconds instead of 2.4. It uses a little more data: a few small requests to the provider, no video, also for an episode you don't end up playing. It works with plain mpv, not with a player set in `ANI_CLI_PLAYER`.
+
+### Changed
+
+- The main menu is easier to read. "My list ·" is gone, Search… moves up under Watching and Planning, and the rest sit under "Browse" and "Other lists". Typing "my list" still finds your lists.
+- The start screen lists only the keys nothing else explains. The footer and the Preview's border name the others where they work. The download folder is in Settings.
+- Lists keep a show's progress next to a long title at 80 columns: "Attack on Titan…Part 2 1/12".
+- After saving an episode on an episode list, the cursor moves to the next one, so enter plays it. Saving on a show's page, Continue waits for the save, so it can't replay the episode you just marked.
+- The pop-up says "opening the player" once mpv starts. It used to say "fetching the stream" until the episode showed.
+- The start-up animation takes half as long, and any key ends it.
+- The Preview's `ani-cli:` line only shows when it adds something: another title, or a count that differs from AniList's. A trailing "(TV)" no longer counts as another title.
+- Errors stay in the footer until the next key, as one can come while the player has the screen. A success message no longer replaces one you haven't seen.
+- The footer says "enter play" on a show's ▶ row, the Settings row says "log in", and the error for a missing stream is short enough for 80 columns: "no sub stream ani-cli can play".
+- Quitting with the player open asks first, and closes the player. Before, it stayed open with nothing left to ask about saving the episode.
+- On a mise install, the update notice says `mise up github:ReynkeDeVos/ani-hop`, and the command for missing tools leaves ani-hop to mise.
+
+### Fixed
+
+- An episode past a show's own count could save to the wrong entry. With AniList's parts not known yet, episode 13 of a season split 12+10 saved the first part as 12/12. The question now waits until AniList has said which part it's in, and says so if AniList doesn't answer. "Watched up to…" waits too.
+- Deleting a show could cut off a download of it in another ani-hop. A show that's downloading now stays whole, and ani-hop says so.
+- A resumed download could go on from another source than it started with, and leave a broken file. The queue now remembers the source. If the provider no longer has it there, the episode starts over.
+- A download queue ani-hop couldn't read was deleted as if it were empty. It stays now, and ani-hop says where it is.
+- `install.sh` replaced any `skip.lua` in mpv's scripts folder. One that isn't ani-skip's now stays, with a warning.
+- Starting a second ani-hop could break the first one for a moment, as it rewrote the helper scripts in place. At worst, it asked to mark an episode that never played.
+- A session left open for a long time could play the wrong show once the provider's order shifted. A source is checked again after 30 minutes, and a download checks its source each time it starts or resumes.
+- A source picked by hand could lose to the old one after a restart, if ani-hop quit before looking it up.
+- A sleeping USB disk or an unreachable NAS froze the screen on opening a show or pressing Continue, and while a download got its folder ready. Those folders are read in the background now, and the pop-up comes first.
+- A stalled ani-skip could leave the pop-up up for good. A downloaded episode now plays without skipping after 5 seconds, and ani-cli gets a minute to reach the player.
+- Logging out said "Logged out" even when the saved login couldn't be deleted, and the next start logged back in. Now it says it couldn't, and stays logged in.
+- A show titled ".." could download into the folder above the download folder.
+- Going past shows quickly made the next one wait for their lookups. A lookup now starts after a short rest and gives up once its show has left the screen. Enter skips the rest.
+- Enter right after opening a show searched the provider twice. It now waits for the lookup already running, and if that fails, plays from the source it knew, without a false error.
+- Saving an episode could undo a list change made elsewhere since. The save is refused now, and says where the show is: "not saved · it's on Dropped now, try again".
+- Two ani-hops changing an audio choice or a picked source at once could lose one of the changes.
+- A second show with the same name could take a folder that belonged to a third show.
+
 ## 0.9.0 – 2026-11-03
 
 ### Added

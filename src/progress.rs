@@ -31,8 +31,6 @@ pub struct Mark {
     pub to: u32,
     /// the list the entry is on afterwards
     pub status: &'static str,
-    /// none watched, which stays on the list the question showed: it must still be on that one
-    keeps_list: bool,
 }
 
 impl<'a> Progress<'a> {
@@ -153,10 +151,7 @@ impl<'a> Progress<'a> {
     pub fn none(&self) -> Vec<Mark> {
         (self.entries().map(|(_, p)| p))
             .filter(|p| self.count(p) > 0)
-            .map(|p| Mark {
-                keeps_list: true,
-                ..self.saving(p, 0, stays(self.known(p)))
-            })
+            .map(|p| self.saving(p, 0, stays(self.known(p))))
             .collect()
     }
 
@@ -212,7 +207,6 @@ impl<'a> Progress<'a> {
             was: self.count(p),
             to,
             status,
-            keeps_list: false,
         }
     }
 
@@ -228,7 +222,7 @@ impl Mark {
     pub fn outdated(&self, now: Option<&Entry>) -> bool {
         let list = |e: Option<&Entry>| e.map(|e| e.status.clone());
         now.map_or(0, |e| e.progress) != self.was
-            || self.keeps_list && list(now) != list(self.entry.media_list_entry.as_ref())
+            || list(now) != list(self.entry.media_list_entry.as_ref())
     }
 
     /// Whether it changes no other episode, so Yes can go first.
@@ -399,7 +393,8 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(Progress::of(&airing, &[]).none()[0].status, "CURRENT");
-        // saved only while it's what the question showed, its list included
+        // saved only while it's what the question showed, its list included: the question
+        // says what the save moves it from
         let k = none(&watching(1, 12, 5)).remove(0);
         let entry = |progress, status| show(1, 12, Some((progress, status))).media_list_entry;
         assert!(!k.outdated(entry(5, "CURRENT").as_ref()));
@@ -410,8 +405,9 @@ mod tests {
         let planned = show(1, 12, Some((0, "PLANNING")));
         let k = Progress::of(&planned, &[]).mark("0").unwrap();
         assert_eq!((k.to, k.status), (0, "CURRENT"));
-        // and an ordinary mark goes by progress alone, as marking moves it anyway
-        assert!(!k.outdated(entry(0, "PAUSED").as_ref()));
+        assert!(!k.outdated(entry(0, "PLANNING").as_ref()));
+        // an ordinary mark too: dropped elsewhere since, saving mustn't undo that unasked
+        assert!(k.outdated(entry(0, "PAUSED").as_ref()));
         assert!(k.outdated(entry(1, "PLANNING").as_ref()));
         assert_eq!(
             (Progress::of(&show(1, 12, Some((2, "PAUSED"))), &[]).mark("3")).map(|k| k.status),

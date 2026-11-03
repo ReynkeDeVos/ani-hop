@@ -63,7 +63,8 @@ pub struct Entries {
     known: HashMap<u64, Known>,
     /// the Entries kept for the Downloads list as last read (`catch_up`), by any ani-hop
     kept: ani::Learnt,
-    pending: usize,
+    /// the shows whose writes are on their way, once per write
+    saving: Vec<u64>,
 }
 
 /// When a read was asked for: what it brings is older than what was saved or read after it.
@@ -112,7 +113,7 @@ impl Entries {
             login: 0,
             known: HashMap::new(),
             kept: ani::learnt(),
-            pending: 0,
+            saving: Vec::new(),
         }
     }
 
@@ -144,7 +145,7 @@ impl Entries {
 
     /// Writes still out, which quitting would cut short.
     pub fn pending(&self) -> usize {
-        self.pending
+        self.saving.len()
     }
 
     /// Taken right before AniList is asked for shows.
@@ -186,9 +187,14 @@ impl Entries {
         true
     }
 
+    /// A write of `m`'s Entry is on its way.
+    pub fn saving(&self, m: &Media) -> bool {
+        self.saving.contains(&m.id)
+    }
+
     /// A write to run in the background; its answer goes to `finish`.
     pub fn begin(&mut self, change: Change) -> Work {
-        self.pending += 1;
+        self.saving.push(change.show().id);
         Work {
             anilist: self.anilist.clone(),
             login: self.login,
@@ -199,7 +205,13 @@ impl Entries {
     /// Takes a write's answer: AniList's Entry now, for every reader, and what to say. None
     /// for an earlier login's write, which changes nothing here.
     pub fn finish(&mut self, done: Done) -> Option<Notice> {
-        self.pending -= 1;
+        if let Some(i) = self
+            .saving
+            .iter()
+            .position(|id| *id == done.change.show().id)
+        {
+            self.saving.swap_remove(i);
+        }
         if done.login != self.login {
             return None;
         }
@@ -491,8 +503,10 @@ mod tests {
         let done = entries.begin(Change::Progress(k)).run();
         entries.login(fake.clone());
         assert_eq!(entries.pending(), 1);
+        assert!(entries.saving(&copy) && !entries.saving(&watching(70_003, 1)));
         assert!(entries.finish(done).is_none(), "no toast, no closed screen");
         assert_eq!(entries.pending(), 0, "and nothing left to wait for");
+        assert!(!entries.saving(&copy));
         assert_eq!(entries.entry(&copy).unwrap().progress, 5);
         assert!(!entries.observe(asked, &mut [watching(70_002, 6)]));
         assert_eq!(entries.entry(&copy).unwrap().progress, 5);

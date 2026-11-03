@@ -14,9 +14,10 @@ use std::fs;
 use std::io::{BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 const FAKE_ROFI: &str = r#"#!/bin/sh
 # ani-hop: captures ani-cli's menu instead of showing one
@@ -66,7 +67,13 @@ case " $* " in
 *" --sub-file="*) ;;
 *) [ -n "$ANIHOP_SUBS_PAGE" ] && ani-hop-subs "$ANIHOP_SUBS_PAGE" "$ANIHOP_SUBS_FILE" && set -- --sub-file="$ANIHOP_SUBS_FILE" "$@" ;;
 esac
+# fetched ahead: what mpv would start with goes in a file, for when the episode is wanted
+if [ -n "$ANIHOP_HOLD" ]; then
+	printf '%s\0' "$@" >"$ANIHOP_HOLD.$$" && mv -f "$ANIHOP_HOLD.$$" "$ANIHOP_HOLD"
+	exit
+fi
 PATH=${PATH#"${0%/*}:"}
+echo ani-hop-player-starts
 exec mpv "$@"
 "#;
 
@@ -453,8 +460,7 @@ pub fn setup() -> std::io::Result<()> {
         ("mpv", FAKE_MPV),
         ("ani-hop-subs", FAKE_SUBS),
     ] {
-        fs::write(bin.join(name), script)?;
-        fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755))?;
+        write_helper(&bin.join(name), script)?;
     }
     let run = run_dir();
     fs::create_dir_all(&run)?;
@@ -465,6 +471,7 @@ pub fn setup() -> std::io::Result<()> {
     let _ = lock.lock(); // where locks don't work, held() takes every ani-hop for alive
     fs::rename(&tmp, run.join(format!("{me}.lock")))?;
     let _ = ALIVE.set(lock);
+    clear_leftovers(&cache_dir().join("probe"));
     for p in fs::read_dir(&run)?.flatten().map(|e| e.path()) {
         let pid = p.file_stem().unwrap_or_default().to_string_lossy();
         if p.extension().is_some_and(|x| x == "lock") && !running(&pid) {
@@ -473,6 +480,135 @@ pub fn setup() -> std::io::Result<()> {
     }
     Ok(())
 }
+
+/// Removes what ani-hops that are gone left in the folder ani-cli works in: only the files
+/// with their pid in the name, as ani-cli keeps its history there.
+fn clear_leftovers(dir: &Path) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for p in rd.flatten().map(|e| e.path()) {
+        let name = p.file_name().unwrap_or_default().to_string_lossy();
+        let pid = (["menu-", "held-", "subs-"].iter())
+            .find_map(|kind| name.strip_prefix(kind))
+            .and_then(|rest| rest.split('-').next());
+        if pid.is_some_and(|pid| !running(pid)) {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
+/// Puts a helper script in place, unless it's there already: another ani-hop may be running it
+/// right now, and one rewritten in place would be busy or empty for that moment. An empty
+/// helper exits as if all went well.
+fn write_helper(path: &Path, script: &str) -> std::io::Result<()> {
+    let runs = |p: &Path| fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 == 0o111);
+    if runs(path) && fs::read(path).is_ok_and(|now| now == script.as_bytes()) {
+        return Ok(());
+    }
+    let tmp = path.with_extension(format!("{}.tmp", std::process::id()));
+    let res = fs::write(&tmp, script)
+        .and_then(|()| fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755)))
+        .and_then(|()| fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    res
+}
+
+/// The players running, ani-cli under them too: quitting closes them.
+static PLAYERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// ani-cli fetching a stream ahead, which quitting ends too.
+static AHEAD: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+fn pids(list: &'static Mutex<Vec<u32>>) -> std::sync::MutexGuard<'static, Vec<u32>> {
+    list.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A process on one of those lists until this is dropped.
+struct Listed(&'static Mutex<Vec<u32>>, u32);
+
+impl Listed {
+    fn on(list: &'static Mutex<Vec<u32>>, child: &Child) -> Listed {
+        pids(list).push(child.id());
+        Listed(list, child.id())
+    }
+}
+
+impl Drop for Listed {
+    fn drop(&mut self) {
+        pids(self.0).retain(|p| *p != self.1);
+    }
+}
+
+/// Whether a player is open: an earlier one can be, after a later one closed.
+pub fn player_open() -> bool {
+    !pids(&PLAYERS).is_empty()
+}
+
+/// Closes the players, as ani-hop quits: nothing would be left to ask about saving the episode.
+pub fn close_players() {
+    let all: Vec<u32> = [&PLAYERS, &AHEAD]
+        .into_iter()
+        .flat_map(|list| pids(list).drain(..).collect::<Vec<_>>())
+        .collect();
+    all.into_iter().for_each(end);
+}
+
+/// Ends a process and everything under it, as it ends a stalled ani-cli or a download. The
+/// process first: ani-cli holds the signal until yt-dlp is gone and then exits, while signalled
+/// after yt-dlp, it falls back to ffmpeg and keeps downloading.
+pub fn end(pid: u32) {
+    // collected first: once their parent is gone they can't be found through it
+    fn under(pid: &str, all: &mut Vec<String>) {
+        let found = Command::new("pgrep")
+            .args(["-P", pid])
+            .stderr(Stdio::null())
+            .output();
+        let found = found.map_or(String::new(), |o| {
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        });
+        for child in found.split_whitespace() {
+            all.push(child.to_string());
+            under(child, all);
+        }
+    }
+    let pid = pid.to_string();
+    let mut all = Vec::new();
+    under(&pid, &mut all);
+    // without stderr: one that just ended would print "No such process" over the screen
+    let term = |pid: &str| {
+        let _ = (Command::new("kill").args(["-TERM", pid]))
+            .stderr(Stdio::null())
+            .status();
+    };
+    term(&pid);
+    all.iter().for_each(|p| term(p));
+}
+
+/// What `cmd` wrote and how it ended, within `limit`: a helper that stalls is ended, and mustn't
+/// hold up what waits for it. None past that, or when it can't start.
+pub fn output_within(cmd: &mut Command, limit: Duration) -> Option<Output> {
+    let child = (cmd.stdout(Stdio::piped()).stderr(Stdio::piped()))
+        .spawn()
+        .ok()?;
+    wait_within(child, limit)
+}
+
+fn wait_within(child: Child, limit: Duration) -> Option<Output> {
+    let pid = child.id();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || _ = tx.send(child.wait_with_output()));
+    let out = rx.recv_timeout(limit);
+    if out.is_err() {
+        end(pid);
+    }
+    out.ok()?.ok()
+}
+
+/// How long ani-cli gets to reach the player or a menu: every one of its requests has a limit,
+/// but ani-skip's doesn't, and a stalled one would leave the pop-up up for good.
+const ANI_CLI_LIMIT: Duration = Duration::from_secs(60);
 
 pub fn ani_cli() -> Command {
     let path = format!(
@@ -549,9 +685,8 @@ pub fn last_error(stderr: &[u8]) -> String {
             let mode =
                 (last.strip_prefix("No sources found for ")).and_then(|m| m.strip_suffix('!'));
             match mode {
-                Some(mode) => format!(
-                    "the provider has no {mode} stream ani-cli can play (none, or only on servers it can't read)"
-                ),
+                // what's after "Couldn't play episode 2 · " fits 80 columns
+                Some(mode) => format!("no {mode} stream ani-cli can play"),
                 None => last.into(),
             }
         }
@@ -588,10 +723,25 @@ pub fn follow(mut child: Child, mut line: impl FnMut(&str)) -> (bool, Vec<u8>) {
     (ok, err_reader.join().unwrap_or_default())
 }
 
+/// What FAKE_MPV says right before it starts mpv.
+const PLAYER_STARTS: &str = "ani-hop-player-starts";
+
+/// How long ani-skip gets to say an episode's times, before a downloaded episode plays anyway.
+const SKIP_LIMIT: Duration = Duration::from_secs(5);
+
 /// mpv prints "VO: [gpu-next] 1920x1080 ..." once its window opens.
 fn player_up(line: &str, up: &mut impl FnMut()) {
     if line.starts_with("VO:") {
         up();
+    }
+}
+
+/// What a stream waits on, from ani-cli's output: FAKE_MPV says when it starts mpv, which takes
+/// a moment longer than everything before it to show the episode.
+fn stream_step(line: &str, step: &dyn Fn(Option<&'static str>)) {
+    match line {
+        PLAYER_STARTS => step(Some(crate::playback::OPENING)),
+        line => player_up(line, &mut || step(None)),
     }
 }
 
@@ -605,6 +755,19 @@ pub fn set_skip(on: bool) -> std::io::Result<()> {
     match on {
         true => fs::remove_file(off),
         false => fs::create_dir_all(config_dir()).and_then(|()| fs::write(off, "")),
+    }
+}
+
+/// Whether the next episode's stream is fetched ahead (Settings): off saves the requests.
+pub fn preload_on() -> bool {
+    config_dir().join("preload").exists()
+}
+
+pub fn set_preload(on: bool) -> std::io::Result<()> {
+    let flag = config_dir().join("preload");
+    match on {
+        true => fs::create_dir_all(config_dir()).and_then(|()| fs::write(flag, "")),
+        false => fs::remove_file(flag),
     }
 }
 
@@ -664,9 +827,9 @@ fn subs(audio: &str) -> bool {
 }
 
 pub fn set_audio(id: Option<u64>, audio: &str) -> std::io::Result<()> {
-    let mut all = choices();
-    choose(&mut all, id, audio);
-    write_json(&audio_path(), &all)
+    edit_json(&audio_path(), |all: &mut HashMap<String, String>| {
+        choose(all, id, audio)
+    })
 }
 
 /// A show keeps a choice of its own only while it differs from the default.
@@ -709,27 +872,23 @@ fn subs_page(m: &Media, src: &Source, ep: &str, dub: bool) -> Option<String> {
     })
 }
 
-/// Streams through ani-cli (with ani-skip); `up` is called once mpv shows the episode.
-pub fn stream(
-    m: &Media,
-    src: &Source,
-    ep: &str,
-    audio: &str,
-    mut up: impl FnMut(),
-) -> Result<(), String> {
+/// The player the user picked, if not plain mpv: ani-cli would take IINA on macOS and Windows'
+/// mpv.exe under WSL, so it's asked for by name.
+fn own_player() -> Option<String> {
+    let player = std::env::var("ANI_CLI_PLAYER").ok();
+    player.filter(|p| !p.is_empty() && p != "mpv")
+}
+
+/// ani-cli set up to take episode `ep` of `src` to the player (with ani-skip), and the file
+/// the player will read subtitles from, if ani-cli finds none.
+fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, Option<PathBuf>) {
     let mut flags = std::env::var("ANI_CLI_PLAYER_FLAGS").unwrap_or_default();
-    // mpv unless the user picked another: ani-cli would take IINA on macOS and Windows'
-    // mpv.exe under WSL
-    let player = std::env::var("ANI_CLI_PLAYER")
-        .ok()
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| "mpv".into());
+    let player = own_player().unwrap_or_else(|| "mpv".into());
     // an mpv flag, other players ani-cli knows (vlc, syncplay) don't start with it
     if player.contains("mpv") && !subs(audio) {
         flags.push_str(" --sub-visibility=no");
     }
     let mut cli = ani_cli();
-    // gone once the player is, which read it at the start
     let subs = subs_page(m, src, ep, dub(audio)).map(|page| {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -739,8 +898,7 @@ pub fn stream(
             .env("ANIHOP_SUBS_PAGE", page);
         file
     });
-    let child = cli
-        .env("ANI_CLI_PLAYER", player)
+    cli.env("ANI_CLI_PLAYER", player)
         .env("ANI_CLI_MODE", mode(dub(audio)))
         .env("ANI_CLI_PLAYER_FLAGS", flags)
         // ani-cli stops when --skip finds no ani-skip, and ani-skip is optional
@@ -754,16 +912,144 @@ pub fn stream(
             &plain(&src.query),
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("ani-cli: {e}"))?;
-    let played = follow(child, |l| player_up(l, &mut up));
+        .stderr(Stdio::piped());
+    (cli, subs)
+}
+
+/// Streams through ani-cli (with ani-skip); `step` hears when mpv starts, and None once it
+/// shows the episode.
+pub fn stream(
+    m: &Media,
+    src: &Source,
+    ep: &str,
+    audio: &str,
+    step: &dyn Fn(Option<&'static str>),
+) -> Result<(), String> {
+    let (mut cli, subs) = stream_command(m, src, ep, audio);
+    let child = cli.spawn().map_err(|e| format!("ani-cli: {e}"))?;
+    let _player = Listed::on(&PLAYERS, &child);
+    // up to mpv only: another player may never say it's there, and one playing mustn't be ended
+    let started = Arc::new(AtomicBool::new(own_player().is_some()));
+    let stalled = Arc::new(AtomicBool::new(false));
+    let watch = (started.clone(), stalled.clone(), child.id());
+    std::thread::spawn(move || {
+        let (started, stalled, pid) = watch;
+        let since = std::time::Instant::now();
+        while !started.load(Ordering::Relaxed) {
+            if since.elapsed() > ANI_CLI_LIMIT {
+                stalled.store(true, Ordering::Relaxed);
+                return end(pid);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+    let played = follow(child, |l| {
+        if l == PLAYER_STARTS || l.starts_with("VO:") {
+            started.store(true, Ordering::Relaxed);
+        }
+        stream_step(l, step)
+    });
+    started.store(true, Ordering::Relaxed);
+    // gone once the player is, which read it at the start
     if let Some(file) = subs {
         let _ = fs::remove_file(file);
     }
     match played {
         (true, _) => Ok(()),
+        (false, _) if stalled.load(Ordering::Relaxed) => {
+            Err("ani-cli didn't answer for a minute".into())
+        }
         (false, stderr) => Err(last_error(&stderr)),
+    }
+}
+
+/// A stream's way into mpv, fetched ahead: what ani-cli would start it with, the links and
+/// ani-skip's times among them, as separate arguments, never through a shell.
+pub struct Held {
+    pub(crate) args: Vec<String>,
+    /// the subtitles those name, if ani-hop-subs had to fetch them: gone with this
+    pub(crate) subs: Option<PathBuf>,
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        if let Some(file) = &self.subs {
+            let _ = fs::remove_file(file);
+        }
+    }
+}
+
+/// How a stream fetched ahead went.
+pub enum Replayed {
+    Ended(Result<(), String>),
+    /// mpv never showed it and failed: its links are too old, nothing was watched
+    TooOld,
+}
+
+/// Whether a stream can be fetched ahead: another player may take other arguments, or none of
+/// these.
+pub fn can_hold() -> bool {
+    own_player().is_none()
+}
+
+/// Runs ani-cli up to where it would start mpv, and keeps what it would start it with.
+pub fn hold_stream(m: &Media, src: &Source, ep: &str, audio: &str) -> Result<Held, String> {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let (mut cli, subs) = stream_command(m, src, ep, audio);
+    let name = format!(
+        "held-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    );
+    let file = cache_dir().join("probe").join(name);
+    cli.env("ANIHOP_HOLD", &file)
+        // nothing's watched yet
+        .env("ANI_CLI_HIST_DIR", cache_dir().join("probe"));
+    // from here on the subtitles go with it, also when it fails
+    let mut held = Held {
+        args: Vec::new(),
+        subs,
+    };
+    let child = cli.spawn().map_err(|e| format!("ani-cli: {e}"))?;
+    let _listed = Listed::on(&AHEAD, &child);
+    let out = wait_within(child, ANI_CLI_LIMIT).ok_or("ani-cli didn't answer for a minute")?;
+    let args = fs::read(&file);
+    let _ = fs::remove_file(&file);
+    match args {
+        Ok(args) if out.status.success() => {
+            let args = args.split(|b| *b == 0).filter(|a| !a.is_empty());
+            held.args = args
+                .map(|a| String::from_utf8_lossy(a).into_owned())
+                .collect();
+            Ok(held)
+        }
+        _ => Err(last_error(&out.stderr)),
+    }
+}
+
+/// Starts mpv with what `hold_stream` kept.
+pub fn play_held(held: &Held, mut up: impl FnMut()) -> Replayed {
+    let child = (Command::new("mpv").args(&held.args))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let child = match child {
+        Ok(child) => child,
+        Err(e) => return Replayed::Ended(Err(format!("mpv: {e}"))),
+    };
+    let _player = Listed::on(&PLAYERS, &child);
+    let mut shown = false;
+    let played = follow(child, |l| {
+        player_up(l, &mut || {
+            shown = true;
+            up()
+        })
+    });
+    match played {
+        (true, _) => Replayed::Ended(Ok(())),
+        (false, _) if !shown => Replayed::TooOld,
+        (false, stderr) => Replayed::Ended(Err(last_error(&stderr))),
     }
 }
 
@@ -778,11 +1064,11 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
         }
     }
     if let Some(mal) = m.id_mal.filter(|_| skip_on()) {
-        let skip = Command::new("ani-skip")
-            .args(["-i", &mal.to_string(), "-e", ep])
-            .stderr(Stdio::null())
-            .output();
-        if let Ok(o) = skip {
+        // it has no limit of its own past connecting: the episode plays without skipping then
+        let mut skip = Command::new("ani-skip");
+        skip.args(["-i", &mal.to_string(), "-e", ep])
+            .stdin(Stdio::null());
+        if let Some(o) = output_within(&mut skip, SKIP_LIMIT) {
             mpv.args(String::from_utf8_lossy(&o.stdout).split_whitespace());
         }
     }
@@ -793,6 +1079,7 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("mpv: {e}"))?;
+    let _player = Listed::on(&PLAYERS, &child);
     match follow(child, |l| player_up(l, &mut up)) {
         (true, _) => Ok(()),
         (false, stderr) => Err(last_error(&stderr)),
@@ -849,20 +1136,26 @@ fn index() -> Index {
     read_json(&index_path())
 }
 
-/// Changes the index under a lock, as another ani-hop may be changing it too.
-fn edit_index(f: impl FnOnce(&mut Index)) -> std::io::Result<()> {
-    let path = index_path();
+/// Changes a file of settings under a lock, as another ani-hop may be changing it too.
+pub fn edit_json<T: Default + Serialize + DeserializeOwned>(
+    path: &Path,
+    f: impl FnOnce(&mut T),
+) -> std::io::Result<()> {
     fs::create_dir_all(path.parent().unwrap())?;
-    // its own file, as the rename below swaps the index for a new one
+    // its own file, as the rename below swaps the file for a new one
     let lock = fs::File::create(path.with_extension("lock"))?;
     lock.lock()?;
-    // a broken index stays as it is, rather than be overwritten with just this change
-    let mut all = match fs::read(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Index::new(),
+    // a broken file stays as it is, rather than be overwritten with just this change
+    let mut all = match fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => T::default(),
         r => serde_json::from_slice(&r?)?,
     };
     f(&mut all);
-    write_json(&path, &all)
+    write_json(path, &all)
+}
+
+fn edit_index(f: impl FnOnce(&mut Index)) -> std::io::Result<()> {
+    edit_json(&index_path(), f)
 }
 
 fn name(p: &Path) -> String {
@@ -893,15 +1186,27 @@ fn folder_in(root: &Path, all: Index, m: &Media) -> PathBuf {
         return p;
     }
     let name = m.name().replace('/', "∕");
+    // the file system's own names would be the download folder, or the one above it
+    let name = match name.trim() {
+        "" | "." | ".." => format!("Show {}", m.id),
+        _ => name,
+    };
+    let taken = |dir: &PathBuf| {
+        let other = all.get(dir).map(|d| &d.media);
+        other.is_some_and(|o| o.id != m.id && o.id != 0 && o.on_anilist() && m.on_anilist())
+            && dir.is_dir()
+    };
     let dir = root.join(&name);
-    let taken = (all.get(&dir)).is_some_and(|d| {
-        let other = &d.media;
-        other.id != m.id && other.id != 0 && other.on_anilist() && m.on_anilist()
-    });
-    match taken && dir.is_dir() {
-        true => root.join(format!("{name} ({})", m.id)),
-        false => dir,
+    if !taken(&dir) {
+        return dir;
     }
+    // the one with its id can be another's too, whose name ends that way
+    let with_id = format!("{name} ({})", m.id);
+    let more = (2u32..).map(|n| root.join(format!("{with_id} {n}")));
+    std::iter::once(root.join(&with_id))
+        .chain(more)
+        .find(|dir| !taken(dir))
+        .unwrap_or(dir)
 }
 
 /// Puts the details AniList has now (progress, airing) on the downloaded shows it knows.
@@ -1088,18 +1393,22 @@ pub fn delete_episode(file: &Path) -> std::io::Result<()> {
 
 /// Deletes what ani-hop downloaded into a show folder (episodes, subtitles, unfinished
 /// parts) and the folder if that was all. A same-named folder may hold the user's own too.
+/// While a download holds it, of this ani-hop or another, nothing goes: `ResourceBusy`.
 pub fn delete_show(dir: &Path) -> std::io::Result<()> {
     fs::read_dir(dir)?;
-    for p in show_files(dir) {
-        fs::remove_file(&p)?;
-    }
-    // a download into it keeps it, and its place in the index
+    let mut res = Ok(());
     edit_index(|all| {
-        if let Some(_alone) = unheld(dir) {
+        let Some(_alone) = unheld(dir) else {
+            res = Err(std::io::ErrorKind::ResourceBusy.into());
+            return;
+        };
+        res = show_files(dir).iter().try_for_each(fs::remove_file);
+        if res.is_ok() {
             all.remove(dir);
             let _ = fs::remove_dir(dir); // fails while something of the user's is left in it
         }
-    })
+    })?;
+    res
 }
 
 /// What deleting a show folder deletes: its episodes, subtitles and unfinished parts, by
@@ -1247,20 +1556,19 @@ pub fn start_download(src: &Source, ep: &str, dub: bool, dir: &Path) -> Result<C
         .map_err(|e| format!("ani-cli: {e}"))
 }
 
-/// Starts FAKE_SUBS for episode `ep` in `dir`, if it's there and ani-cli found no subtitles for
+/// FAKE_SUBS for episode `ep` in `dir`, if it's there and ani-cli found no subtitles for
 /// it.
-pub fn start_subs(m: &Media, src: &Source, dir: &Path, ep: &str, dub: bool) -> Option<Child> {
+pub fn subs_command(m: &Media, src: &Source, dir: &Path, ep: &str, dub: bool) -> Option<Command> {
     let (_, file) = local_episodes(dir).into_iter().find(|(e, _)| e == ep)?;
     let vtt = file.with_extension("vtt");
     let page = subs_page(m, src, ep, dub).filter(|_| !vtt.exists())?;
-    Command::new(cache_dir().join("bin/ani-hop-subs"))
-        .arg(page)
+    let mut cmd = Command::new(cache_dir().join("bin/ani-hop-subs"));
+    cmd.arg(page)
         .arg(vtt)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()
+        .stderr(Stdio::null());
+    Some(cmd)
 }
 
 /// Whether a download of episode `ep` into `dir` that ended left its file. ani-cli exits 0
@@ -1549,7 +1857,7 @@ mod tests {
         // a download that hasn't written anything yet
         drop_if_empty(&dir).unwrap();
         assert!(dir.is_dir() && ours(&dir), "kept while held");
-        delete_show(&dir).unwrap();
+        assert!(delete_show(&dir).is_err());
         assert!(dir.is_dir() && ours(&dir));
         drop(hold);
         // a process another test forks right then holds the lock file too, until its exec
@@ -1560,6 +1868,228 @@ mod tests {
         }
         assert!(!dir.exists() && !ours(&dir), "dropped once let go");
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_show_a_download_holds_deletes_nothing() {
+        let root = std::env::temp_dir().join(format!("ani-hop-busy-{}", std::process::id()));
+        let mut m = Media {
+            id: 41_001,
+            ..Default::default()
+        };
+        m.title.romaji = Some("Busy".into());
+        let (dir, hold) = prepare_in(&root, &m).unwrap();
+        let (done, part) = (
+            dir.join("Busy Episode 1.mp4"),
+            dir.join("Busy Episode 2.mp4.part"),
+        );
+        fs::write(&done, "x").unwrap();
+        fs::write(&part, "x").unwrap();
+        let held = delete_show(&dir).unwrap_err();
+        assert_eq!(held.kind(), std::io::ErrorKind::ResourceBusy);
+        assert!(done.exists() && part.exists() && ours(&dir));
+        drop(hold);
+        delete_show(&dir).unwrap();
+        assert!(!done.exists() && !part.exists() && !dir.exists() && !ours(&dir));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn a_name_the_file_system_keeps_for_itself_stays_in_the_download_folder() {
+        let root = std::env::temp_dir().join(format!("ani-hop-dots-{}", std::process::id()));
+        for (i, title) in ["..", ".", "", " .. "].into_iter().enumerate() {
+            let mut m = Media {
+                id: 41_100 + i as u64,
+                ..Default::default()
+            };
+            m.title.romaji = Some(title.into());
+            let dir = folder_in(&root, Index::new(), &m);
+            assert_eq!(dir.parent(), Some(root.as_path()), "{title:?}");
+            let named = name(&dir);
+            assert!(named.starts_with("Show ") || named == " .. ", "{named}");
+        }
+    }
+
+    #[test]
+    fn a_folder_with_a_shows_id_can_be_taken_too() {
+        let root = std::env::temp_dir().join(format!("ani-hop-ids-{}", std::process::id()));
+        let show = |id, title: &str| {
+            let mut m = Media {
+                id,
+                ..Default::default()
+            };
+            m.title.romaji = Some(title.into());
+            m
+        };
+        let (first, _) = prepare_in(&root, &show(880_003, "A")).unwrap();
+        let (taken, _) = prepare_in(&root, &show(880_005, "A (880004)")).unwrap();
+        let (mine, _) = prepare_in(&root, &show(880_004, "A")).unwrap();
+        assert_eq!(name(&first), "A");
+        assert_eq!(name(&taken), "A (880004)");
+        assert_eq!(name(&mine), "A (880004) 2");
+        assert_eq!(index()[&taken].media.id, 880_005, "it's still that show's");
+        for d in [&first, &taken, &mine] {
+            edit_index(|all| drop(all.remove(d))).unwrap();
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn helpers_are_left_alone_unless_they_changed_and_never_empty() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = std::env::temp_dir().join(format!("ani-hop-helper-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let helper = dir.join("rofi");
+        write_helper(&helper, "#!/bin/sh\necho one\n").unwrap();
+        let first = fs::metadata(&helper).unwrap();
+        assert_eq!(first.permissions().mode() & 0o777, 0o755);
+        write_helper(&helper, "#!/bin/sh\necho one\n").unwrap();
+        assert_eq!(
+            fs::metadata(&helper).unwrap().ino(),
+            first.ino(),
+            "untouched"
+        );
+        // what's running keeps the old one: the new one comes as a new file, whole
+        write_helper(&helper, "#!/bin/sh\necho two\n").unwrap();
+        assert_ne!(fs::metadata(&helper).unwrap().ino(), first.ino());
+        // through sh: a test forking right then holds a copy of the file open until its exec,
+        // which running the file itself would call busy
+        let out = Command::new("sh").arg(&helper).output().unwrap();
+        assert_eq!(out.stdout, b"two\n");
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o644)).unwrap();
+        write_helper(&helper, "#!/bin/sh\necho two\n").unwrap();
+        assert_eq!(
+            fs::metadata(&helper).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "nothing left aside");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_helper_that_stalls_is_ended_in_time() {
+        let mut slow = Command::new("sh");
+        slow.args(["-c", "sleep 30 & wait"]).stdin(Stdio::null());
+        let since = std::time::Instant::now();
+        assert!(output_within(&mut slow, Duration::from_millis(200)).is_none());
+        assert!(since.elapsed() < Duration::from_secs(5));
+        let mut quick = Command::new("sh");
+        quick.args(["-c", "echo hi"]).stdin(Stdio::null());
+        let out = output_within(&mut quick, Duration::from_secs(5)).unwrap();
+        assert_eq!(out.stdout, b"hi\n");
+    }
+
+    /// Closing the players goes for all of them, so these take turns.
+    static CLOSING: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn closing_the_players_ends_what_runs_under_them() {
+        let _turn = CLOSING.lock().unwrap_or_else(|e| e.into_inner());
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30 & echo $!; wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let shell = child.id();
+        let player = Listed::on(&PLAYERS, &child);
+        assert!(pids(&PLAYERS).contains(&shell) && player_open());
+        let (ok, _) = {
+            // ended from elsewhere, as quitting does, while this waits for it
+            let closing = std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                close_players();
+            });
+            let res = follow(child, |_| {});
+            closing.join().unwrap();
+            res
+        };
+        assert!(!ok);
+        assert!(!pids(&PLAYERS).contains(&shell), "drained");
+        drop(player);
+    }
+
+    #[test]
+    fn closing_the_players_ends_what_fetches_ahead_but_that_is_no_player_open() {
+        let _turn = CLOSING.lock().unwrap_or_else(|e| e.into_inner());
+        let child = Command::new("sh")
+            .args(["-c", "sleep 30 & wait"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let listed = Listed::on(&AHEAD, &child);
+        assert!(pids(&AHEAD).contains(&pid));
+        let closing = std::thread::spawn(|| {
+            std::thread::sleep(Duration::from_millis(100));
+            close_players();
+        });
+        let (ok, _) = follow(child, |_| {});
+        closing.join().unwrap();
+        assert!(!ok && !pids(&AHEAD).contains(&pid));
+        drop(listed);
+    }
+
+    #[test]
+    fn only_what_gone_ani_hops_left_goes_from_the_working_folder() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-left-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        // an ani-hop that's running, whatever the age of its files
+        fs::create_dir_all(run_dir()).unwrap();
+        let alive = fs::File::create(run_dir().join("777001.lock")).unwrap();
+        alive.lock().unwrap();
+        let (kept, gone) = (
+            ["ani-hsts", "notes", "subs-777001-1.vtt", "held-777001-1"],
+            [
+                "subs-777002-1.vtt",
+                "menu-777002-1",
+                "held-777002-3",
+                "held-777002-3.4242",
+            ],
+        );
+        for name in kept.iter().chain(&gone) {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+        clear_leftovers(&dir);
+        assert!(kept.iter().all(|n| dir.join(n).exists()));
+        assert!(gone.iter().all(|n| !dir.join(n).exists()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_fake_mpv_told_to_hold_writes_each_argument_and_starts_nothing() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-hold-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("mpv");
+        write_helper(&fake, FAKE_MPV).unwrap();
+        let held = dir.join("held");
+        let out = Command::new("sh")
+            .arg(&fake)
+            .args([
+                "--referrer=https://a b/",
+                "--title=It's \"one\"",
+                "https://x/y",
+            ])
+            .env("ANIHOP_HOLD", &held)
+            .env_remove("ANIHOP_SUBS_PAGE")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(out.stdout.is_empty(), "no player started");
+        let args = fs::read(&held).unwrap();
+        let args: Vec<&[u8]> = args.split(|b| *b == 0).filter(|a| !a.is_empty()).collect();
+        assert_eq!(
+            args,
+            [
+                b"--referrer=https://a b/".as_slice(),
+                b"--title=It's \"one\"".as_slice(),
+                b"https://x/y".as_slice(),
+            ]
+        );
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2066,7 +2596,9 @@ esac
         let run = |code: &str, warn: &str, args: &[&str]| {
             let _ = fs::remove_file(&out);
             let path = format!("{}:{}:{sys}", fake.display(), real.display());
-            let o = Command::new(fake.join("ffmpeg"))
+            // through sh: a test forking right then would make the file busy for an exec
+            let o = Command::new("sh")
+                .arg(fake.join("ffmpeg"))
                 .args(args)
                 .arg(&out)
                 .env("PATH", path)
@@ -2189,7 +2721,23 @@ esac
         // playback's dub fallback looks for "dub" in it
         assert_eq!(
             last_error(b"\x1b[2K\x1b[1;31mNo sources found for dub!\x1b[0m\n"),
-            "the provider has no dub stream ani-cli can play (none, or only on servers it can't read)"
+            "no dub stream ani-cli can play"
         );
+    }
+
+    #[test]
+    fn a_stream_says_when_its_player_starts_and_when_it_shows_the_episode() {
+        let steps = std::cell::RefCell::new(Vec::new());
+        let step = |s: Option<&'static str>| steps.borrow_mut().push(s);
+        for line in [
+            "Checking dependencies",
+            "ani-hop-player-starts",
+            "AO: x",
+            "VO: [gpu] 1920x1080",
+        ] {
+            stream_step(line, &step);
+        }
+        assert_eq!(*steps.borrow(), [Some("opening the player"), None]);
+        assert!(FAKE_MPV.contains("echo ani-hop-player-starts"));
     }
 }

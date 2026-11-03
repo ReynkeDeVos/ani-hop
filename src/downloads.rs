@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -41,6 +41,10 @@ pub struct Job {
     /// the show's parts known when it was queued, whose watched episodes `eps: None` skips
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub parts: Parts,
+    /// where it downloads from, once the worker looked that up: yt-dlp goes on from what it
+    /// got by file name, whichever entry that's from, so a restart must get the same one
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<Source>,
 }
 
 impl Job {
@@ -52,6 +56,7 @@ impl Job {
             eps,
             dub: None,
             parts: Vec::new(),
+            source: None,
         }
     }
 
@@ -70,6 +75,9 @@ impl Job {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         self.id = NEXT.fetch_add(1, Ordering::Relaxed);
         (self.dub).get_or_insert_with(|| ani::dub(ani::audio(Some(self.media.id))));
+        if let Some(src) = &self.source {
+            self.lookup = Lookup::Check(src.clone());
+        }
     }
 
     fn has(&self, ep: &str) -> bool {
@@ -150,6 +158,9 @@ struct State {
     /// oldest first, the running one included
     jobs: Vec<Job>,
     running: Option<Running>,
+    /// the show and episode on its way to starting: its source checked after a resume, its
+    /// folder made ready, with nothing running yet
+    preparing: Option<(u64, String)>,
     now: Option<Now>,
     /// held by `pause` until `resume`
     paused: bool,
@@ -192,7 +203,9 @@ impl Queue {
         thread::spawn(move || {
             for () in woken {
                 while let Some(job) = worker.next_job() {
-                    if !worker.work(job, &done) {
+                    let go_on = worker.work(job, &done);
+                    worker.lock().preparing = None;
+                    if !go_on {
                         return; // quitting: what's left stays saved for the next start
                     }
                 }
@@ -295,7 +308,7 @@ impl Queue {
         if running.as_ref().is_some_and(|e| eps.contains(e))
             && let Some(r) = st.running.take()
         {
-            kill(r.pid);
+            ani::end(r.pid);
         }
         st.now.take_if(|n| n.id == m.id && eps.contains(&n.ep));
         let waiting: Vec<String> = (eps.iter())
@@ -313,12 +326,14 @@ impl Queue {
     /// which would start over unasked. False then, and nothing changes.
     pub fn pause(&self, id: u64, ep: &str) -> bool {
         let mut st = self.lock();
-        if !(st.running.as_ref()).is_some_and(|r| r.id == id && r.ep == ep) {
+        // on its way to starting counts, which checks again before it starts anything
+        let starting = (st.preparing.as_ref()).is_some_and(|p| p.0 == id && p.1 == ep);
+        if !starting && !(st.running.as_ref()).is_some_and(|r| r.id == id && r.ep == ep) {
             return false;
         }
         st.paused = true;
         if let Some(r) = st.running.take() {
-            kill(r.pid);
+            ani::end(r.pid);
         }
         true
     }
@@ -336,7 +351,7 @@ impl Queue {
         let mut st = self.lock();
         st.quit = true;
         if let Some(r) = st.running.take() {
-            kill(r.pid);
+            ani::end(r.pid);
         }
     }
 
@@ -359,18 +374,35 @@ impl Queue {
     /// Queues of ani-hops that are gone, as at the start: our own name can only be a leftover
     /// then too.
     pub fn leftovers(&self) -> (Vec<Job>, Vec<PathBuf>) {
-        let files: Vec<PathBuf> = (self.queue_files().into_iter())
-            .filter(|f| !self.alive(f).1)
-            .collect();
-        let jobs = files.iter().flat_map(|f| read_queue(f)).collect();
+        let (mut jobs, mut files) = (Vec::new(), Vec::new());
+        for f in self.gone() {
+            if let Ok(read) = read_queue(&f) {
+                jobs.extend(read);
+                files.push(f);
+            }
+        }
         (jobs, files)
+    }
+
+    /// Queues of ani-hops that are gone that can't be read: they stay, for the user to look
+    /// at, as what they hold is lost once they're gone.
+    pub fn unreadable(&self) -> Vec<PathBuf> {
+        let mut files = self.gone();
+        files.retain(|f| read_queue(f).is_err());
+        files
+    }
+
+    fn gone(&self) -> Vec<PathBuf> {
+        let mut files = self.queue_files();
+        files.retain(|f| !self.alive(f).1);
+        files
     }
 
     /// Episodes per show other running ani-hops have queued.
     pub fn elsewhere(&self) -> HashMap<u64, Vec<String>> {
         let mut all: HashMap<u64, Vec<String>> = HashMap::new();
         for f in self.queue_files().iter().filter(|f| self.alive(f).1) {
-            for j in read_queue(f) {
+            for j in read_queue(f).unwrap_or_default() {
                 all.entry(j.media.id)
                     .or_default()
                     .extend(j.eps.unwrap_or_default());
@@ -392,8 +424,11 @@ impl Queue {
     /// ani-hop had them already).
     pub fn adopt(&self, files: &[PathBuf]) -> Result<usize, String> {
         let _turn = self.claiming();
-        let files: Vec<&PathBuf> = files.iter().filter(|f| f.exists()).collect();
-        let jobs: Vec<Job> = files.iter().flat_map(|f| read_queue(f)).collect();
+        let mut jobs: Vec<Job> = Vec::new();
+        // what can't be read stays where it is
+        let files: Vec<&PathBuf> = (files.iter().filter(|f| f.exists()))
+            .filter(|f| read_queue(f).map(|read| jobs.extend(read)).is_ok())
+            .collect();
         let n = jobs.len();
         if n > 0 {
             let mut st = self.lock();
@@ -422,7 +457,10 @@ impl Queue {
         let _turn = self.claiming();
         let jobs: Vec<Job> = (files.iter())
             .flat_map(|f| {
-                let jobs = read_queue(f);
+                // what can't be read stays where it is
+                let Ok(jobs) = read_queue(f) else {
+                    return Vec::new();
+                };
                 // one by our name (an earlier ani-hop's, with our pid) gets this one's queue
                 let gone = match *f == self.file() {
                     true => self.save(&mut self.lock()).is_ok(),
@@ -451,11 +489,17 @@ impl Queue {
     /// stopped ones are skipped. Returns at a pause, false once quitting stopped the downloads.
     fn work(&self, job: Job, done: &impl Fn(String, Result<(), String>)) -> bool {
         let m = &job.media;
-        let src = match self
-            .0
-            .fetch
-            .resolve(m, job.lookup.clone(), job.eps.is_none())
+        // a job can wait for hours while the provider's order shifts: checked as it starts
+        let lookup = job.lookup.clone().rechecked();
+        // the one resumed: its progress stays on screen, with Pause offered, during this
         {
+            let mut st = self.lock();
+            let resumed = (st.now.as_ref())
+                .filter(|n| n.id == m.id && job.has(&n.ep))
+                .map(|n| (n.id, n.ep.clone()));
+            st.preparing = resumed;
+        }
+        let src = match self.0.fetch.resolve(m, lookup, job.eps.is_none()) {
             Ok(s) => s,
             Err(e) => {
                 let mut st = self.lock();
@@ -468,6 +512,8 @@ impl Queue {
                     st.paused = true;
                 } else {
                     st.jobs.retain(|j| j.id != job.id);
+                    // it's over, whatever the screen last said of it
+                    st.now.take_if(|n| n.id == m.id);
                     let _ = self.save(&mut st);
                 }
                 drop(st);
@@ -479,10 +525,15 @@ impl Queue {
             let on_disk = ani::local_episodes(&self.0.fetch.folder(m));
             job.unwatched(&src.episodes, &on_disk)
         });
+        // what it got is from another entry, which yt-dlp would go on from: it starts over
+        if (job.source.as_ref()).is_some_and(|old| (&old.title, old.nth) != (&src.title, src.nth)) {
+            let eps = job.eps.as_ref().or(all.as_ref());
+            self.discard(&self.0.fetch.folder(m), eps.map_or(&[], Vec::as_slice));
+        }
         {
             let mut st = self.lock();
             if let Some(j) = st.jobs.iter_mut().find(|j| j.id == job.id) {
-                // after a pause it goes on from here, without looking the show up again
+                j.source = Some(src.clone());
                 j.lookup = Lookup::Ready(src.clone());
                 // stopping one of them may have listed them already
                 if let Some(all) = all {
@@ -550,8 +601,9 @@ impl Queue {
     }
 
     /// Downloads one episode. It starts under the lock stopping and pausing take, after
-    /// checking it's still wanted, so neither is ever missed. Also the episode's claim, if it
-    /// got that far.
+    /// checking it's still wanted, so neither is ever missed. What touches the disk happens
+    /// outside that lock, as the disk may be asleep and the screens read the queue every frame.
+    /// Also the episode's claim, if it got that far.
     fn fetch_one(
         &self,
         job: &Job,
@@ -562,6 +614,7 @@ impl Queue {
     ) -> (Result<(), String>, Option<EpisodeLock>) {
         let mut claim = None;
         let res = self.fetch(job, src, ep, dub, label, &mut claim);
+        self.lock().preparing = None;
         (res, claim)
     }
 
@@ -582,33 +635,42 @@ impl Queue {
             text: text.into(),
             resumes,
         };
-        let (child, dir) = {
+        let wanted = |st: &State| {
+            !st.quit && !st.paused && (st.jobs.iter()).any(|j| j.id == job.id && j.has(ep))
+        };
+        {
             let mut st = self.lock();
-            let wanted = (st.jobs.iter()).any(|j| j.id == job.id && j.has(ep));
-            if st.quit || st.paused || !wanted {
+            if !wanted(&st) {
                 return Err(STOPPED.into());
             }
             st.now = Some(now("starting", true));
-            // under the lock, so stopping another episode can't drop the folder in between;
-            // also for an episode already there, so a folder found through ani-cli gets the
-            // AniList show
-            let (dir, hold) = self.0.fetch.prepare(m)?;
-            // another ani-hop may have queued it too before either saw the other's queue
-            let mut held = (self.claim(&dir, ep)?).ok_or("another ani-hop is downloading it")?;
-            held.folder = Some(hold);
-            *claim = Some(held);
-            if ani::local_episodes(&dir).iter().any(|(e, _)| e == ep) {
-                return Ok(()); // yt-dlp wouldn't replace it, so it stays the audio it was
+            st.preparing = Some((m.id, ep.to_string()));
+        }
+        // it comes held, so stopping another episode can't drop the folder; also for an episode
+        // already there, so a folder found through ani-cli gets the AniList show
+        let (dir, hold) = self.0.fetch.prepare(m)?;
+        // another ani-hop may have queued it too before either saw the other's queue
+        let mut held = (self.claim(&dir, ep)?).ok_or("another ani-hop is downloading it")?;
+        held.folder = Some(hold);
+        *claim = Some(held);
+        if ani::local_episodes(&dir).iter().any(|(e, _)| e == ep) {
+            return Ok(()); // yt-dlp wouldn't replace it, so it stays the audio it was
+        }
+        ani::drop_half_pieces(&dir, ep);
+        let child = {
+            let mut st = self.lock();
+            if !wanted(&st) {
+                return Err(STOPPED.into());
             }
-            ani::drop_half_pieces(&dir, ep);
             let child = self.0.fetch.start(src, ep, dub, &dir)?;
+            st.preparing = None;
             st.running = Some(Running {
                 pid: child.id(),
                 id: m.id,
                 dir: dir.clone(),
                 ep: ep.to_string(),
             });
-            (child, dir)
+            child
         };
         let mut lines = ani::Lines::default();
         let stderr = ani::follow(child, |l| {
@@ -622,8 +684,10 @@ impl Queue {
         })
         .1;
         // still the running one, so a stop, a pause or quitting ends this too
-        let subs = self.lock().running.as_mut().and_then(|r| {
-            let subs = ani::start_subs(m, src, &dir, ep, dub)?;
+        let subs = ani::subs_command(m, src, &dir, ep, dub).and_then(|mut cmd| {
+            let mut st = self.lock();
+            let r = st.running.as_mut()?;
+            let subs = cmd.spawn().ok()?;
             r.pid = subs.id();
             Some(subs)
         });
@@ -726,27 +790,21 @@ impl Drop for EpisodeLock {
     }
 }
 
-fn read_queue(path: &Path) -> Vec<Job> {
-    ani::read_json(path)
-}
-
-/// Ends an ani-cli download and what it runs.
-fn kill(pid: u32) {
-    let pid = pid.to_string();
-    // without stderr: one that just ended would print "No such process" over the screen
-    let quiet = |cmd: &str, args: &[&str]| {
-        let _ = Command::new(cmd).args(args).stderr(Stdio::null()).status();
-    };
-    // The ani-cli shell first: it holds the signal until yt-dlp is gone and then exits.
-    // Signalled after yt-dlp, it falls back to ffmpeg and keeps downloading after we quit.
-    quiet("kill", &["-TERM", &pid]);
-    quiet("pkill", &["-TERM", "-P", &pid]);
+/// A queue file's jobs. One that can't be read says so: passing for an empty one, it would be
+/// deleted with what it holds. None there is an empty one.
+fn read_queue(path: &Path) -> Result<Vec<Job>, String> {
+    match fs::read(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(e.to_string()),
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| e.to_string()),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
     use std::sync::mpsc::Receiver;
     use std::time::{Duration, Instant};
 
@@ -816,6 +874,14 @@ mod tests {
         dir
     }
 
+    /// Removes a test's folder. A worker that was told to quit may still be finishing what it
+    /// was doing in there.
+    fn clean(dir: &Path) {
+        wait("removed", || {
+            fs::remove_dir_all(dir).is_ok() || !dir.exists()
+        });
+    }
+
     fn show() -> Media {
         let mut m = Media {
             id: ID.get(),
@@ -883,7 +949,7 @@ mod tests {
         assert!(s.pending == 0 && s.now.is_none() && !s.paused);
         let locks = || fs::read_dir(dir.join("queue/locks")).unwrap().count();
         wait("a finished episode's claim goes with it", || locks() == 0);
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
     }
 
     #[test]
@@ -905,7 +971,7 @@ mod tests {
         // the claim of an episode not on disk stays: deleting it could let two own it
         let locks = fs::read_dir(dir.join("queue/locks")).unwrap().count();
         assert_eq!(locks, 1);
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
     }
 
     #[test]
@@ -926,7 +992,7 @@ mod tests {
         let t = Duration::from_secs(10);
         assert_eq!(done.recv_timeout(t).unwrap(), ("Show E1".into(), Ok(())));
         q.quit();
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
     }
 
     #[test]
@@ -966,7 +1032,7 @@ mod tests {
         assert!(q.snapshot().paused);
         assert!(!dir.join("dl/Show/Show Episode 2.mp4").exists());
         q.quit();
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
     }
 
     #[test]
@@ -991,7 +1057,7 @@ mod tests {
         assert_eq!(done.recv_timeout(t).unwrap(), ("Show E1".into(), Ok(())));
         assert_eq!(next.adopt(&files), Ok(0), "taken already");
         next.quit();
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
     }
 
     #[test]
@@ -1010,7 +1076,7 @@ mod tests {
             b.discard(&dir.join("dl/Show"), &["1".into()]);
             !part.exists()
         });
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
     }
 
     #[test]
@@ -1035,7 +1101,7 @@ mod tests {
             !folder.exists()
         });
         wait("let go", || q.claim(&folder, "1").unwrap().is_some());
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
     }
 
     #[test]
@@ -1068,7 +1134,7 @@ mod tests {
         q.stop(&show(), &["1".into()], None, &[]).unwrap();
         release.join().unwrap();
         assert!(!part.exists(), "a stopped one loses its pieces");
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
     }
 
     #[test]
@@ -1083,7 +1149,7 @@ mod tests {
         assert_eq!(files, std::slice::from_ref(&mine));
         assert_eq!(q.adopt(&files), Ok(1));
         assert!(mine.exists(), "it holds the queue now");
-        assert_eq!(read_queue(&mine).len(), 1);
+        assert_eq!(read_queue(&mine).unwrap().len(), 1);
         q.quit();
         wait("stopped", || q.lock().running.is_none());
         // dropped, it holds this one's own queue: kept while that has something, else gone
@@ -1096,12 +1162,282 @@ mod tests {
         // running, so its worker has saved what it does before the folder goes below
         wait("downloading", || running(&q, "2"));
         assert_eq!(q.drop_leftovers(std::slice::from_ref(&mine)), 1);
-        let kept = read_queue(&mine);
+        let kept = read_queue(&mine).unwrap();
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].eps.as_deref(), Some(&["2".to_string()][..]));
         q.quit();
         wait("stopped", || q.lock().running.is_none());
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
+    }
+
+    /// Downloads like `Fake`, once its folder's ready, which takes until it's told to go on.
+    struct SlowFolder(Fake, Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+    impl Fetch for SlowFolder {
+        fn folder(&self, m: &Media) -> PathBuf {
+            self.0.folder(m)
+        }
+        fn prepare(&self, m: &Media) -> Result<(PathBuf, ani::Hold), String> {
+            let (go, told) = &*self.1;
+            let mut go = go.lock().unwrap();
+            while !*go {
+                go = told.wait(go).unwrap();
+            }
+            drop(go);
+            self.0.prepare(m)
+        }
+        fn resolve(&self, m: &Media, lookup: Lookup, all: bool) -> Result<Source, String> {
+            self.0.resolve(m, lookup, all)
+        }
+        fn start(&self, s: &Source, ep: &str, dub: bool, dir: &Path) -> Result<Child, String> {
+            self.0.start(s, ep, dub, dir)
+        }
+    }
+
+    #[test]
+    fn a_disk_asleep_holds_up_neither_the_screens_nor_a_pause_or_stop() {
+        let dir = temp("asleep");
+        let go = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let fetch = SlowFolder(
+            Fake {
+                root: dir.join("dl"),
+                script: QUICK,
+            },
+            go.clone(),
+        );
+        let (tx, done) = mpsc::channel();
+        let q = Queue::start(dir.join("queue"), "a".into(), fetch, move |l, r| {
+            let _ = tx.send((l, r));
+        });
+        q.enqueue(job(&["1", "2"])).unwrap();
+        wait("getting its folder ready", || q.snapshot().now.is_some());
+        // the screens read the queue every frame, while the disk wakes up
+        let since = Instant::now();
+        let s = q.snapshot();
+        assert!(since.elapsed() < Duration::from_secs(1));
+        assert_eq!(s.now.as_ref().map(|n| n.text.as_str()), Some("starting"));
+        assert!(!q.pause(ID.get(), "2"), "another episode's getting ready");
+        // pausing now counts: nothing's started by the time the folder's ready
+        assert!(q.pause(ID.get(), "1"));
+        *go.0.lock().unwrap() = true;
+        go.1.notify_all();
+        wait("back to waiting", || {
+            q.lock().now.is_none() || q.snapshot().paused
+        });
+        assert!(done.recv_timeout(Duration::from_millis(300)).is_err());
+        assert!(q.lock().running.is_none() && q.snapshot().pending == 2);
+        assert!(!dir.join("dl/Show/Show Episode 1.mp4").exists());
+        q.resume();
+        let t = Duration::from_secs(10);
+        assert_eq!(done.recv_timeout(t).unwrap(), ("Show E1".into(), Ok(())));
+        assert_eq!(done.recv_timeout(t).unwrap(), ("Show E2".into(), Ok(())));
+        wait("all done", || q.snapshot().pending == 0);
+        // what the screens last showed is no download to pause
+        q.lock().now = Some(Now {
+            id: ID.get(),
+            ep: "1".into(),
+            label: String::new(),
+            text: String::new(),
+            resumes: true,
+        });
+        assert!(!q.pause(ID.get(), "1") && !q.snapshot().paused);
+        q.quit();
+        clean(&dir);
+    }
+
+    /// Downloads like `Fake`, with a lookup that takes until it's told to go on.
+    struct SlowLookup(Fake, Arc<(Mutex<bool>, std::sync::Condvar)>);
+
+    impl Fetch for SlowLookup {
+        fn folder(&self, m: &Media) -> PathBuf {
+            self.0.folder(m)
+        }
+        fn prepare(&self, m: &Media) -> Result<(PathBuf, ani::Hold), String> {
+            self.0.prepare(m)
+        }
+        fn resolve(&self, m: &Media, lookup: Lookup, all: bool) -> Result<Source, String> {
+            let (go, told) = &*self.1;
+            let mut go = go.lock().unwrap();
+            while !*go {
+                go = told.wait(go).unwrap();
+            }
+            drop(go);
+            self.0.resolve(m, lookup, all)
+        }
+        fn start(&self, s: &Source, ep: &str, dub: bool, dir: &Path) -> Result<Child, String> {
+            self.0.start(s, ep, dub, dir)
+        }
+    }
+
+    #[test]
+    fn a_pause_counts_while_a_resumed_download_gets_its_source_checked() {
+        let dir = temp("recheckpause");
+        let go = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
+        let fetch = SlowLookup(
+            Fake {
+                root: dir.join("dl"),
+                script: SLOW,
+            },
+            go.clone(),
+        );
+        let (tx, done) = mpsc::channel();
+        let q = Queue::start(dir.join("queue"), "a".into(), fetch, move |l, r| {
+            let _ = tx.send((l, r));
+        });
+        q.enqueue(job(&["1"])).unwrap();
+        let part = dir.join("dl/Show/Show Episode 1.mp4.part");
+        wait("a piece", || running(&q, "1") && part.exists());
+        assert!(q.pause(ID.get(), "1"));
+        wait("paused", || q.lock().running.is_none());
+        // the worker has seen it end and gone back to waiting
+        assert!(done.recv_timeout(Duration::from_millis(300)).is_err());
+        // the lookup after a resume takes a while, and the screen offers Pause all along
+        *go.0.lock().unwrap() = false;
+        q.resume();
+        wait("looking it up", || q.lock().preparing.is_some());
+        assert!(!q.pause(ID.get(), "2"), "not that one");
+        assert!(q.pause(ID.get(), "1"), "counts");
+        *go.0.lock().unwrap() = true;
+        go.1.notify_all();
+        wait("back to waiting", || q.lock().preparing.is_none());
+        assert!(q.snapshot().paused && q.lock().running.is_none());
+        assert!(part.exists(), "kept");
+        assert!(done.recv_timeout(Duration::from_millis(200)).is_err());
+        // resumed once more, it goes on; SLOW finishes its second try
+        q.resume();
+        let (_, res) = done.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(res, Ok(()));
+        q.quit();
+        clean(&dir);
+    }
+
+    #[test]
+    fn a_queue_that_cant_be_read_stays_and_nothing_takes_it_for_empty() {
+        let dir = temp("broken");
+        let (q, _) = queue(&dir, "me", SLOW);
+        let broken = dir.join("queue/gone.json");
+        // one good job and one that isn't
+        let good = serde_json::to_value(job(&["1"])).unwrap();
+        let bad = serde_json::json!([good, {"media": 3}]).to_string();
+        fs::create_dir_all(dir.join("queue")).unwrap();
+        fs::write(&broken, &bad).unwrap();
+        assert!(read_queue(&broken).is_err());
+        let (jobs, files) = q.leftovers();
+        assert!(jobs.is_empty() && files.is_empty(), "nothing to delete");
+        assert_eq!(q.unreadable(), std::slice::from_ref(&broken));
+        // a file that went bad after the question, answered either way
+        assert_eq!(q.adopt(std::slice::from_ref(&broken)), Ok(0));
+        assert_eq!(q.drop_leftovers(std::slice::from_ref(&broken)), 0);
+        assert_eq!(fs::read_to_string(&broken).unwrap(), bad, "untouched");
+        // none at all is an empty one
+        assert_eq!(read_queue(&dir.join("queue/none.json")).unwrap().len(), 0);
+        clean(&dir);
+    }
+
+    /// Finds the show at another provider entry than `Fake` has, and lets through what it's given.
+    struct Moved(Fake, Mutex<Vec<String>>);
+
+    impl Fetch for Moved {
+        fn folder(&self, m: &Media) -> PathBuf {
+            self.0.folder(m)
+        }
+        fn prepare(&self, m: &Media) -> Result<(PathBuf, ani::Hold), String> {
+            self.0.prepare(m)
+        }
+        fn resolve(&self, _: &Media, lookup: Lookup, _: bool) -> Result<Source, String> {
+            let Lookup::Check(s) = lookup else {
+                return Err("expected a check of what it had".into());
+            };
+            self.1.lock().unwrap().push(s.title.clone());
+            Ok(Source { nth: 2, ..source() })
+        }
+        fn start(&self, s: &Source, ep: &str, dub: bool, dir: &Path) -> Result<Child, String> {
+            self.0.start(s, ep, dub, dir)
+        }
+    }
+
+    #[test]
+    fn a_restart_goes_on_from_its_source_and_starts_over_if_that_moved() {
+        let dir = temp("restart");
+        let (q, _) = queue(&dir, "a", SLOW);
+        q.enqueue(job(&["1"])).unwrap();
+        wait("downloading", || running(&q, "1"));
+        q.quit();
+        wait("stopped", || q.lock().running.is_none());
+        let saved = read_queue(&q.file()).unwrap();
+        assert_eq!(saved[0].source.as_ref().unwrap().title, source().title);
+        // back from the file, it gets that source checked, whatever's picked by now
+        let mut restored = saved[0].clone();
+        restored.lookup = Lookup::Resolve;
+        restored.number();
+        assert!(matches!(&restored.lookup, Lookup::Check(s) if s.title == source().title));
+
+        // the provider no longer has it there: what it got is from another entry, and goes
+        let (tx, done) = mpsc::channel();
+        let fetch = Moved(
+            Fake {
+                root: dir.join("dl"),
+                script: QUICK,
+            },
+            Mutex::default(),
+        );
+        let part = dir.join("dl/Show/Show Episode 1.mp4.part");
+        assert!(part.exists() && ani::ours(&dir.join("dl/Show")));
+        let q = Queue::start(dir.join("queue2"), "b".into(), fetch, move |l, r| {
+            let _ = tx.send((l, r));
+        });
+        restored.lookup = Lookup::Resolve;
+        q.enqueue(restored).unwrap();
+        let (_, res) = done.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert_eq!(res, Ok(()));
+        assert!(!part.exists(), "what the other source got is gone");
+        clean(&dir);
+    }
+
+    #[test]
+    fn a_job_that_waited_gets_its_source_checked_again() {
+        let dir = temp("recheck");
+        let (tx, done) = mpsc::channel();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        struct Seen(Fake, Arc<Mutex<Vec<&'static str>>>);
+        impl Fetch for Seen {
+            fn folder(&self, m: &Media) -> PathBuf {
+                self.0.folder(m)
+            }
+            fn prepare(&self, m: &Media) -> Result<(PathBuf, ani::Hold), String> {
+                self.0.prepare(m)
+            }
+            fn resolve(&self, m: &Media, lookup: Lookup, all: bool) -> Result<Source, String> {
+                self.1.lock().unwrap().push(match &lookup {
+                    Lookup::Ready(_) => "ready",
+                    Lookup::Check(_) => "check",
+                    Lookup::Resolve => "resolve",
+                });
+                self.0.resolve(m, lookup, all)
+            }
+            fn start(&self, s: &Source, ep: &str, dub: bool, dir: &Path) -> Result<Child, String> {
+                self.0.start(s, ep, dub, dir)
+            }
+        }
+        let fetch = Seen(
+            Fake {
+                root: dir.join("dl"),
+                script: QUICK,
+            },
+            seen.clone(),
+        );
+        let q = Queue::start(dir.join("queue"), "a".into(), fetch, move |l, r| {
+            let _ = tx.send((l, r));
+        });
+        let mut j = job(&["1"]);
+        j.lookup = Lookup::Ready(source());
+        q.enqueue(j).unwrap();
+        done.recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .1
+            .unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["check"]);
+        clean(&dir);
     }
 
     #[test]
@@ -1123,7 +1459,7 @@ mod tests {
             "nothing of the stopped one"
         );
         assert!(!q.snapshot().paused);
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
     }
 
     #[test]
@@ -1156,10 +1492,10 @@ mod tests {
             let quiet = done.recv_timeout(Duration::from_millis(300));
             assert!(quiet.is_err(), "{name}: one error, then it waits");
             assert_eq!(q.snapshot().pending, 2, "{name}: nothing dropped");
-            let saved = read_queue(&q.file());
+            let saved = read_queue(&q.file()).unwrap();
             assert_eq!(saved[0].eps.as_deref(), Some(&["1".into(), "2".into()][..]));
             q.quit();
-            fs::remove_dir_all(&dir).unwrap();
+            clean(&dir);
         }
     }
 
@@ -1178,7 +1514,7 @@ mod tests {
         fs::write(dir.join("sub/queue"), "").unwrap();
         assert!(other.adopt(std::slice::from_ref(&left)).is_err());
         assert!(left.exists());
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
     }
 
     #[test]
@@ -1195,7 +1531,7 @@ mod tests {
             ("Show E1", Err("another ani-hop is downloading it".into()))
         );
         a.quit();
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
     }
 
     #[test]
@@ -1237,7 +1573,7 @@ mod tests {
         let name =
             "downloads::tests::a_whole_show_job_with_a_cached_source_lists_the_episodes_out_now";
         assert!(crate::in_child(name, &env));
-        fs::remove_dir_all(&dir).unwrap();
+        clean(&dir);
     }
 
     #[test]

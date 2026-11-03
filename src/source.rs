@@ -9,11 +9,14 @@
 use crate::ani;
 use crate::anilist::Media;
 use serde::{Deserialize, Serialize};
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 /// Where an AniList entry lives on the provider, as ani-cli sees it.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,6 +57,14 @@ pub enum Lookup {
 }
 
 impl Lookup {
+    /// As a later moment must see it: a source checked earlier gets checked again.
+    pub fn rechecked(self) -> Lookup {
+        match self {
+            Lookup::Ready(s) => Lookup::Check(s),
+            lookup => lookup,
+        }
+    }
+
     /// Blocks on ani-cli.
     pub fn run(self, m: &Media) -> Result<Source, String> {
         match self {
@@ -68,7 +79,8 @@ impl Lookup {
 /// ani-cli, or checked in this one; and the lookups running for them.
 pub struct Sources {
     known: HashMap<u64, Source>,
-    checked: HashSet<u64>,
+    /// when each was last checked: the provider's order can shift while ani-hop stays open
+    checked: HashMap<u64, Instant>,
     /// the lookup each show waits for: an older one's answer doesn't count anymore
     asked: HashMap<u64, u64>,
     tickets: u64,
@@ -76,17 +88,46 @@ pub struct Sources {
     picked: HashSet<u64>,
 }
 
+/// How long a checked source goes without another search: long enough for a whole evening of
+/// episodes of one show, short enough that a shifted order doesn't play another show.
+const CHECK_FOR: Duration = Duration::from_secs(30 * 60);
+
+/// Sources as saved, without one that isn't what was picked by hand since: a lookup of the
+/// pick may never have finished, and the old one would play in its place.
+fn agreeing(
+    mut known: HashMap<u64, Source>,
+    picks: &HashMap<String, Pick>,
+) -> HashMap<u64, Source> {
+    known.retain(|id, s| (picks.get(&id.to_string())).is_none_or(|p| p.is(s)));
+    known
+}
+
 impl Sources {
     pub fn load() -> Sources {
+        let picks = overrides();
         Sources {
-            known: ani::read_json(&resolved_path()),
-            checked: HashSet::new(),
+            known: agreeing(ani::read_json(&resolved_path()), &picks),
+            checked: HashMap::new(),
             asked: HashMap::new(),
             tickets: 0,
-            picked: (overrides().keys())
-                .filter_map(|id| id.parse().ok())
-                .collect(),
+            picked: (picks.keys()).filter_map(|id| id.parse().ok()).collect(),
         }
+    }
+
+    /// With sources saved in an earlier session, for tests.
+    #[cfg(test)]
+    pub fn knowing(known: HashMap<u64, Source>) -> Sources {
+        Sources {
+            known,
+            checked: HashMap::new(),
+            asked: HashMap::new(),
+            tickets: 0,
+            picked: HashSet::new(),
+        }
+    }
+
+    fn checked(&self, id: u64) -> bool {
+        (self.checked.get(&id)).is_some_and(|at| at.elapsed() < CHECK_FOR)
     }
 
     /// Whether the show's source was picked by hand, maybe in an earlier session whose
@@ -103,16 +144,25 @@ impl Sources {
     /// How to get a usable source for the show.
     pub fn lookup(&self, id: u64) -> Lookup {
         match self.known.get(&id) {
-            Some(s) if self.checked.contains(&id) => Lookup::Ready(s.clone()),
+            Some(s) if self.checked(id) => Lookup::Ready(s.clone()),
             Some(s) => Lookup::Check(s.clone()),
             None => Lookup::Resolve,
         }
     }
 
+    /// How to get a source to play from: the lookup on its way answers that too, and a check
+    /// of its own would search the provider again.
+    pub fn to_play(&self, id: u64) -> Lookup {
+        match self.asked.contains_key(&id) {
+            true => Lookup::Resolve,
+            false => self.lookup(id),
+        }
+    }
+
     /// A ticket for looking the show up (`resolve`) in the background, unless it was looked
-    /// up this session or a lookup for it runs already.
+    /// up a moment ago or a lookup for it runs already.
     pub fn ask(&mut self, id: u64) -> Option<u64> {
-        if self.checked.contains(&id) || self.asked.contains_key(&id) {
+        if self.checked(id) || self.asked.contains_key(&id) {
             return None;
         }
         self.tickets += 1;
@@ -129,7 +179,7 @@ impl Sources {
         self.asked.remove(&id);
         if let Ok(src) = res {
             self.known.insert(id, src.clone());
-            self.checked.insert(id);
+            self.checked.insert(id, Instant::now());
             let _ = ani::write_json(&resolved_path(), &self.known);
         }
         true
@@ -149,7 +199,76 @@ impl Sources {
         self.known.remove(&id);
         self.checked.remove(&id);
         self.asked.remove(&id);
+        // gone from the file too, or a restart before its lookup finds the old one again
+        let _ = ani::write_json(&resolved_path(), &self.known);
         Ok(())
+    }
+}
+
+/// What a lookup ahead of time answers once nobody waits for it anymore.
+pub const ABANDONED: &str = "abandoned";
+
+/// How long a show's page is open before its lookup starts ahead of time: going past a show
+/// costs the provider nothing, and enter on the page goes without this wait.
+const REST: Duration = Duration::from_millis(150);
+
+/// The show on screen, for work done ahead of time: ani-cli runs one at a time, so what nobody
+/// waits for anymore mustn't hold up what someone does.
+#[derive(Clone, Default)]
+pub struct Focus {
+    on_screen: Arc<AtomicU64>,
+    /// a show someone waits on: no rest for its lookup, and no giving up
+    waited: Arc<AtomicU64>,
+}
+
+impl Focus {
+    pub fn on_screen(&self, id: u64) {
+        self.on_screen.store(id, Ordering::Relaxed);
+    }
+
+    pub fn waited(&self, id: u64) {
+        self.waited.store(id, Ordering::Relaxed);
+    }
+
+    fn wanted(&self, id: u64) -> bool {
+        self.on_screen.load(Ordering::Relaxed) == id || self.waited.load(Ordering::Relaxed) == id
+    }
+}
+
+thread_local! {
+    /// What this thread looks up ahead of time, whose searches stop once it isn't wanted.
+    static AHEAD: RefCell<Option<(Focus, u64)>> = const { RefCell::new(None) };
+}
+
+/// One ani-cli at a time: the provider shouldn't see a burst when several shows are opened.
+fn turn() -> MutexGuard<'static, ()> {
+    static TURN: Mutex<()> = Mutex::new(());
+    TURN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `resolve`, ahead of time: after a moment's rest, and giving up (`ABANDONED`) once its show
+/// has left the screen and nobody waits for it.
+pub fn resolve_ahead(m: &Media, focus: &Focus) -> Result<Source, String> {
+    let since = Instant::now();
+    while since.elapsed() < REST && focus.waited.load(Ordering::Relaxed) != m.id {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    AHEAD.set(Some((focus.clone(), m.id)));
+    let res = resolve(m);
+    AHEAD.set(None);
+    res
+}
+
+/// `f`'s answer in ani-cli's turn, unless show `id` has left the screen by then.
+pub fn in_turn<T>(
+    id: u64,
+    focus: &Focus,
+    f: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let _turn = turn();
+    match focus.wanted(id) {
+        true => f(),
+        false => Err(ABANDONED.into()),
     }
 }
 
@@ -157,24 +276,27 @@ impl Sources {
 /// `None` means ani-cli never asked (it went on to "play" with the debug player).
 fn probe(args: &[&str]) -> Result<Option<(String, Vec<String>)>, String> {
     static N: AtomicU64 = AtomicU64::new(0);
-    // one at a time: the provider shouldn't see a burst when several shows are opened
-    static TURN: Mutex<()> = Mutex::new(());
-    let _turn = TURN.lock().unwrap_or_else(|e| e.into_inner());
+    let _turn = turn();
+    // only now: it may have waited for others, while its show left the screen
+    if AHEAD.with_borrow(|a| a.as_ref().is_some_and(|(focus, id)| !focus.wanted(*id))) {
+        return Err(ABANDONED.into());
+    }
     let dir = ani::cache_dir().join("probe");
     let out = dir.join(format!(
         "menu-{}-{}",
         std::process::id(),
         N.fetch_add(1, Ordering::Relaxed)
     ));
-    let res = ani::ani_cli()
-        .args(args)
+    let mut cli: Command = ani::ani_cli();
+    cli.args(args)
         .env("ANIHOP_MENU_OUT", &out)
         .env("ANI_CLI_PLAYER", "debug")
         // a single-episode show gets its stream fetched here, and nearly every one has a sub
         .env("ANI_CLI_MODE", "sub")
-        .env("ANI_CLI_HIST_DIR", &dir)
-        .output()
-        .map_err(|e| format!("ani-cli: {e}"))?;
+        .env("ANI_CLI_HIST_DIR", &dir);
+    // whatever waits in line behind this mustn't wait for good
+    let res =
+        ani::output_within(&mut cli, PROBE_LIMIT).ok_or("ani-cli didn't answer for a minute")?;
     match fs::read_to_string(&out) {
         Ok(text) => {
             let _ = fs::remove_file(&out);
@@ -186,6 +308,8 @@ fn probe(args: &[&str]) -> Result<Option<(String, Vec<String>)>, String> {
         Err(_) => Err(ani::last_error(&res.stderr)),
     }
 }
+
+const PROBE_LIMIT: Duration = Duration::from_secs(60);
 
 /// What a search found: provider titles, and the episodes if there was just one hit.
 type Hits = (Vec<String>, Option<Vec<String>>);
@@ -428,6 +552,17 @@ impl Pick {
             Pick::First(q, t) => (q, t, 1),
         }
     }
+
+    /// Whether `src` is this pick, the second of two equal titles too. A single hit shows no
+    /// title, so it goes by its search, and is the only one there is.
+    fn is(&self, src: &Source) -> bool {
+        let (q, t, n) = match self {
+            Pick::Nth(q, t, n) => (q, t, *n),
+            Pick::First(q, t) => (q, t, 1),
+        };
+        let single_hit = src.title == *q && src.nth == 1 && n == 1;
+        src.query == *q && (src.title == *t && src.nth == n || single_hit)
+    }
 }
 
 /// Manually chosen sources by AniList id.
@@ -442,10 +577,10 @@ pub fn by_hand(id: u64) -> bool {
 
 fn save_override(id: u64, query: &str, hits: &[String], i: usize) -> std::io::Result<()> {
     let nth = hits[..=i].iter().filter(|h| **h == hits[i]).count();
-    let mut all = overrides();
     let pick = Pick::Nth(query.to_string(), hits[i].clone(), nth);
-    all.insert(id.to_string(), pick);
-    ani::write_json(&overrides_path(), &all)
+    ani::edit_json(&overrides_path(), |all: &mut HashMap<String, Pick>| {
+        all.insert(id.to_string(), pick);
+    })
 }
 
 pub fn default_query(m: &Media) -> String {
@@ -1031,7 +1166,7 @@ mod tests {
         };
         let mut all = Sources {
             known: HashMap::new(),
-            checked: HashSet::new(),
+            checked: HashMap::new(),
             asked: HashMap::new(),
             tickets: 0,
             picked: HashSet::new(),
@@ -1048,6 +1183,119 @@ mod tests {
         assert!(all.answer(7, again, &Ok(src("New"))));
         assert!(matches!(all.lookup(7), Lookup::Ready(s) if s.title == "New"));
         assert_eq!(all.ask(7), None, "checked this session");
+    }
+
+    #[test]
+    fn a_play_waits_for_the_lookup_on_its_way_instead_of_searching_again() {
+        let cached = Source {
+            query: "q".into(),
+            index: 1,
+            title: "Show".into(),
+            nth: 1,
+            episodes: Vec::new(),
+        };
+        let mut all = Sources {
+            known: HashMap::from([(7, cached.clone())]),
+            checked: HashMap::new(),
+            asked: HashMap::new(),
+            tickets: 0,
+            picked: HashSet::new(),
+        };
+        assert!(matches!(all.to_play(7), Lookup::Check(_)), "none runs yet");
+        let ticket = all.ask(7).unwrap();
+        assert!(
+            matches!(all.to_play(7), Lookup::Resolve),
+            "its answer will do"
+        );
+        // a download goes by what's known, as it runs on its own
+        assert!(matches!(all.lookup(7), Lookup::Check(_)));
+        assert!(all.answer(7, ticket, &Ok(cached)));
+        assert!(matches!(all.to_play(7), Lookup::Ready(_)));
+    }
+
+    #[test]
+    fn a_checked_source_gets_checked_again_later() {
+        let src = Source {
+            query: "q".into(),
+            index: 1,
+            title: "Show".into(),
+            nth: 1,
+            episodes: Vec::new(),
+        };
+        let mut all = Sources {
+            known: HashMap::from([(7, src)]),
+            checked: HashMap::from([(7, Instant::now())]),
+            asked: HashMap::new(),
+            tickets: 0,
+            picked: HashSet::new(),
+        };
+        assert!(matches!(all.lookup(7), Lookup::Ready(_)));
+        assert_eq!(all.ask(7), None, "a moment ago");
+        // the provider's order may have shifted by now
+        let long_ago = Instant::now().checked_sub(CHECK_FOR).unwrap();
+        all.checked.insert(7, long_ago);
+        assert!(matches!(all.lookup(7), Lookup::Check(_)));
+        assert!(all.ask(7).is_some());
+    }
+
+    #[test]
+    fn a_source_saved_before_a_pick_doesnt_stand_in_for_it() {
+        let src = |query: &str, title: &str| Source {
+            query: query.into(),
+            index: 1,
+            title: title.into(),
+            nth: 1,
+            episodes: Vec::new(),
+        };
+        let known = HashMap::from([
+            (1, src("old", "Old")),
+            (2, src("q", "Picked")),
+            // a single hit shows no title: its source goes by its search
+            (3, src("q", "q")),
+            (4, src("any", "Unpicked")),
+            // the first of two equal titles, where the second was picked
+            (5, src("q", "Picked")),
+        ]);
+        let pick = || Pick::Nth("q".into(), "Picked".into(), 1);
+        let picks = HashMap::from([
+            ("1".to_string(), pick()),
+            ("2".to_string(), pick()),
+            ("3".to_string(), pick()),
+            ("5".to_string(), Pick::Nth("q".into(), "Picked".into(), 2)),
+        ]);
+        let left = agreeing(known, &picks);
+        let mut ids: Vec<u64> = left.into_keys().collect();
+        ids.sort();
+        assert_eq!(ids, [2, 3, 4]);
+        // the second of two entries named as searched, where the first was picked
+        let second = Source {
+            nth: 2,
+            ..src("Show", "Show")
+        };
+        assert!(!Pick::Nth("Show".into(), "Show".into(), 1).is(&second));
+        assert!(Pick::Nth("Show".into(), "Show".into(), 2).is(&second));
+    }
+
+    #[test]
+    fn work_ahead_gives_up_once_its_show_left_the_screen() {
+        let focus = Focus::default();
+        let ran = || in_turn(1, &focus, || Ok(true));
+        assert_eq!(ran(), Err(ABANDONED.to_string()));
+        focus.on_screen(1);
+        assert_eq!(ran(), Ok(true));
+        focus.on_screen(2);
+        assert_eq!(ran(), Err(ABANDONED.to_string()));
+        focus.waited(1);
+        assert_eq!(ran(), Ok(true), "someone waits for it");
+        // its searches too, with no ani-cli to run: gone before it would start
+        focus.waited(0);
+        let m = Media {
+            id: 1,
+            ..Default::default()
+        };
+        let mut m = m;
+        m.title.romaji = Some("Show".into());
+        assert_eq!(resolve_ahead(&m, &focus).unwrap_err(), ABANDONED);
     }
 
     #[test]
