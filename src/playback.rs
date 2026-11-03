@@ -19,6 +19,7 @@ pub trait Player: Send + Sync {
     /// Streams episode `ep` of `src`; `up` once the player shows it.
     fn stream(
         &self,
+        m: &Media,
         src: &Source,
         ep: &str,
         audio: &str,
@@ -36,12 +37,13 @@ pub struct Mpv;
 impl Player for Mpv {
     fn stream(
         &self,
+        m: &Media,
         src: &Source,
         ep: &str,
         audio: &str,
         up: &mut dyn FnMut(),
     ) -> Result<(), String> {
-        ani::stream(src, ep, audio, up)
+        ani::stream(m, src, ep, audio, up)
     }
 
     fn file(&self, m: &Media, ep: &str, file: &Path, up: &mut dyn FnMut()) -> Result<(), String> {
@@ -194,11 +196,15 @@ impl Run {
                 src
             }
         };
-        match self.player.stream(&src, &self.ep, self.audio, &mut up) {
+        let show = &self.show;
+        match self
+            .player
+            .stream(show, &src, &self.ep, self.audio, &mut up)
+        {
             // dubs come later or not at all, the subtitled one is the next best
             Err(e) if ani::dub(self.audio) && e.contains("dub") => {
                 step(Some("no dub yet, fetching it with subtitles"));
-                self.player.stream(&src, &self.ep, "sub", &mut up)
+                self.player.stream(show, &src, &self.ep, "sub", &mut up)
             }
             res => res,
         }
@@ -220,6 +226,7 @@ mod tests {
     impl Player for Script {
         fn stream(
             &self,
+            _: &Media,
             _: &Source,
             ep: &str,
             audio: &str,

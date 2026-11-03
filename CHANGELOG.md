@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.8.5 – 2026-10-30
+## 0.8.5 – 2026-11-03
 
 ### Changed
 
@@ -9,6 +9,7 @@
 ### Fixed
 
 - A typo in a search's first letters found nothing: "fieren" and "freiren" found no Frieren. The first six letters may now hold one typo (a letter missed, added or changed, or two swapped); before, the first three had to be right.
+- An episode whose stream has no English subtitles played without any, with no word why: The Apothecary Diaries 1 is one, the provider's copy that ani-cli reads lists only other languages. When ani-cli finds no subtitles, for a stream or a download, ani-hop now gets the English ones from the provider's other server, which has the same release. If that fails too, the episode plays as before. It stays out of it where the source may number episodes differently, which could get it another episode's subtitles (chosen by hand, another length than a finished show, longer than one still airing), and for a stream in a player set in `ANI_CLI_PLAYER` other than `mpv`.
 
 ## 0.8.4 – 2026-10-30
 

@@ -621,6 +621,15 @@ impl Queue {
             }
         })
         .1;
+        // still the running one, so a stop, a pause or quitting ends this too
+        let subs = self.lock().running.as_mut().and_then(|r| {
+            let subs = ani::start_subs(m, src, &dir, ep, dub)?;
+            r.pid = subs.id();
+            Some(subs)
+        });
+        if let Some(mut subs) = subs {
+            let _ = subs.wait();
+        }
         // gone already: a stop or a pause killed it
         let killed = self.lock().running.take().is_none();
         match ani::finished(&dir, ep, dub)? {
@@ -737,6 +746,7 @@ fn kill(pid: u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::mpsc::Receiver;
     use std::time::{Duration, Instant};
 
@@ -915,6 +925,46 @@ mod tests {
         q.resume();
         let t = Duration::from_secs(10);
         assert_eq!(done.recv_timeout(t).unwrap(), ("Show E1".into(), Ok(())));
+        q.quit();
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_pause_while_it_looks_for_subtitles_holds_the_next_episode() {
+        // alone in a process: a script can't run while another test's fork still holds it open
+        // from being written ("Text file busy")
+        if std::env::var_os("ANIHOP_CHILD").is_none() {
+            let home = temp("subs-home");
+            let env = [
+                ("HOME", home.clone().into_os_string()),
+                ("XDG_CONFIG_HOME", home.join("config").into_os_string()),
+                ("XDG_CACHE_HOME", home.join("cache").into_os_string()),
+            ];
+            let name =
+                "downloads::tests::a_pause_while_it_looks_for_subtitles_holds_the_next_episode";
+            assert!(crate::in_child(name, &env));
+            fs::remove_dir_all(&home).unwrap();
+            return;
+        }
+        let dir = temp("subs");
+        // stands in for the real one: says it started, then only ends when it's stopped
+        let helper = ani::cache_dir().join("bin/ani-hop-subs");
+        fs::create_dir_all(helper.parent().unwrap()).unwrap();
+        fs::write(&helper, "#!/bin/sh\n: > \"$2.asked\"\nexec sleep 30\n").unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let (q, done) = queue(&dir, "a", QUICK);
+        let mut with_subs = job(&["1", "2"]);
+        with_subs.media.id_mal = Some(1);
+        let id = with_subs.media.id;
+        q.enqueue(with_subs).unwrap();
+        let asked = dir.join("dl/Show/Show Episode 1.vtt.asked");
+        wait("it to look", || asked.exists());
+        assert!(q.pause(id, "1"));
+        let t = Duration::from_secs(10);
+        assert_eq!(done.recv_timeout(t).unwrap(), ("Show E1".into(), Ok(())));
+        assert!(done.recv_timeout(Duration::from_millis(300)).is_err());
+        assert!(q.snapshot().paused);
+        assert!(!dir.join("dl/Show/Show Episode 2.mp4").exists());
         q.quit();
         fs::remove_dir_all(&dir).unwrap();
     }

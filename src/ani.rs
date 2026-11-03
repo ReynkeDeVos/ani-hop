@@ -6,7 +6,7 @@
 //! keeps working after `ani-cli -U`.
 
 use crate::anilist::{Entry, Media};
-use crate::source::Source;
+use crate::source::{Source, by_hand};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -58,6 +58,37 @@ cat "$log" >&2
 grep -Eq '^\[(in#|hls|https?|tcp|tls|mpegts)|\[(error|fatal|panic)\]' "$log" && ok=1 && echo "parts of it failed to download" >&2
 rm -f "$log"
 [ $ok = 0 ] && mv -f "$out.part" "$out"
+"#;
+
+const FAKE_MPV: &str = r#"#!/bin/sh
+# ani-hop: ani-cli's way to mpv. With no subtitles from ani-cli, ani-hop-subs looks for them.
+case " $* " in
+*" --sub-file="*) ;;
+*) [ -n "$ANIHOP_SUBS_PAGE" ] && ani-hop-subs "$ANIHOP_SUBS_PAGE" "$ANIHOP_SUBS_FILE" && set -- --sub-file="$ANIHOP_SUBS_FILE" "$@" ;;
+esac
+PATH=${PATH#"${0%/*}:"}
+exec mpv "$@"
+"#;
+
+const FAKE_SUBS: &str = r#"#!/bin/sh
+# ani-hop: the emergency fallback for an episode ani-cli finds no subtitles for. ani-cli reads
+# one of the provider's servers, whose copy can lack them (The Apothecary Diaries 1 has no
+# English track); the other server has the same release with them. Writes its English ones from
+# page $1 to file $2, or fails and leaves no file: the episode then plays as ani-cli found it.
+# shortcut: knows that server's page and API, so a change there ends the fallback; drop this
+# once ani-cli reads a second server (its issue 1932).
+host=https://megaplay.buzz/
+id=$(curl -sfL --max-time 5 -e "$host" "$1" | sed -nE 's/.*data-id="([0-9]+)".*/\1/p' | head -n 1)
+[ -n "$id" ] || exit 1
+url=$(curl -sfL --max-time 5 -e "$host" "${host}stream/getSources?id=$id" | tr '{' '\n' |
+	grep -m 1 '"label":"English' | sed -nE 's|.*"file":"([^"]*)".*|\1|p' | sed 's|\\/|/|g')
+# from the network, and curl would take one starting with - for an option
+case $url in https://*) ;; *) exit 1 ;; esac
+tmp=$2.$$
+trap 'rm -f "$tmp"' EXIT
+trap 'exit 1' HUP INT TERM
+curl -sfL --proto =https --max-time 5 -e "$host" -o "$tmp" "$url" &&
+	head -n 1 "$tmp" | grep -q WEBVTT && mv -f "$tmp" "$2"
 "#;
 
 /// A test outside `in_child`: it gets a home of its own, so no test run touches the user's
@@ -390,7 +421,12 @@ pub fn setup() -> std::io::Result<()> {
     let bin = cache_dir().join("bin");
     fs::create_dir_all(&bin)?;
     fs::create_dir_all(cache_dir().join("probe"))?;
-    for (name, script) in [("rofi", FAKE_ROFI), ("ffmpeg", FAKE_FFMPEG)] {
+    for (name, script) in [
+        ("rofi", FAKE_ROFI),
+        ("ffmpeg", FAKE_FFMPEG),
+        ("mpv", FAKE_MPV),
+        ("ani-hop-subs", FAKE_SUBS),
+    ] {
         fs::write(bin.join(name), script)?;
         fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755))?;
     }
@@ -623,8 +659,38 @@ fn mode(dub: bool) -> &'static str {
     if dub { "dub" } else { "sub" }
 }
 
+/// Episode `ep`'s page on the provider's other server, for FAKE_SUBS. That server goes by the
+/// show's MyAnimeList id, so there's none unless `src` numbers episodes as the show does: a
+/// source chosen by hand can be another part, one of another length than a finished show (or
+/// longer than one still airing) holds several parts or is another. Those would get another
+/// episode's subtitles.
+/// shortcut: a wrong source of the same length still passes, it plays the wrong show anyway;
+/// telling them apart needs the id ani-cli only gives ani-skip.
+fn subs_page(m: &Media, src: &Source, ep: &str, dub: bool) -> Option<String> {
+    let mal = m.id_mal?;
+    let eps = src.episodes.len();
+    let fits = match m.episodes {
+        Some(n) if m.status.as_deref() == Some("FINISHED") => eps == n as usize,
+        Some(n) => eps <= n as usize,
+        None => true,
+    };
+    (fits && !by_hand(m.id)).then(|| {
+        format!(
+            "https://megaplay.buzz/stream/mal/{mal}/{}/{}",
+            plain(ep),
+            mode(dub)
+        )
+    })
+}
+
 /// Streams through ani-cli (with ani-skip); `up` is called once mpv shows the episode.
-pub fn stream(src: &Source, ep: &str, audio: &str, mut up: impl FnMut()) -> Result<(), String> {
+pub fn stream(
+    m: &Media,
+    src: &Source,
+    ep: &str,
+    audio: &str,
+    mut up: impl FnMut(),
+) -> Result<(), String> {
     let mut flags = std::env::var("ANI_CLI_PLAYER_FLAGS").unwrap_or_default();
     // mpv unless the user picked another: ani-cli would take IINA on macOS and Windows'
     // mpv.exe under WSL
@@ -636,7 +702,18 @@ pub fn stream(src: &Source, ep: &str, audio: &str, mut up: impl FnMut()) -> Resu
     if player.contains("mpv") && !subs(audio) {
         flags.push_str(" --sub-visibility=no");
     }
-    let child = ani_cli()
+    let mut cli = ani_cli();
+    // gone once the player is, which read it at the start
+    let subs = subs_page(m, src, ep, dub(audio)).map(|page| {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let name = format!("subs-{}-{n}.vtt", std::process::id());
+        let file = cache_dir().join("probe").join(name);
+        cli.env("ANIHOP_SUBS_FILE", &file)
+            .env("ANIHOP_SUBS_PAGE", page);
+        file
+    });
+    let child = cli
         .env("ANI_CLI_PLAYER", player)
         .env("ANI_CLI_MODE", mode(dub(audio)))
         .env("ANI_CLI_PLAYER_FLAGS", flags)
@@ -654,7 +731,11 @@ pub fn stream(src: &Source, ep: &str, audio: &str, mut up: impl FnMut()) -> Resu
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("ani-cli: {e}"))?;
-    match follow(child, |l| player_up(l, &mut up)) {
+    let played = follow(child, |l| player_up(l, &mut up));
+    if let Some(file) = subs {
+        let _ = fs::remove_file(file);
+    }
+    match played {
         (true, _) => Ok(()),
         (false, stderr) => Err(last_error(&stderr)),
     }
@@ -1138,6 +1219,22 @@ pub fn start_download(src: &Source, ep: &str, dub: bool, dir: &Path) -> Result<C
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("ani-cli: {e}"))
+}
+
+/// Starts FAKE_SUBS for episode `ep` in `dir`, if it's there and ani-cli found no subtitles for
+/// it.
+pub fn start_subs(m: &Media, src: &Source, dir: &Path, ep: &str, dub: bool) -> Option<Child> {
+    let (_, file) = local_episodes(dir).into_iter().find(|(e, _)| e == ep)?;
+    let vtt = file.with_extension("vtt");
+    let page = subs_page(m, src, ep, dub).filter(|_| !vtt.exists())?;
+    Command::new(cache_dir().join("bin/ani-hop-subs"))
+        .arg(page)
+        .arg(vtt)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()
 }
 
 /// Whether a download of episode `ep` into `dir` that ended left its file. ani-cli exits 0
@@ -1708,6 +1805,185 @@ mod tests {
         assert_eq!(so_far("00:26:16.0", Some(1693.1), None), "93%");
         assert_eq!(so_far("00:28:14.0", Some(1693.1), Some(8.0)), "100%");
         assert_eq!(so_far("00:06:45.000000", None, Some(8.0)), "06:45 so far");
+    }
+
+    #[test]
+    fn subs_page_is_for_a_source_numbered_as_the_show() {
+        let m = |id_mal, episodes, status: &str| Media {
+            id_mal,
+            episodes,
+            status: Some(status.into()),
+            ..Media::default()
+        };
+        let src = Source::at("q", &["Show".into()], 1, vec!["1".into(); 12]);
+        let done = "FINISHED";
+        assert_eq!(
+            subs_page(&m(Some(54492), Some(12), done), &src, "1", false).unwrap(),
+            "https://megaplay.buzz/stream/mal/54492/1/sub"
+        );
+        assert_eq!(
+            subs_page(&m(Some(54492), Some(12), done), &src, "12.5", true).unwrap(),
+            "https://megaplay.buzz/stream/mal/54492/12.5/dub"
+        );
+        // what the provider calls an episode stays one part of the url
+        assert_eq!(
+            subs_page(&m(Some(1), Some(12), done), &src, "../x", false).unwrap(),
+            "https://megaplay.buzz/stream/mal/1/..%2Fx/sub"
+        );
+        // still airing: the source has what's out so far, AniList may not say how many there
+        // will be
+        let airing = "RELEASING";
+        assert!(subs_page(&m(Some(1), Some(24), airing), &src, "1", false).is_some());
+        assert!(subs_page(&m(Some(1), None, airing), &src, "1", false).is_some());
+        // no id for that server
+        assert_eq!(subs_page(&m(None, Some(12), done), &src, "1", false), None);
+        // several parts in one entry, or only one of the show's
+        assert_eq!(
+            subs_page(&m(Some(1), Some(6), done), &src, "1", false),
+            None
+        );
+        assert_eq!(
+            subs_page(&m(Some(1), Some(6), airing), &src, "1", false),
+            None
+        );
+        assert_eq!(
+            subs_page(&m(Some(1), Some(24), done), &src, "1", false),
+            None
+        );
+    }
+
+    #[test]
+    fn fake_mpv_finds_subtitles_only_when_ani_cli_has_none() {
+        // alone in a process: a script can't run while another test's fork still holds it open
+        // from being written ("Text file busy")
+        if std::env::var_os("ANIHOP_CHILD").is_none() {
+            let name = "ani::tests::fake_mpv_finds_subtitles_only_when_ani_cli_has_none";
+            assert!(crate::in_child(name, &[]));
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ani-hop-mpv-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let (fake, real) = (dir.join("fake"), dir.join("real"));
+        let sys = std::env::var("PATH").unwrap_or_default();
+        // stands in for the real one: logs its arguments, fails to show its exit code comes through
+        let mpv = "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LOG.mpv\"\nexit 7\n";
+        // and the real curl: logs each call, answers with the server's page, API or file
+        let curl = r#"#!/bin/sh
+echo "$*" >> "$LOG.curl"
+for a; do
+	[ "$prev" = -o ] && out=$a
+	prev=$a
+done
+case $* in
+*getSources*) printf '%s' "$TRACKS" ;;
+*stream/mal*) printf '%s' "$PAGE" ;;
+*)
+	printf '%s' "$VTT" > "$out"
+	[ "$VTT" != partial ] || exit 22
+	;;
+esac
+"#;
+        for (bin, name, script) in [
+            (&fake, "mpv", FAKE_MPV),
+            (&fake, "ani-hop-subs", FAKE_SUBS),
+            (&real, "mpv", mpv),
+            (&real, "curl", curl),
+        ] {
+            fs::create_dir_all(bin).unwrap();
+            fs::write(bin.join(name), script).unwrap();
+            fs::set_permissions(bin.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let (log, file) = (dir.join("log"), dir.join("subs.vtt"));
+        const PAGE: &str = r#"<div id="player" data-id="12763" data-realid="1"></div>"#;
+        // as the server has them: a track without a label, then English among others
+        const TRACKS: &str = r#"{"tracks":[{"file":"https:\/\/h\/thumbs.vtt","kind":"thumbnails"},{"file":"https:\/\/h\/ara.vtt","label":"Arabic","kind":"captions"},{"file":"https:\/\/h\/eng.vtt","label":"English","kind":"captions","default":true}]}"#;
+        const VTT: &str = "WEBVTT\n\n00:01.000 --> 00:02.000\nHi\n";
+        // what mpv got, what curl was asked, with what's in the file afterwards
+        let run = |args: &[&str], page: Option<&str>, vars: [(&str, &str); 3]| {
+            let _ = fs::remove_file(log.with_extension("curl"));
+            let mut mpv = Command::new(fake.join("mpv"));
+            if let Some(page) = page {
+                mpv.env("ANIHOP_SUBS_PAGE", page)
+                    .env("ANIHOP_SUBS_FILE", &file);
+            }
+            let o = mpv
+                .args(args)
+                .envs(vars)
+                .env(
+                    "PATH",
+                    format!("{}:{}:{sys}", fake.display(), real.display()),
+                )
+                .env("LOG", &log)
+                .output()
+                .unwrap();
+            assert_eq!(o.status.code(), Some(7), "mpv's own exit code");
+            (
+                fs::read_to_string(log.with_extension("mpv")).unwrap(),
+                fs::read_to_string(log.with_extension("curl")).unwrap_or_default(),
+                fs::read_to_string(&file).ok(),
+            )
+        };
+        let page = Some("https://megaplay.buzz/stream/mal/1/1/sub");
+        let all = [("PAGE", PAGE), ("TRACKS", TRACKS), ("VTT", VTT)];
+        let stream = ["--referrer=r", "--force-media-title=A Episode 1", "v.m3u8"];
+
+        // ani-cli has some: nothing is asked and mpv gets what ani-cli passed
+        let args = ["--sub-file=https://x/a.vtt", "v.m3u8"];
+        let (mpv, curl, got) = run(&args, page, all);
+        assert_eq!(mpv, "--sub-file=https://x/a.vtt\nv.m3u8\n");
+        assert_eq!((curl.as_str(), got), ("", None));
+
+        // a show without a MyAnimeList id has no page to ask
+        let (mpv, curl, _) = run(&stream, None, all);
+        assert!(!mpv.contains("--sub-file") && curl.is_empty());
+
+        // the page doesn't have the episode: ends there, mpv plays without
+        let (mpv, curl, got) = run(&stream, page, [("PAGE", "Error"), all[1], all[2]]);
+        assert!(!mpv.contains("--sub-file") && got.is_none());
+        assert_eq!(curl.lines().count(), 1);
+
+        // no English track
+        let french = r#"{"tracks":[{"file":"https:\/\/h\/f.vtt","label":"French"}]}"#;
+        let (mpv, curl, got) = run(&stream, page, [all[0], ("TRACKS", french), all[2]]);
+        assert!(!mpv.contains("--sub-file") && got.is_none());
+        assert_eq!(curl.lines().count(), 2);
+
+        // a url curl would take for an option is never given to it
+        let evil = dir.join("overwritten");
+        let tracks = format!(
+            r#"{{"tracks":[{{"file":"--libcurl={}","label":"English"}}]}}"#,
+            evil.display()
+        );
+        let (mpv, curl, got) = run(&stream, page, [all[0], ("TRACKS", &tracks), all[2]]);
+        assert!(!mpv.contains("--sub-file") && got.is_none());
+        assert_eq!(curl.lines().count(), 2);
+        assert!(!evil.exists() && !curl.contains("libcurl"));
+
+        // a block page where the file should be, or a transfer cut off: not taken for
+        // subtitles, nothing left behind
+        for vtt in ["<!DOCTYPE html>", "partial"] {
+            let (mpv, curl, got) = run(&stream, page, [all[0], all[1], ("VTT", vtt)]);
+            assert!(!mpv.contains("--sub-file") && got.is_none());
+            assert_eq!(curl.lines().count(), 3);
+            let left: Vec<_> = fs::read_dir(&dir).unwrap().flatten().collect();
+            assert!(!left.iter().any(|e| {
+                let name = e.file_name();
+                name.to_string_lossy().starts_with("subs.vtt")
+            }));
+        }
+
+        // it's there: mpv gets the English file, with its other arguments as they were
+        let (mpv, curl, got) = run(&stream, page, all);
+        let sub_file = format!("--sub-file={}\n", file.display());
+        assert_eq!(mpv, format!("{sub_file}{}\n", stream.join("\n")));
+        assert_eq!(got.as_deref(), Some(VTT));
+        assert!(curl.contains("getSources?id=12763") && curl.contains("https://h/eng.vtt"));
+        assert!(
+            curl.lines()
+                .all(|l| l.contains("-e https://megaplay.buzz/"))
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

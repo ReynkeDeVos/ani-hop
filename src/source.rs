@@ -435,6 +435,11 @@ fn overrides() -> HashMap<String, Pick> {
     ani::read_json(&overrides_path())
 }
 
+/// Whether the show's source was chosen by hand.
+pub fn by_hand(id: u64) -> bool {
+    overrides().contains_key(&id.to_string())
+}
+
 fn save_override(id: u64, query: &str, hits: &[String], i: usize) -> std::io::Result<()> {
     let nth = hits[..=i].iter().filter(|h| **h == hits[i]).count();
     let mut all = overrides();
@@ -510,8 +515,7 @@ fn recount(m: &Media, eps: &[String]) -> Option<Source> {
     let n = m
         .episodes
         .filter(|_| m.status.as_deref() == Some("FINISHED"))? as usize;
-    let by_hand = || overrides().contains_key(&m.id.to_string());
-    if eps.len() == n || by_hand() {
+    if eps.len() == n || by_hand(m.id) {
         return None;
     }
     by_count(m, n, search, episodes)
@@ -1051,6 +1055,7 @@ mod tests {
         if std::env::var_os("ANIHOP_CHILD").is_some() {
             let all = Sources::load();
             assert!(all.picked(7) && !all.picked(8));
+            assert!(by_hand(7) && !by_hand(8));
             return;
         }
         let dir = std::env::temp_dir().join(format!("ani-hop-picks-{}", std::process::id()));
