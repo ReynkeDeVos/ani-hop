@@ -45,6 +45,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub const PIN_REDIRECT: &str = "https://anilist.co/api/v2/oauth/pin";
+/// How long enter on the Continue row waits to hear which episode is next, before it plays what
+/// it knows: AniList takes half a second for a list, and much longer when it's down or busy.
+const CONTINUE_LIMIT: Duration = Duration::from_secs(3);
 /// The row of "Watched up to…" that goes back to none: not an episode a provider could list.
 const NO_EPISODES: &str = "none";
 const LISTS: [(&str, &str); 6] = [
@@ -155,6 +158,8 @@ enum Msg {
     ),
     /// the downloaded shows as AniList has them now
     Local(Stamp, Result<Vec<Media>, String>),
+    /// Watching as AniList has it now, for the Continue row: whose, when asked, the answer
+    Watching(u64, Stamp, Result<Vec<Media>, String>, lists::Ask),
     /// the next page of a ranking
     More(u64, Stamp, Result<Vec<Media>, String>),
     Hits(u64, Result<Vec<String>, String>),
@@ -171,10 +176,13 @@ enum Msg {
     Resolved(Media, u64, Result<Source, String>),
     /// a change to the user's list, answered: a show's parts with it, the show first
     Entry(Vec<entries::Done>),
-    /// (Playback attempt, what it waits on now; None = the player is up)
-    PlayStep(u64, Option<&'static str>),
-    /// (Playback attempt, show, episode, how it ended)
-    Played(u64, Media, String, Result<(), String>),
+    /// the Continue row has waited long enough for this page
+    ContinueLimit(u64),
+    /// (Playback attempt, when it started, its show, what it waits on now; None = the player
+    /// is up)
+    PlayStep(u64, Stamp, Media, Option<&'static str>),
+    /// (Playback attempt, when it started, show, episode, how it ended)
+    Played(u64, Stamp, Media, String, Result<(), String>),
     /// what a rescan of the download folder found: the shows and their episodes
     Scanned(Vec<(Media, OnDisk)>),
     /// an episode downloaded or failed: ("Show E3", result)
@@ -233,6 +241,14 @@ pub struct App {
     parked: Option<(Media, Want)>,
     /// an episode that was played, whose question waits for AniList to say which part it's in
     marking: Option<(Media, String)>,
+    /// the show played last on this login, which the Continue row goes on with
+    last_played: Option<Media>,
+    /// Watching as last read, which it goes on with otherwise (none while logged out)
+    watching: Option<List>,
+    /// Watching's answer is on its way
+    reading_watching: bool,
+    /// the page of a show Continue opened, whose next episode plays once that's known
+    continuing: Option<u64>,
     /// the show on screen, for work done ahead of time
     focus: Focus,
     /// the next episode's stream is fetched ahead (Settings)
@@ -391,6 +407,11 @@ fn user_path() -> PathBuf {
     ani::config_dir().join("user.json")
 }
 
+/// The show a login played last. A cache: without it the Continue row goes by Watching.
+fn last_played_path(user: u64) -> PathBuf {
+    lists::cache(&format!("{user}-last-played"))
+}
+
 fn client_id() -> Option<String> {
     fs::read_to_string(ani::config_dir().join("client_id"))
         .ok()
@@ -527,6 +548,10 @@ impl App {
             external: None,
             parked: None,
             marking: None,
+            last_played: None,
+            watching: None,
+            reading_watching: false,
+            continuing: None,
             focus: Focus::default(),
             preloading: false,
             background: seams.background,
@@ -560,6 +585,7 @@ impl App {
         app.missing = ani::missing_deps();
         app.old_ani_cli = ani::old_ani_cli();
         app.preloading = ani::preload_on();
+        app.read_continue();
         app.push("ani-hop", View::Main);
         let welcomed = ani::config_dir().join("welcomed");
         let first = !welcomed.exists();
@@ -632,6 +658,157 @@ impl App {
         self.parts.clear();
         self.related.clear();
         self.marking = None;
+        self.forget_continue();
+    }
+
+    /// Nothing of the last login's for the Continue row: the next login's comes from its files.
+    fn forget_continue(&mut self) {
+        (self.last_played, self.watching, self.continuing) = (None, None, None);
+        self.reading_watching = false;
+    }
+
+    /// Reads what the Continue row goes on with for this login, as of its last run, so the row
+    /// is there from the first frame, and asks AniList how things stand now: also right after
+    /// a read, which may have been a list's, whose answer the show played last doesn't have.
+    fn read_continue(&mut self) {
+        let Some(user) = self.user.as_ref().map(|u| u.0) else {
+            return;
+        };
+        self.last_played = ani::read_json(&last_played_path(user));
+        let cache = lists::cache(&format!("{user}-CURRENT"));
+        let (list, _) = List::open(Feed::Whole, Some(cache), std::time::SystemTime::now());
+        self.watching = Some(list);
+        self.reading_watching = true;
+        let (c, stamp, ask) = (self.client.clone(), self.entries.stamp(), lists::Ask::now());
+        self.spawn(move || Msg::Watching(user, stamp, c.list(user, "CURRENT"), ask));
+        // it may go on into one, which is how it still has an episode to go on to
+        if let Some(m) = self.last_played.clone() {
+            self.want_parts(&m);
+        }
+    }
+
+    /// `m` played: the Continue row goes on with it from now on, also at the next start. Only
+    /// a show AniList keeps progress of: others would say episode 1 whatever was watched.
+    fn played(&mut self, mut m: Media) {
+        let Some(user) = self.user.as_ref().filter(|_| m.on_anilist()).map(|u| u.0) else {
+            return;
+        };
+        m.media_list_entry = self.entries.entry(&m).cloned();
+        // without it the next start goes by Watching
+        let _ = ani::edit_json(&last_played_path(user), |saved| *saved = Some(m.clone()));
+        self.last_played = Some(m);
+        self.rebuild();
+    }
+
+    /// Changes this login's file of the show played last, while that's still `id`: what another
+    /// ani-hop played since is what counts at the next start then.
+    fn edit_last_played(&self, id: u64, to: Option<&Media>) {
+        if let Some(user) = self.user.as_ref().map(|u| u.0) {
+            let _ = ani::edit_json(&last_played_path(user), |saved: &mut Option<Media>| {
+                if saved.as_ref().is_some_and(|m| m.id == id) {
+                    *saved = to.cloned();
+                }
+            });
+        }
+    }
+
+    /// Newer data of the show played last, which doesn't make it played again.
+    fn update_last_played(&mut self, mut m: Media) {
+        m.media_list_entry = self.entries.entry(&m).cloned();
+        self.edit_last_played(m.id, Some(&m));
+        self.last_played = Some(m);
+    }
+
+    /// The show played last isn't one to go on with anymore.
+    fn forget_last_played(&mut self) {
+        if let Some(m) = self.last_played.take() {
+            self.edit_last_played(m.id, None);
+        }
+    }
+
+    /// Watching's answer, asked at `stamp`, doesn't have `m`, which was on it as far as anyone
+    /// knew: another device moved it on, to where is for AniList to say.
+    fn left_watching(&self, m: &Media, stamp: Stamp) -> bool {
+        let shows = self.watching.iter().flat_map(|l| &l.shows);
+        !(shows.into_iter()).any(|s| s.id == m.id)
+            && !self.entries.newer_than(m, stamp)
+            && self.entries.entry(m).is_some_and(|e| e.status == "CURRENT")
+    }
+
+    /// What the Continue row goes on with, and the episode: the show played last unless it was
+    /// put aside, else the first on Watching, as long as it has an episode out to go on to.
+    fn to_continue(&self) -> Option<(&Media, u32)> {
+        let status = |m: &Media| self.entries.entry(m).map(|e| e.status.clone());
+        let last = (self.last_played.iter())
+            .filter(|m| !matches!(status(m).as_deref(), Some("PAUSED" | "DROPPED")));
+        let watching = (self.watching.iter().flat_map(|l| &l.shows))
+            .filter(|m| status(m).as_deref() == Some("CURRENT"));
+        (last.chain(watching)).find_map(|m| self.progress(m).next_out().map(|ep| (m, ep)))
+    }
+
+    /// Enter on the Continue row: `m`'s page, and its next episode as enter there plays it.
+    fn go_on_with(&mut self, m: Media) {
+        self.open_show(m);
+        self.continuing = Some(self.top().id);
+        self.continue_play();
+        self.limit_continue();
+    }
+
+    /// Ends the Continue row's wait at CONTINUE_LIMIT, if it's waiting.
+    fn limit_continue(&self) {
+        if let Some(id) = self.continuing {
+            self.spawn(move || {
+                thread::sleep(CONTINUE_LIMIT);
+                Msg::ContinueLimit(id)
+            });
+        }
+    }
+
+    /// The page the Continue row is waiting on. Not if a key came meanwhile, or something's on
+    /// top of it: what's on screen is theirs then.
+    fn continuing_page(&mut self) -> Option<Media> {
+        let id = self.continuing?;
+        let top = self.stack.last().unwrap();
+        match &top.view {
+            View::Show(m) if top.id == id => Some(m.clone()),
+            _ => {
+                self.continuing = None;
+                None
+            }
+        }
+    }
+
+    /// Plays what the Continue row asked for, once it's known which episode that is.
+    fn continue_play(&mut self) {
+        let Some(m) = self.continuing_page() else {
+            return;
+        };
+        // what's next may change with these answers
+        if !self.reading_watching
+            && !matches!(self.parts.get(&m.id), Some((_, None)))
+            && !self.saving_progress(&m)
+        {
+            self.continue_now(m);
+        }
+    }
+
+    /// Plays what the Continue row asked for, as enter on `m`'s page would by now.
+    fn continue_now(&mut self, m: Media) {
+        self.continuing = None;
+        // Playback only stops a second player while the first is starting
+        if let Some(p) = self.playback.now() {
+            return self.toast(format!("Already playing {}", p.title), false);
+        }
+        match self.progress(&m).next_out() {
+            Some(_) => self.show_action(m, "next"),
+            None => self.toast(format!("You're caught up on {}", m.name()), false),
+        }
+    }
+
+    /// A save of `m`'s or its parts' progress is on its way: until AniList has answered, its
+    /// next episode is still the one just marked.
+    fn saving_progress(&self, m: &Media) -> bool {
+        self.entries.saving(m) || (self.parts(m).iter()).any(|(_, p)| self.entries.saving(p))
     }
 
     /// Back to the main menu; an unanswered resume question stays.
@@ -766,6 +943,11 @@ impl App {
             View::Episodes(m, EpMode::Download) => m,
             View::Episodes(_, EpMode::Play) => return Some("play"),
             View::Show(_) if screen.menu.current().is_some_and(|i| i.key == "next") => {
+                return Some("play");
+            }
+            View::Main
+                if (screen.menu.current()).is_some_and(|i| i.key.starts_with("continue:")) =>
+            {
                 return Some("play");
             }
             _ => return Some("select"),
@@ -1021,8 +1203,16 @@ impl App {
                     }
                 };
                 let mut v = Vec::new();
-                // what you're watching goes first, so enter-enter-enter continues it; then
-                // finding something new
+                if let Some((m, ep)) = self.to_continue() {
+                    let key = format!("continue:{}", m.id);
+                    let hint = format!("continue episode {ep}");
+                    let mut it = Item::new(key, format!("▶  {}", m.name()), hint);
+                    // all a row has room for beside a title at 80 columns, so no word in the label
+                    it.short = format!("ep {ep}");
+                    it.about = "continue".into();
+                    v.push(it);
+                }
+                // what you're watching goes first; then finding something new
                 if self.user.is_some() {
                     v.extend(LISTS[..2].iter().map(list("")));
                 }
@@ -1145,9 +1335,8 @@ impl App {
             View::Show(m) => {
                 let dl = self.show_downloads(m);
                 let src = self.sources.get(m.id);
-                let (next, released) = (self.progress(m).next(), self.progress(m).released());
                 let mut v = Vec::new();
-                if released.is_none_or(|r| next <= r) {
+                if let Some(next) = self.progress(m).next_out() {
                     let verb = if next > 1 { "Continue with" } else { "Play" };
                     let on_disk = (dl.on_disk().iter()).any(|(e, _)| ani::ep_num(e) == next as f64);
                     v.push(Item::new(
@@ -1351,6 +1540,7 @@ impl App {
             return;
         }
         self.pressed = true;
+        self.continuing = None;
         // read by now; what this key does may have its own to say
         self.toast.take_if(|t| t.1);
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
@@ -1711,6 +1901,15 @@ impl App {
 
     fn main_action(&mut self, key: &str, label: &str) {
         let c = self.client.clone();
+        // the show on the row, whatever would go there by now
+        if let Some(id) = key.strip_prefix("continue:") {
+            let watching = self.watching.iter().flat_map(|l| &l.shows);
+            let m = (self.last_played.iter().chain(watching)).find(|m| m.id.to_string() == id);
+            if let Some(m) = m.cloned() {
+                self.go_on_with(m);
+            }
+            return;
+        }
         if let Some(sort) = key.strip_prefix("browse:") {
             let sort = sort.to_string();
             let cache = self.ranking_key(&sort);
@@ -1849,6 +2048,7 @@ impl App {
                 self.entries.login(Arc::new(self.client.clone()));
                 self.parts.clear();
                 self.related.clear();
+                self.forget_continue();
                 let c = self.client.clone();
                 self.spawn(move || Msg::Viewer(c.token.clone(), c.viewer()));
                 self.toast("Checking token…", false);
@@ -1887,9 +2087,11 @@ impl App {
         else {
             return;
         };
-        let saving =
-            self.entries.saving(m) || (self.parts(m).iter()).any(|(_, p)| self.entries.saving(p));
-        if !self.preloading || !ani::can_hold() || saving || self.playback.now().is_some() {
+        if !self.preloading
+            || !ani::can_hold()
+            || self.saving_progress(m)
+            || self.playback.now().is_some()
+        {
             return;
         }
         let Lookup::Ready(src) = self.sources.lookup(m.id) else {
@@ -1967,13 +2169,7 @@ impl App {
                 };
                 self.fulfill(m, Want::Episodes(mode));
             }
-            // until AniList has answered, "next" is still the episode just marked
-            "next"
-                if self.entries.saving(&m)
-                    || (self.parts(&m).iter()).any(|(_, p)| self.entries.saving(p)) =>
-            {
-                self.toast("Saving your progress…", false)
-            }
+            "next" if self.saving_progress(&m) => self.toast("Saving your progress…", false),
             "next" => self.play(m.clone(), self.progress(&m).next().to_string()),
             "play" => self.resolve(&m, Some(Want::Episodes(EpMode::Play))),
             // what's on disk can be deleted before ani-cli answers, or without it
@@ -2135,9 +2331,11 @@ impl App {
             Start::Lookup => self.resolve(&m, Some(Want::Play(ep))),
             Start::Run(run) => {
                 let (tx, attempt) = (self.tx.clone(), run.attempt);
+                let stamp = self.entries.stamp();
                 self.spawn(move || {
-                    let res = run.run(&|step| _ = tx.send(Msg::PlayStep(attempt, step)));
-                    Msg::Played(attempt, m, ep, res)
+                    let step = |step| _ = tx.send(Msg::PlayStep(attempt, stamp, m.clone(), step));
+                    let res = run.run(&step);
+                    Msg::Played(attempt, stamp, m, ep, res)
                 });
             }
         }
@@ -2225,6 +2423,38 @@ impl App {
                 }
                 self.rebuild();
             }
+            Msg::Watching(user, stamp, res, ask) => {
+                let res = self.observed(stamp, res);
+                // asked for someone who isn't logged in anymore; another read is on its way
+                if self.user.as_ref().map(|u| u.0) != Some(user)
+                    || res.as_ref().err().is_some_and(String::is_empty)
+                {
+                    return;
+                }
+                self.reading_watching = false;
+                // a failed one keeps what's known: the row still works, and it's nothing to say
+                let read = (self.watching.as_mut()).is_some_and(|l| l.refreshed(ask, res).is_ok());
+                if read && let Some(m) = self.last_played.clone() {
+                    let shows = self.watching.iter().flat_map(|l| &l.shows);
+                    match shows.into_iter().find(|s| s.id == m.id).cloned() {
+                        Some(fresh) => self.update_last_played(fresh),
+                        None if self.left_watching(&m, stamp) => self.forget_last_played(),
+                        None => {}
+                    }
+                }
+                // what enter on the row took for next isn't known anymore
+                if read
+                    && self.continuing.is_some()
+                    && let View::Show(m) = &self.stack.last().unwrap().view
+                    && self.left_watching(m, stamp)
+                {
+                    let text = format!("{} isn't on Watching anymore", m.name());
+                    self.continuing = None;
+                    self.toast(text, false);
+                }
+                self.rebuild();
+                self.continue_play();
+            }
             Msg::Hits(id, res) => self.fill(id, |v| {
                 if let View::Sources(_, _, h) = v {
                     // back on the search, which says so in its own words
@@ -2244,7 +2474,12 @@ impl App {
                     &serde_json::json!([id, name, english]).to_string(),
                 );
                 let login = self.user.is_none();
+                let known = self.user.as_ref().is_some_and(|u| u.0 == id);
                 self.user = Some((id, name));
+                // from the start, it went by who was logged in last time
+                if !known {
+                    self.read_continue();
+                }
                 if login {
                     self.toast(
                         format!("Logged in as {}", self.user.as_ref().unwrap().1),
@@ -2296,7 +2531,7 @@ impl App {
                         );
                         self.toast(text, true);
                     }
-                    return;
+                    return self.continue_play();
                 };
                 if !(self.entries).observe(stamp, parts.iter_mut().map(|p| &mut p.1)) {
                     return;
@@ -2309,6 +2544,7 @@ impl App {
                 if let Some((m, ep)) = self.marking.take_if(|(m, _)| m.id == id) {
                     self.ask_watched(m, ep);
                 }
+                self.continue_play();
                 self.preload_next();
             }
             Msg::Linked(id, res) => {
@@ -2425,15 +2661,49 @@ impl App {
                 if matches!(&self.top().view, View::Status(s) if Some(s.id) == n.closes) {
                     self.stack.pop();
                 }
+                // what went wrong comes first; it's still next
+                if notices.iter().any(|n| n.error) {
+                    self.continuing = None;
+                }
+                // as saved, for a next start without AniList; taken off the list, it's done with
+                if let Some(m) = self.last_played.clone() {
+                    match m.media_list_entry.is_some() && self.entries.entry(&m).is_none() {
+                        true => self.forget_last_played(),
+                        false => self.update_last_played(m),
+                    }
+                }
                 self.refresh();
+                self.continue_play();
                 self.preload_next();
             }
-            Msg::PlayStep(attempt, step) => self.playback.step(attempt, step),
-            Msg::Played(attempt, m, ep, res) => {
+            Msg::ContinueLimit(id) if self.continuing != Some(id) => {}
+            Msg::ContinueLimit(_) => match self.continuing_page() {
+                // not over a save: until that's answered, next is the episode just marked
+                Some(m) if self.saving_progress(&m) => self.limit_continue(),
+                Some(m) => self.continue_now(m),
+                None => {}
+            },
+            Msg::PlayStep(attempt, stamp, m, step) => {
+                self.playback.step(attempt, step);
+                // the episode's on screen: now it counts as played, whatever comes next
+                if step.is_none() && self.entries.same_login(stamp) {
+                    self.played(m);
+                }
+            }
+            Msg::Played(attempt, stamp, m, ep, res) => {
+                // a player other than mpv doesn't say when it's up; one that did, counted then
+                let unsaid = self.playback.starting(attempt);
                 self.playback.ended(attempt);
+                // started before logging out or in again: no business of this login's
+                let ours = self.entries.same_login(stamp) && self.user.is_some();
                 match res {
                     Err(e) => self.toast(format!("Couldn't play episode {ep} · {e}"), true),
-                    Ok(()) if self.user.is_some() && m.on_anilist() => self.ask_watched(m, ep),
+                    Ok(()) if ours && m.on_anilist() => {
+                        if unsaid {
+                            self.played(m.clone());
+                        }
+                        self.ask_watched(m, ep);
+                    }
                     Ok(()) => {}
                 }
             }
@@ -2785,7 +3055,13 @@ mod tests {
     #[test]
     fn an_episode_past_the_shows_own_waits_to_know_which_part_its_in() {
         let (mut app, m, part, stamp) = split_season(50_010);
-        app.on_msg(Msg::Played(1, m.clone(), "13".into(), Ok(())));
+        app.on_msg(Msg::Played(
+            1,
+            app.entries.stamp(),
+            m.clone(),
+            "13".into(),
+            Ok(()),
+        ));
         assert!(
             !matches!(app.top().view, View::Confirm(_)),
             "it would save the show's own 12/12"
@@ -2801,7 +3077,13 @@ mod tests {
     #[test]
     fn a_failed_parts_lookup_saves_nothing_and_says_so() {
         let (mut app, m, _, stamp) = split_season(50_020);
-        app.on_msg(Msg::Played(1, m.clone(), "13".into(), Ok(())));
+        app.on_msg(Msg::Played(
+            1,
+            app.entries.stamp(),
+            m.clone(),
+            "13".into(),
+            Ok(()),
+        ));
         let failed = Err("Can't reach AniList".to_string());
         app.on_msg(Msg::Parts(m.id, (22, 12), stamp, failed));
         assert!(!matches!(app.top().view, View::Confirm(_)));
@@ -2812,7 +3094,13 @@ mod tests {
     #[test]
     fn an_episode_of_the_shows_own_asks_at_once_while_parts_are_looked_up() {
         let (mut app, m, _, _) = split_season(50_030);
-        app.on_msg(Msg::Played(1, m.clone(), "12".into(), Ok(())));
+        app.on_msg(Msg::Played(
+            1,
+            app.entries.stamp(),
+            m.clone(),
+            "12".into(),
+            Ok(()),
+        ));
         let View::Confirm(Pending::Progress(marks, _)) = &app.top().view else {
             panic!("asks");
         };
@@ -2836,7 +3124,13 @@ mod tests {
         app.sources = Sources::knowing(HashMap::from([(m.id, source(12))]));
         app.push("Episodes", View::Episodes(m.clone(), EpMode::Play));
         app.top().menu.select_key(on);
-        app.on_msg(Msg::Played(1, m, played.into(), Ok(())));
+        app.on_msg(Msg::Played(
+            1,
+            app.entries.stamp(),
+            m,
+            played.into(),
+            Ok(()),
+        ));
         app
     }
 
@@ -2873,6 +3167,7 @@ mod tests {
         assert_eq!(app.playback.now().unwrap().id, other.id);
         app.on_msg(Msg::Played(
             app.playback.now().unwrap().id,
+            app.entries.stamp(),
             other,
             "2".into(),
             Ok(()),
@@ -3156,5 +3451,601 @@ mod tests {
             other
         );
         assert!(!just.contains('—') && !other.contains('—'));
+    }
+
+    /// An App whose Continue row goes by `last` and `watching`, with the cursor on its first row.
+    fn app_going_on(last: Option<Media>, watching: Vec<Media>) -> App {
+        let mut app = app();
+        app.last_played = last;
+        app.watching = Some(List::local(Some(watching)));
+        app.rebuild();
+        press(&mut app, KeyCode::Home);
+        app
+    }
+
+    fn first_row(app: &mut App) -> (String, String, String) {
+        let it = &app.top().menu.items[0];
+        (it.key.clone(), it.label.clone(), it.hint.clone())
+    }
+
+    /// Watching's answer, as asked for right before it comes.
+    fn watching_came(app: &mut App, res: Result<Vec<Media>, String>) {
+        let (user, stamp) = (app.user.as_ref().unwrap().0, app.entries.stamp());
+        app.on_msg(Msg::Watching(user, stamp, res, lists::Ask::now()));
+    }
+
+    /// `m`'s player shows its episode, for an attempt on this login.
+    fn shows_episode(app: &mut App, attempt: u64, m: &Media) {
+        let stamp = app.entries.stamp();
+        app.on_msg(Msg::PlayStep(attempt, stamp, m.clone(), None));
+    }
+
+    /// The show played last, as the file has it.
+    fn on_file(user: u64) -> Option<Media> {
+        ani::read_json(&last_played_path(user))
+    }
+
+    #[test]
+    fn the_continue_row_goes_on_with_the_show_played_last_else_the_first_on_watching() {
+        let last = show(50_200, 12, Some(3));
+        let first = show(50_201, 12, Some(1));
+        let mut app = app_going_on(Some(last), vec![first.clone(), show(50_202, 12, Some(5))]);
+        let row = (
+            "continue:50200".into(),
+            "▶  Show".into(),
+            "continue episode 4".into(),
+        );
+        assert_eq!(first_row(&mut app), row);
+        assert_eq!(cursor(&mut app), "continue:50200", "enter is all it takes");
+        assert_eq!(app.enter_verb(), Some("play"));
+
+        let mut app = app_going_on(None, vec![first]);
+        assert_eq!(first_row(&mut app).0, "continue:50201");
+        assert_eq!(first_row(&mut app).2, "continue episode 2");
+    }
+
+    #[test]
+    fn the_continue_row_skips_what_has_nothing_to_go_on_to_or_was_put_aside() {
+        let caught_up = show(50_210, 12, Some(12));
+        let mut paused = show(50_211, 12, Some(3));
+        paused.media_list_entry.as_mut().unwrap().status = "PAUSED".into();
+        let mut not_out = show(50_212, 12, Some(3));
+        not_out.next_airing_episode = Some(anilist::Airing {
+            episode: 4,
+            airing_at: anilist::now() + 3600,
+        });
+        let next = show(50_213, 12, Some(3));
+        for last in [caught_up.clone(), paused.clone(), not_out.clone()] {
+            let watching = vec![caught_up.clone(), not_out.clone(), next.clone()];
+            let mut app = app_going_on(Some(last), watching);
+            assert_eq!(first_row(&mut app).0, "continue:50213");
+        }
+        // nothing to offer: the menu as it was
+        let mut app = app_going_on(None, vec![caught_up]);
+        assert_eq!(cursor(&mut app), "list:CURRENT");
+    }
+
+    #[test]
+    fn one_enter_plays_the_next_episode_on_top_of_its_page() {
+        let m = show(50_220, 12, Some(3));
+        let mut app = app_going_on(Some(m.clone()), Vec::new());
+        enter(&mut app);
+        assert!(matches!(&app.top().view, View::Show(s) if s.id == m.id));
+        assert_eq!(step(&app), Some(SEARCHING));
+        app.on_msg(Msg::Resolved(m.clone(), 1, Ok(source(12))));
+        assert_eq!(step(&app), Some("fetching the stream"));
+        assert_eq!(app.playback.now().unwrap().ep, "4");
+        assert_eq!(app.stack.len(), 2, "its page, and the main menu under it");
+        assert_eq!(app.continuing, None, "once");
+    }
+
+    #[test]
+    fn a_continue_row_that_comes_late_leaves_the_cursor_on_its_row() {
+        let mut app = app_going_on(None, Vec::new());
+        press(&mut app, KeyCode::Down);
+        assert_eq!(cursor(&mut app), "list:PLANNING");
+        watching_came(&mut app, Ok(vec![show(50_230, 12, Some(1))]));
+        assert_eq!(first_row(&mut app).0, "continue:50230");
+        assert_eq!(cursor(&mut app), "list:PLANNING");
+        // and it's not what a filter finds first without being asked
+        app.top().menu.edit(|q| *q = "plan".into());
+        watching_came(&mut app, Ok(vec![show(50_231, 12, Some(1))]));
+        assert_eq!(cursor(&mut app), "list:PLANNING");
+    }
+
+    #[test]
+    fn watching_read_again_brings_what_another_device_did() {
+        let mut stale = show(50_240, 12, Some(3));
+        let mut app = app_going_on(Some(stale.clone()), vec![stale.clone()]);
+        assert_eq!(first_row(&mut app).2, "continue episode 4");
+        stale.media_list_entry.as_mut().unwrap().progress = 6;
+        watching_came(&mut app, Ok(vec![stale.clone()]));
+        assert_eq!(first_row(&mut app).2, "continue episode 7");
+        // finished or moved on from Watching there
+        let other = show(50_241, 12, Some(1));
+        watching_came(&mut app, Ok(vec![other]));
+        assert_eq!(first_row(&mut app).0, "continue:50241");
+        assert_eq!(app.last_played.as_ref().map(|m| m.id), None);
+    }
+
+    #[test]
+    fn a_failed_read_of_watching_keeps_the_row() {
+        let m = show(50_250, 12, Some(3));
+        let mut app = app_going_on(Some(m.clone()), vec![m]);
+        watching_came(&mut app, Err("AniList is down".into()));
+        assert_eq!(first_row(&mut app).0, "continue:50250");
+        assert!(toast(&app).is_none(), "the row still works");
+    }
+
+    #[test]
+    fn watching_from_an_earlier_login_says_nothing_about_this_one() {
+        let m = show(50_260, 12, Some(3));
+        let mut app = app_going_on(None, vec![m.clone()]);
+        let stamp = app.entries.stamp();
+        app.entries.login(Arc::new(Saves::default()));
+        app.reading_watching = true;
+        let res = Ok(vec![show(50_261, 12, Some(1))]);
+        app.on_msg(Msg::Watching(1, stamp, res, lists::Ask::now()));
+        assert!(app.reading_watching, "this login's answer is still to come");
+        assert!(
+            app.watching
+                .as_ref()
+                .unwrap()
+                .shows
+                .iter()
+                .all(|s| s.id == m.id)
+        );
+    }
+
+    /// `m` is known at ani-cli with more episodes than AniList counts, so the page asks for its
+    /// parts and Continue waits for the answer.
+    fn app_on_parts(m: &Media, provider: u32) -> App {
+        let mut app = app_going_on(Some(m.clone()), Vec::new());
+        app.sources = Sources::knowing(HashMap::from([(m.id, source(provider))]));
+        app
+    }
+
+    #[test]
+    fn continue_waits_for_the_parts_that_say_which_episode_is_next() {
+        let m = show(50_270, 12, Some(12));
+        let mut app = app_on_parts(&m, 22);
+        app.go_on_with(m.clone());
+        assert!(app.playback.now().is_none(), "13 may have been watched");
+        let mut part = show(50_271, 10, Some(3));
+        part.status = Some("FINISHED".into());
+        let stamp = app.entries.stamp();
+        app.on_msg(Msg::Parts(m.id, (22, 12), stamp, Ok(vec![(12, part)])));
+        assert_eq!(app.playback.now().unwrap().ep, "16");
+    }
+
+    #[test]
+    fn continue_plays_on_when_the_parts_stay_unknown() {
+        let m = show(50_272, 12, Some(5));
+        let mut app = app_on_parts(&m, 22);
+        enter(&mut app);
+        assert!(app.playback.now().is_none());
+        let stamp = app.entries.stamp();
+        app.on_msg(Msg::Parts(
+            m.id,
+            (22, 12),
+            stamp,
+            Err("AniList is down".into()),
+        ));
+        assert_eq!(app.playback.now().unwrap().ep, "6");
+    }
+
+    #[test]
+    fn a_key_while_continue_waits_takes_over() {
+        let m = show(50_273, 12, Some(5));
+        let mut app = app_on_parts(&m, 22);
+        enter(&mut app);
+        press(&mut app, KeyCode::Down);
+        let stamp = app.entries.stamp();
+        app.on_msg(Msg::Parts(m.id, (22, 12), stamp, Ok(Vec::new())));
+        assert!(app.playback.now().is_none(), "the cursor went elsewhere");
+        assert!(matches!(app.top().view, View::Show(_)));
+    }
+
+    #[test]
+    fn something_on_top_of_the_page_stops_continue_too() {
+        let m = show(50_274, 12, Some(5));
+        let mut app = app_on_parts(&m, 22);
+        enter(&mut app);
+        app.push("Audio", View::Audio(Some(m.clone())));
+        let stamp = app.entries.stamp();
+        app.on_msg(Msg::Parts(m.id, (22, 12), stamp, Ok(Vec::new())));
+        assert!(app.playback.now().is_none());
+        assert_eq!(app.continuing, None);
+    }
+
+    #[test]
+    fn continue_waits_for_a_save_so_it_doesnt_replay_what_was_marked() {
+        let anilist = Arc::new(Saves::default());
+        let m = show(50_280, 12, Some(3));
+        let on_list = m.media_list_entry.clone().unwrap();
+        anilist.0.lock().unwrap().insert(m.id, on_list);
+        let mut app = app_with(anilist);
+        app.user = Some((70_010, "Tester".into()));
+        shows_episode(&mut app, 1, &m);
+        let mark = app.progress(&m).mark("4").unwrap();
+        let work = app.entries.begin(entries::Change::Progress(mark));
+        app.rebuild();
+        press(&mut app, KeyCode::Home);
+        assert_eq!(first_row(&mut app).2, "continue episode 4");
+        enter(&mut app);
+        assert!(app.playback.now().is_none());
+        app.on_msg(Msg::Entry(vec![work.run()]));
+        assert_eq!(app.playback.now().unwrap().ep, "5");
+        let kept = on_file(70_010).unwrap().media_list_entry.unwrap();
+        assert_eq!(kept.progress, 4, "for a next start without AniList");
+    }
+
+    #[test]
+    fn a_save_that_failed_comes_before_playing_on() {
+        struct Refuses;
+        impl AniList for Refuses {
+            fn entry(&self, _: u64) -> Result<Option<Entry>, String> {
+                Err("AniList is down".into())
+            }
+            fn save(&self, _: u64, _: Option<&str>, _: Option<u32>) -> Result<Entry, String> {
+                Err("AniList is down".into())
+            }
+            fn remove(&self, _: u64) -> Result<(), String> {
+                Err("AniList is down".into())
+            }
+        }
+        let mut app = app();
+        app.entries.login(Arc::new(Refuses));
+        let m = show(50_281, 12, Some(3));
+        app.last_played = Some(m.clone());
+        let mark = app.progress(&m).mark("4").unwrap();
+        let work = app.entries.begin(entries::Change::Progress(mark));
+        app.rebuild();
+        press(&mut app, KeyCode::Home);
+        enter(&mut app);
+        app.on_msg(Msg::Entry(vec![work.run()]));
+        assert!(app.playback.now().is_none(), "it would replay episode 4");
+        assert!(toast(&app).unwrap().1);
+    }
+
+    #[test]
+    fn continue_with_a_player_up_says_so_rather_than_open_another() {
+        let m = show(50_290, 12, Some(3));
+        let mut app = app_going_on(Some(m.clone()), Vec::new());
+        app.sources = Sources::knowing(HashMap::from([(m.id, source(12))]));
+        app.on_msg(Msg::Resolved(m.clone(), 1, Ok(source(12))));
+        app.play(m.clone(), "4".into());
+        shows_episode(&mut app, 1, &m);
+        assert!(step(&app).is_none(), "up");
+        press(&mut app, KeyCode::Home);
+        enter(&mut app);
+        assert!(matches!(app.top().view, View::Show(_)));
+        assert!(toast(&app).unwrap().0.starts_with("Already playing"));
+        assert_eq!(app.playback.now().unwrap().ep, "4");
+    }
+
+    #[test]
+    fn continue_says_when_nothing_is_left_by_the_time_it_gets_there() {
+        let m = show(50_291, 12, Some(12));
+        let mut app = app_going_on(None, Vec::new());
+        app.go_on_with(m);
+        assert!(app.playback.now().is_none());
+        assert_eq!(toast(&app).unwrap().0, "You're caught up on Show");
+    }
+
+    #[test]
+    fn a_show_counts_as_played_once_its_episode_is_on_screen() {
+        let m = show(50_300, 12, Some(3));
+        let mut app = app();
+        app.user = Some((70_001, "Tester".into()));
+        let stamp = app.entries.stamp();
+        app.on_msg(Msg::PlayStep(1, stamp, m.clone(), Some(OPENING)));
+        assert!(app.last_played.is_none(), "still starting, or failing");
+        shows_episode(&mut app, 1, &m);
+        assert_eq!(app.last_played.as_ref().map(|s| s.id), Some(m.id));
+        assert_eq!(cursor(&mut app), "list:CURRENT", "the cursor stayed");
+        assert_eq!(first_row(&mut app).0, "continue:50300");
+
+        // the next start has it from the first frame
+        app.last_played = None;
+        app.read_continue();
+        assert!(app.reading_watching, "and asks how things stand now");
+        assert_eq!(app.last_played.as_ref().map(|s| s.id), Some(m.id));
+        assert_eq!(
+            app.last_played.unwrap().media_list_entry.unwrap().progress,
+            3
+        );
+    }
+
+    #[test]
+    fn a_player_that_never_says_its_up_still_counts_once_it_closes() {
+        let m = show(50_301, 12, Some(3));
+        let mut app = app();
+        app.user = Some((70_002, "Tester".into()));
+        let stamp = app.entries.stamp();
+        app.play(m.clone(), "4".into());
+        app.on_msg(Msg::Played(1, stamp, m.clone(), "4".into(), Ok(())));
+        assert_eq!(app.last_played.as_ref().map(|s| s.id), Some(m.id));
+        // one that failed doesn't
+        let other = show(50_302, 12, Some(3));
+        app.play(other.clone(), "4".into());
+        let failed = Err("no stream".into());
+        app.on_msg(Msg::Played(2, stamp, other, "4".into(), failed));
+        assert_eq!(app.last_played.as_ref().map(|s| s.id), Some(m.id));
+    }
+
+    #[test]
+    fn only_a_show_with_progress_to_go_on_from_counts_as_played() {
+        let mut app = app();
+        // ani-cli's own: AniList keeps no progress of it
+        shows_episode(&mut app, 1, &Media::from_ani_cli("Show", source(12)));
+        assert!(app.last_played.is_none());
+        // logged out: no progress at all
+        let m = show(50_303, 12, None);
+        app.user = None;
+        shows_episode(&mut app, 1, &m);
+        assert!(app.last_played.is_none());
+        assert!(app.to_continue().is_none());
+    }
+
+    #[test]
+    fn logging_out_or_in_as_someone_else_leaves_the_row_behind() {
+        let m = show(50_310, 12, Some(3));
+        let mut app = app();
+        app.user = Some((70_003, "Tester".into()));
+        shows_episode(&mut app, 1, &m);
+        app.forget_login();
+        app.refresh();
+        assert!(app.last_played.is_none() && app.watching.is_none());
+        assert!(!first_row(&mut app).0.starts_with("continue:"));
+        // someone else's file, or none
+        app.user = Some((70_004, "Other".into()));
+        app.read_continue();
+        assert!(app.last_played.is_none());
+        // back as the first: theirs again
+        app.user = Some((70_003, "Tester".into()));
+        app.read_continue();
+        assert_eq!(app.last_played.map(|s| s.id), Some(m.id));
+    }
+
+    #[test]
+    fn a_show_taken_off_the_list_is_not_offered_anymore() {
+        let anilist = Arc::new(Saves::default());
+        let mut app = app_with(anilist);
+        app.user = Some((70_005, "Tester".into()));
+        let m = show(50_320, 12, Some(3));
+        shows_episode(&mut app, 1, &m);
+        assert_eq!(first_row(&mut app).0, "continue:50320");
+        let work = app.entries.begin(entries::Change::Remove(m.clone(), m.id));
+        app.on_msg(Msg::Entry(vec![work.run()]));
+        assert!(app.last_played.is_none());
+        assert!(on_file(70_005).is_none());
+        assert!(!first_row(&mut app).0.starts_with("continue:"));
+    }
+
+    #[test]
+    fn enter_before_watchings_answer_plays_what_that_says_is_next() {
+        let mut m = show(50_340, 12, Some(3));
+        let mut app = app_going_on(Some(m.clone()), vec![m.clone()]);
+        app.reading_watching = true;
+        enter(&mut app);
+        assert!(
+            app.playback.now().is_none(),
+            "another device may have watched 4"
+        );
+        m.media_list_entry.as_mut().unwrap().progress = 6;
+        watching_came(&mut app, Ok(vec![m]));
+        assert_eq!(app.playback.now().unwrap().ep, "7");
+    }
+
+    #[test]
+    fn enter_before_a_failed_read_of_watching_plays_what_was_known() {
+        let m = show(50_341, 12, Some(3));
+        let mut app = app_going_on(Some(m), Vec::new());
+        app.reading_watching = true;
+        enter(&mut app);
+        watching_came(&mut app, Err("AniList is down".into()));
+        assert_eq!(app.playback.now().unwrap().ep, "4");
+    }
+
+    #[test]
+    fn enter_before_watching_says_a_show_moved_on_stays_on_its_page() {
+        let m = show(50_342, 12, Some(3));
+        let mut app = app_going_on(None, vec![m.clone()]);
+        app.reading_watching = true;
+        enter(&mut app);
+        watching_came(&mut app, Ok(Vec::new()));
+        assert!(app.playback.now().is_none(), "it may be finished by now");
+        assert!(matches!(&app.top().view, View::Show(s) if s.id == m.id));
+        assert_eq!(toast(&app).unwrap().0, "Show isn't on Watching anymore");
+    }
+
+    #[test]
+    fn continue_waits_for_anilist_only_so_long() {
+        let m = show(50_347, 12, Some(3));
+        let mut app = app_going_on(Some(m), Vec::new());
+        app.reading_watching = true;
+        enter(&mut app);
+        assert!(app.playback.now().is_none());
+        let page = app.top().id;
+        // from an earlier enter, gone by now
+        app.on_msg(Msg::ContinueLimit(page - 1));
+        assert!(app.playback.now().is_none());
+        app.on_msg(Msg::ContinueLimit(page));
+        assert_eq!(app.playback.now().unwrap().ep, "4");
+        assert_eq!(app.continuing, None);
+        // the answer that comes after all doesn't start another
+        watching_came(&mut app, Ok(Vec::new()));
+        assert!(!app.reading_watching);
+        assert_eq!(app.playback.now().unwrap().ep, "4");
+        // and it's nothing to a page left in the meantime
+        press(&mut app, KeyCode::Esc);
+        app.playback = Playback::new(Arc::new(NoPlayer));
+        app.on_msg(Msg::ContinueLimit(page));
+        assert!(app.playback.now().is_none());
+    }
+
+    #[test]
+    fn the_limit_on_continue_waits_out_a_save_and_it_still_plays() {
+        let anilist = Arc::new(Saves::default());
+        let m = show(50_348, 12, Some(3));
+        let on_list = m.media_list_entry.clone().unwrap();
+        anilist.0.lock().unwrap().insert(m.id, on_list);
+        let mut app = app_with(anilist);
+        app.last_played = Some(m.clone());
+        app.reading_watching = true;
+        let mark = app.progress(&m).mark("4").unwrap();
+        let work = app.entries.begin(entries::Change::Progress(mark));
+        app.rebuild();
+        press(&mut app, KeyCode::Home);
+        enter(&mut app);
+        let page = app.top().id;
+        app.on_msg(Msg::ContinueLimit(page));
+        assert!(app.playback.now().is_none(), "it would replay episode 4");
+        assert_eq!(app.continuing, Some(page), "still on");
+        assert!(toast(&app).is_none());
+        // the next limit gets past Watching, which still hasn't answered
+        app.on_msg(Msg::Entry(vec![work.run()]));
+        assert!(app.playback.now().is_none());
+        app.on_msg(Msg::ContinueLimit(page));
+        assert_eq!(app.playback.now().unwrap().ep, "5");
+    }
+
+    #[test]
+    fn enter_on_the_page_goes_ahead_while_watching_keeps_continue_waiting() {
+        let m = show(50_343, 12, Some(3));
+        let mut app = app_going_on(Some(m), Vec::new());
+        app.reading_watching = true;
+        enter(&mut app);
+        assert!(app.playback.now().is_none());
+        enter(&mut app);
+        assert_eq!(app.playback.now().unwrap().ep, "4");
+    }
+
+    #[test]
+    fn watching_of_someone_no_longer_logged_in_is_dropped() {
+        let m = show(50_344, 12, Some(3));
+        let mut app = app_going_on(None, vec![m.clone()]);
+        app.reading_watching = true;
+        let stamp = app.entries.stamp();
+        let res = Ok(vec![show(50_345, 12, Some(1))]);
+        app.on_msg(Msg::Watching(2, stamp, res, lists::Ask::now()));
+        assert!(app.reading_watching, "this login's is on its way");
+        assert_eq!(first_row(&mut app).0, "continue:50344");
+    }
+
+    #[test]
+    fn a_start_right_after_the_last_still_asks_how_things_stand() {
+        let mut app = app();
+        app.user = Some((70_011, "Tester".into()));
+        let cached = (vec![show(50_346, 12, Some(6))], None::<u32>);
+        ani::write_json(&lists::cache("70011-CURRENT"), &cached).unwrap();
+        app.read_continue();
+        assert!(
+            app.reading_watching,
+            "a fresh list says nothing of the show played last"
+        );
+        assert_eq!(
+            app.to_continue().map(|c| c.1),
+            Some(7),
+            "from the first frame"
+        );
+    }
+
+    #[test]
+    fn a_player_from_an_earlier_login_leaves_this_ones_row_and_file_alone() {
+        let m = show(50_350, 12, Some(3));
+        let mut app = app();
+        app.user = Some((70_012, "Tester".into()));
+        let stamp = app.entries.stamp();
+        app.forget_login();
+        app.user = Some((70_013, "Other".into()));
+        app.on_msg(Msg::PlayStep(1, stamp, m.clone(), None));
+        assert!(app.last_played.is_none());
+        app.on_msg(Msg::Played(1, stamp, m, "4".into(), Ok(())));
+        assert!(app.last_played.is_none());
+        assert!(on_file(70_013).is_none());
+        assert!(matches!(app.top().view, View::Main), "no question about it");
+    }
+
+    #[test]
+    fn closing_an_older_player_leaves_the_show_played_since() {
+        let (a, b) = (show(50_351, 12, Some(3)), show(50_352, 12, Some(3)));
+        let mut app = app();
+        app.user = Some((70_014, "Tester".into()));
+        let stamp = app.entries.stamp();
+        app.play(a.clone(), "4".into());
+        shows_episode(&mut app, 1, &a);
+        app.play(b.clone(), "4".into());
+        shows_episode(&mut app, 2, &b);
+        app.on_msg(Msg::Played(1, stamp, a, "4".into(), Ok(())));
+        assert_eq!(app.last_played.as_ref().map(|s| s.id), Some(b.id));
+        assert_eq!(on_file(70_014).map(|s| s.id), Some(b.id));
+    }
+
+    #[test]
+    fn what_another_ani_hop_played_since_stays_on_file() {
+        let anilist = Arc::new(Saves::default());
+        let (x, y) = (show(50_353, 12, Some(3)), show(50_354, 12, Some(1)));
+        let on_list = x.media_list_entry.clone().unwrap();
+        anilist.0.lock().unwrap().insert(x.id, on_list);
+        let mut app = app_with(anilist);
+        app.user = Some((70_015, "Tester".into()));
+        shows_episode(&mut app, 1, &x);
+        ani::write_json(&last_played_path(70_015), &y).unwrap();
+        // a save, a read and a removal here don't make x played again
+        let mark = app.progress(&x).mark("4").unwrap();
+        let work = app.entries.begin(entries::Change::Progress(mark));
+        app.on_msg(Msg::Entry(vec![work.run()]));
+        watching_came(&mut app, Ok(vec![x.clone()]));
+        assert_eq!(on_file(70_015).map(|s| s.id), Some(y.id));
+        app.forget_last_played();
+        assert_eq!(on_file(70_015).map(|s| s.id), Some(y.id));
+    }
+
+    #[test]
+    fn a_late_answer_of_watching_keeps_a_show_saved_onto_it_since() {
+        let anilist = Arc::new(Saves::default());
+        let m = show(50_355, 12, Some(3));
+        let on_list = m.media_list_entry.clone().unwrap();
+        anilist.0.lock().unwrap().insert(m.id, on_list);
+        let mut app = app_with(anilist);
+        app.user = Some((70_016, "Tester".into()));
+        let stamp = app.entries.stamp();
+        shows_episode(&mut app, 1, &m);
+        app.watching = Some(List::local(Some(Vec::new())));
+        let mark = app.progress(&m).mark("4").unwrap();
+        let work = app.entries.begin(entries::Change::Progress(mark));
+        app.on_msg(Msg::Entry(vec![work.run()]));
+        app.on_msg(Msg::Watching(
+            70_016,
+            stamp,
+            Ok(Vec::new()),
+            lists::Ask::now(),
+        ));
+        assert_eq!(app.last_played.as_ref().map(|s| s.id), Some(m.id));
+        // read after that save, it's moved on
+        watching_came(&mut app, Ok(Vec::new()));
+        assert!(app.last_played.is_none());
+    }
+
+    #[test]
+    fn the_continue_row_keeps_its_episode_beside_a_long_title() {
+        let mut m = show(50_330, 28, Some(12));
+        m.title.romaji = Some("Attack on Titan Final Season Part 2 and a Long Subtitle".into());
+        let mut app = app_going_on(Some(m), Vec::new());
+        let at_80 = screen(&mut app, 80, 24);
+        let row = at_80.lines().find(|l| l.contains('▶')).unwrap();
+        assert!(row.contains("ep 13"), "{at_80}");
+        assert!(row.contains('…'), "{at_80}");
+        // the start panel stays: a new release is said there
+        assert!(at_80.contains("filter the list"), "{at_80}");
+        // and with room it says what it does
+        let short = show(50_331, 28, Some(12));
+        let mut roomy = app_going_on(Some(short), Vec::new());
+        let wide = self::screen(&mut roomy, 200, 24);
+        assert!(wide.contains("continue episode 13"), "{wide}");
+        app.top().menu.edit(|q| *q = "continue".into());
+        assert_eq!(cursor(&mut app), "continue:50330");
     }
 }

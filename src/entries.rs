@@ -187,6 +187,17 @@ impl Entries {
         true
     }
 
+    /// Whether `stamp` was taken on this login.
+    pub fn same_login(&self, stamp: Stamp) -> bool {
+        stamp.login == self.login
+    }
+
+    /// Whether `m`'s Entry was saved or read after a read asked at `stamp`, which may not have
+    /// it yet.
+    pub fn newer_than(&self, m: &Media, stamp: Stamp) -> bool {
+        self.known.get(&m.id).is_some_and(|k| k.when > stamp.asked)
+    }
+
     /// A write of `m`'s Entry is on its way.
     pub fn saving(&self, m: &Media) -> bool {
         self.saving.contains(&m.id)

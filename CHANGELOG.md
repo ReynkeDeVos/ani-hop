@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.10.2 – 2026-11-03
+
+### Added
+
+- When logged in, the main menu's first row plays your next episode, so one enter does what took three. It goes on with the show you played last, or the first show on Watching with an episode out, and it's gone when neither has one. The show's page opens underneath, so closing the player lands you there. A show you paused, dropped or took off your list isn't offered.
+
+### Changed
+
+- ani-hop reads Watching from AniList at the start, so that row is right after watching on another device. Press enter before the answer is in and the episode starts once it is, or after 3 seconds with what ani-hop knows, though never before a save on its way is answered; enter again on the show's page plays right away. It's one more request, and without a connection the row goes by what ani-hop knows from last time.
+
 ## 0.10.0 – 2026-11-03
 
 ### Added
