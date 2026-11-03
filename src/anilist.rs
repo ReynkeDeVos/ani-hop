@@ -38,9 +38,19 @@ pub struct Media {
     pub studios: Studios,
     pub next_airing_episode: Option<Airing>,
     pub media_list_entry: Option<Entry>,
+    /// when it started, which only a series is asked for: many specials have no season
+    pub start_date: StartDate,
     /// where ani-cli listed a show AniList didn't provide (its episodes stay empty)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ani_cli: Option<crate::source::Source>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StartDate {
+    pub year: Option<u32>,
+    pub month: Option<u32>,
+    pub day: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -459,6 +469,7 @@ impl Client {
         let q = format!(
             "query($ids: [Int]) {{ Page(perPage: {PER_PAGE}) {{
                media(id_in: $ids, type: ANIME, isAdult: false) {{ {MEDIA}
+                 startDate {{ year month day }}
                  relations {{ edges {{ relationType node {{ id type format isAdult }} }} }} }} }} }}"
         );
         linked_shows(&self.gql(&q, json!({ "ids": ids }))?)

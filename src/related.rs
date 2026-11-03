@@ -6,9 +6,9 @@ use crate::anilist::{Media, PER_PAGE};
 use std::collections::{HashMap, HashSet};
 use std::iter::zip;
 
-/// Enough for the largest series tried: Detective Conan's 127 shows took 8. More would hold up
-/// everything else, at the 30 requests a minute AniList can come down to.
-const MOST_REQUESTS: usize = 12;
+/// A request per step along a series, so this is how long a run it can follow. More would hold
+/// up everything else, at the 30 requests a minute AniList can come down to.
+const MOST_REQUESTS: usize = 24;
 
 /// A link to another show. Only "PREQUEL" and "SEQUEL" say which comes first.
 pub struct Link {
@@ -28,12 +28,16 @@ pub struct Series {
     pub shows: Vec<Media>,
     /// the run of prequels and sequels each one is in
     runs: Vec<usize>,
+    /// the shows each one says it's part of
+    parents: HashMap<u64, Vec<u64>>,
     /// MOST_REQUESTS ran out with links left to follow
     pub cut: bool,
 }
 
 /// `seed`'s series, one request per PER_PAGE shows. Links go both ways and in circles, so each
-/// show is asked for once.
+/// show is asked for once. A crossover is part of two series, and is listed without going on into
+/// the other, or Detective Conan would bring all of Lupin III; from the crossover itself both are
+/// its own.
 pub fn walk(
     seed: u64,
     mut fetch: impl FnMut(&[u64]) -> Result<Vec<Linked>, String>,
@@ -47,8 +51,10 @@ pub fn walk(
         let batch = std::mem::replace(&mut waiting, rest);
         asked += 1;
         for linked in fetch(&batch)? {
-            let next = linked.links.iter().map(|l| l.to);
-            waiting.extend(next.filter(|to| seen.insert(*to)));
+            if linked.show.id == seed || !crossover(&linked) {
+                let next = linked.links.iter().map(|l| l.to);
+                waiting.extend(next.filter(|to| seen.insert(*to)));
+            }
             found.push(linked);
         }
     }
@@ -60,6 +66,12 @@ impl Series {
         let at: HashMap<u64, usize> = (found.iter().enumerate())
             .map(|(i, l)| (l.show.id, i))
             .collect();
+        let parent = |l: &Linked| {
+            let links = l.links.iter().filter(|k| k.relation == "PARENT");
+            let ids: Vec<u64> = links.map(|k| k.to).collect();
+            (l.show.id, ids)
+        };
+        let parents = found.iter().map(parent).collect();
         let mut before = vec![HashSet::new(); found.len()];
         let mut run: Vec<usize> = (0..found.len()).collect();
         for (i, linked) in found.iter().enumerate() {
@@ -90,7 +102,24 @@ impl Series {
             shows.push(std::mem::take(&mut found[i].show));
             runs.push(root(&mut run, i));
         }
-        Series { shows, runs, cut }
+        Series {
+            shows,
+            runs,
+            parents,
+            cut,
+        }
+    }
+
+    /// The shows `seed`'s list goes for, too. Not when it's cut short, which could list another
+    /// one less than a walk from there would. Not for a crossover, whose own list has both of
+    /// its series and which this one has only one of.
+    pub fn listed_for(&self, seed: u64) -> Vec<u64> {
+        let crossover = |id: &u64| self.parents.get(id).is_some_and(|p| p.len() > 1);
+        if self.cut || crossover(&seed) {
+            return vec![seed];
+        }
+        let ids = self.shows.iter().map(|m| m.id);
+        ids.filter(|id| !crossover(id)).collect()
     }
 
     /// The shows as `seed`'s list has them, and how many of the first are its seasons: the run
@@ -106,13 +135,27 @@ impl Series {
         (shows.collect(), count)
     }
 
-    /// The run a list starts with: `seed`'s, unless that's a movie or a special on its own,
-    /// whose list starts with the show it belongs to, the run with the most on TV.
+    /// The run a list starts with: `seed`'s, unless it's on its own and a side piece. Then it's
+    /// the show it says it's part of; a movie or special that says nothing goes with the run
+    /// with the most on TV, while one-off ONAs and OVAs are often the main show themselves.
     fn main_run(&self, seed: u64) -> Option<usize> {
-        let (own, run) = zip(&self.shows, &self.runs).find(|(m, _)| m.id == seed)?;
-        let size = self.runs.iter().filter(|r| *r == run).count();
+        let run_of = |id: u64| {
+            zip(&self.shows, &self.runs)
+                .find(|(m, _)| m.id == id)
+                .map(|(_, r)| *r)
+        };
+        let run = run_of(seed)?;
+        let own = self.shows.iter().find(|m| m.id == seed)?;
+        let size = self.runs.iter().filter(|r| **r == run).count();
         if size > 1 || on_tv(own) {
-            return Some(*run);
+            return Some(run);
+        }
+        let parents = self.parents.get(&seed).into_iter().flatten();
+        if let Some(parent) = parents.filter_map(|id| run_of(*id)).next() {
+            return Some(parent);
+        }
+        if !matches!(own.format.as_deref(), Some("MOVIE" | "SPECIAL")) {
+            return Some(run);
         }
         let tv = |run: usize| {
             zip(&self.shows, &self.runs)
@@ -123,6 +166,12 @@ impl Series {
         let most = self.runs.iter().rev().max_by_key(|r| tv(**r))?;
         (tv(*most) > 0).then_some(*most)
     }
+}
+
+/// Part of more than one show: Lupin III vs. Detective Conan.
+fn crossover(linked: &Linked) -> bool {
+    let parents = linked.links.iter().filter(|l| l.relation == "PARENT");
+    parents.count() > 1
 }
 
 /// The first of the shows `run` has `i` run on from.
@@ -139,20 +188,16 @@ fn on_tv(m: &Media) -> bool {
 }
 
 /// For sorting by when a show came out: without a date, it's yet to come.
-fn released(m: &Media) -> (u32, u8, u64) {
-    let season = match m.season.as_deref() {
-        Some("WINTER") => 0,
-        Some("SPRING") => 1,
-        Some("SUMMER") => 2,
-        Some("FALL") => 3,
-        _ => 4,
-    };
-    (m.season_year.unwrap_or(u32::MAX), season, m.id)
+fn released(m: &Media) -> (u32, u32, u32, u64) {
+    let date = m.start_date;
+    let year = date.year.or(m.season_year).unwrap_or(u32::MAX);
+    (year, date.month.unwrap_or(13), date.day.unwrap_or(32), m.id)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::anilist::StartDate;
 
     /// A show out in `year`, with its links as (relation, id).
     fn show(id: u64, format: &str, year: u32, links: &[(&str, u64)]) -> Linked {
@@ -160,7 +205,10 @@ mod tests {
             show: Media {
                 id,
                 format: Some(format.into()),
-                season_year: (year > 0).then_some(year),
+                start_date: StartDate {
+                    year: (year > 0).then_some(year),
+                    ..Default::default()
+                },
                 ..Default::default()
             },
             links: (links.iter())
@@ -295,19 +343,135 @@ mod tests {
     }
 
     #[test]
-    fn a_long_series_comes_in_batches_and_says_when_it_stopped() {
-        // 50 at a time, as AniList hands them out: 12 requests reach 1 + 11 x 50 shows
+    fn a_side_piece_lists_the_show_it_says_it_is_part_of_first() {
+        // Hunter x Hunter: a movie of the 2011 show, in a series that has the 1999 one too
         let world = || {
-            let links: Vec<(&str, u64)> = (2..2000).map(|to| ("SIDE_STORY", to)).collect();
+            vec![
+                show(1, "TV", 1999, &[("SEQUEL", 2), ("ALTERNATIVE", 3)]),
+                show(2, "OVA", 2002, &[("PREQUEL", 1)]),
+                show(3, "TV", 2011, &[("ALTERNATIVE", 1), ("SIDE_STORY", 4)]),
+                show(4, "MOVIE", 2013, &[("PARENT", 3)]),
+            ]
+        };
+        let (shows, seasons) = series(4, world).0.list(4);
+        assert_eq!((ids(&shows), seasons), (vec![3, 1, 2, 4], 1));
+    }
+
+    #[test]
+    fn a_one_off_is_the_main_show_unless_it_says_otherwise() {
+        // DEVILMAN crybaby: an ONA of its own, next to a TV show it's another version of
+        let world = || {
+            vec![
+                show(1, "ONA", 2018, &[("ALTERNATIVE", 2)]),
+                show(2, "TV", 1972, &[("ALTERNATIVE", 1), ("SEQUEL", 3)]),
+                show(3, "TV", 1973, &[("PREQUEL", 2)]),
+            ]
+        };
+        let (shows, seasons) = series(1, world).0.list(1);
+        assert_eq!((ids(&shows), seasons), (vec![1, 2, 3], 1));
+        // a movie that says nothing still goes with what's on TV
+        let world = || {
+            vec![
+                show(1, "MOVIE", 2018, &[("ALTERNATIVE", 2)]),
+                show(2, "TV", 1972, &[("ALTERNATIVE", 1)]),
+            ]
+        };
+        let (shows, seasons) = series(1, world).0.list(1);
+        assert_eq!((ids(&shows), seasons), (vec![2, 1], 1));
+    }
+
+    #[test]
+    fn a_crossover_is_listed_without_bringing_the_other_series() {
+        // Detective Conan and Lupin III, with a special that's part of both
+        let world = || {
+            vec![
+                show(1, "TV", 1996, &[("SIDE_STORY", 2), ("SIDE_STORY", 9)]),
+                show(2, "OVA", 2000, &[("PARENT", 1)]),
+                show(9, "SPECIAL", 2009, &[("PARENT", 1), ("PARENT", 5)]),
+                show(5, "TV", 1971, &[("SIDE_STORY", 6), ("SIDE_STORY", 9)]),
+                show(6, "MOVIE", 1979, &[("PARENT", 5)]),
+            ]
+        };
+        let (s, asked) = series(1, world);
+        assert_eq!(asked, [vec![1], vec![2, 9]], "stops at the crossover");
+        assert_eq!(ids(&s.list(1).0), [1, 2, 9]);
+        // what goes for its other shows doesn't for the crossover, which has a list of its own
+        let mut goes_for = s.listed_for(1);
+        goes_for.sort_unstable();
+        assert_eq!(goes_for, [1, 2]);
+        // from the crossover itself both series are its own
+        let (s, _) = series(9, world);
+        assert_eq!(ids(&s.list(9).0).len(), 5);
+        assert_eq!(s.listed_for(9), [9], "too much for either series' shows");
+    }
+
+    #[test]
+    fn a_run_is_followed_however_long_and_a_cut_list_goes_only_for_where_it_started() {
+        // one request per step: a run of 20 seasons is more than a batch can make up for
+        let run = |n: u64| {
+            let world = move || {
+                (1..=n)
+                    .map(|id| {
+                        let (before, after) = (id - 1, id + 1);
+                        let mut links = Vec::new();
+                        if id > 1 {
+                            links.push(("PREQUEL", before));
+                        }
+                        if id < n {
+                            links.push(("SEQUEL", after));
+                        }
+                        show(id, "TV", 2000 + id as u32, &links)
+                    })
+                    .collect()
+            };
+            series(1, world).0
+        };
+        let whole = run(20);
+        assert!(!whole.cut);
+        assert_eq!((whole.shows.len(), whole.listed_for(1).len()), (20, 20));
+        let cut = run(MOST_REQUESTS as u64 + 2);
+        assert!(cut.cut);
+        assert_eq!(cut.shows.len(), MOST_REQUESTS);
+        assert_eq!(cut.listed_for(1), [1]);
+    }
+
+    #[test]
+    fn shows_come_out_by_their_date_without_a_season() {
+        // a special AniList has a date for, but no season
+        let dated = |id: u64, year: u32, month: u32, season_year: Option<u32>| {
+            let mut l = show(id, "SPECIAL", 0, &[]);
+            l.show.start_date.year = (year > 0).then_some(year);
+            l.show.start_date.month = (month > 0).then_some(month);
+            l.show.season_year = season_year;
+            l
+        };
+        let world = || {
+            vec![
+                show(1, "TV", 2024, &[("SIDE_STORY", 2), ("SIDE_STORY", 3)]),
+                dated(2, 2010, 5, None),
+                dated(3, 2010, 2, None),
+            ]
+        };
+        let (shows, _) = series(1, world).0.list(1);
+        assert_eq!(ids(&shows), [1, 3, 2]);
+        // and a season where that's all there is
+        assert!(released(&dated(1, 0, 0, Some(2011)).show) < released(&dated(1, 0, 0, None).show));
+    }
+
+    #[test]
+    fn a_long_series_comes_in_batches_and_says_when_it_stopped() {
+        // 50 at a time, as AniList hands them out: the last request's are found, not followed
+        let world = || {
+            let links: Vec<(&str, u64)> = (2..4000).map(|to| ("SIDE_STORY", to)).collect();
             let mut all = vec![show(1, "TV", 2000, &links)];
-            all.extend((2..2000).map(|id| show(id, "OVA", 2001, &[("PARENT", 1)])));
+            all.extend((2..4000).map(|id| show(id, "OVA", 2001, &[("PARENT", 1)])));
             all
         };
         let (s, asked) = series(1, world);
         assert_eq!(asked.len(), MOST_REQUESTS);
         assert!(asked.iter().all(|b| b.len() <= PER_PAGE));
         assert!(s.cut);
-        assert_eq!(s.shows.len(), 1 + 11 * PER_PAGE);
+        assert_eq!(s.shows.len(), 1 + (MOST_REQUESTS - 1) * PER_PAGE);
         // a failed request is no half a series
         let failed = walk(1, |_| Err("Can't reach AniList".to_string()));
         assert_eq!(failed.err().as_deref(), Some("Can't reach AniList"));

@@ -17,7 +17,7 @@ mod ui;
 
 use anilist::{Client, EpInfo, Media};
 use downloads::{AniCli, Job, Queue};
-use entries::{Change, Entries, Stamp};
+use entries::{Change, Entries, Stamp, Work};
 use lists::{Feed, List};
 use menu::{Act, Item, Menu};
 use playback::{Playback, Start};
@@ -135,6 +135,8 @@ enum Related {
     Nothing,
     /// another show at least
     Links,
+    /// its series is being walked
+    Walking,
     /// the show's whole series, walked once for all of its shows
     Series(Arc<Series>),
 }
@@ -161,12 +163,12 @@ enum Msg {
     Parts(u64, (u32, u32), Stamp, Result<Parts, String>),
     /// whether AniList links a show to another
     Linked(u64, Result<bool, String>),
-    /// for the screen waiting on it, a show's series as AniList has it
-    Series(u64, u64, Stamp, Result<Series, String>),
+    /// a show's series as AniList has it
+    Series(u64, Stamp, Result<Series, String>),
     /// a lookup's answer, with its ticket (Sources::ask)
     Resolved(Media, u64, Result<Source, String>),
-    /// a change to the user's list, answered
-    Entry(entries::Done),
+    /// a change to the user's list, answered: a show's parts with it, the show first
+    Entry(Vec<entries::Done>),
     /// (Playback attempt, what it waits on now; None = the player is up)
     PlayStep(u64, Option<&'static str>),
     /// (Playback attempt, show, episode, how it ended)
@@ -195,9 +197,9 @@ pub struct App {
     /// episode titles and summaries per show (empty while loading or when there are none)
     pub ep_info: HashMap<u64, HashMap<String, EpInfo>>,
     /// AniList sequels per show that its provider entry runs on into, each with the episodes
-    /// before it (empty while loading or when there are none), and the episode counts they
-    /// were looked up for
-    parts: HashMap<u64, ((u32, u32), Parts)>,
+    /// before it (none yet while AniList hasn't answered), and the episode counts they were
+    /// looked up for
+    parts: HashMap<u64, ((u32, u32), Option<Parts>)>,
     /// what AniList links each show opened this session to
     related: HashMap<u64, Related>,
     pub sources: Sources,
@@ -877,7 +879,7 @@ impl App {
             return;
         };
         if self.parts.get(&m.id).is_none_or(|p| p.0 != key) {
-            self.parts.insert(m.id, (key, Vec::new()));
+            self.parts.insert(m.id, (key, None));
             let (m, c, stamp) = (m.clone(), self.client.clone(), self.entries.stamp());
             self.spawn(move || {
                 let parts = c.parts(&m, key.0);
@@ -896,9 +898,15 @@ impl App {
     /// The show's sequels, while it has the episode counts they were looked up for.
     pub fn parts(&self, m: &Media) -> &[(u32, Media)] {
         match self.parts.get(&m.id) {
-            Some((key, parts)) if Some(*key) == self.parts_key(m) => parts,
+            Some((key, Some(parts))) if Some(*key) == self.parts_key(m) => parts,
             _ => &[],
         }
+    }
+
+    /// Whether `parts` is all of `m`'s: there are none to look for, or AniList has answered.
+    fn parts_known(&self, m: &Media) -> bool {
+        let answered = |key| matches!(self.parts.get(&m.id), Some((k, Some(_))) if *k == key);
+        self.parts_key(m).is_none_or(answered)
     }
 
     /// `m`'s episodes as AniList counts them, with the parts known so far.
@@ -1023,7 +1031,8 @@ impl App {
                         {
                             hint.push(format!("{e} ep"));
                         }
-                        hint.extend(m.season_year.map(|y| y.to_string()));
+                        let year = m.season_year.or(m.start_date.year);
+                        hint.extend(year.map(|y| y.to_string()));
                         let mut it = Item::new(m.id.to_string(), m.name(), hint.join(" · "));
                         // found by its other titles too: "attack on titan", "aot"
                         it.about = m.titles().cloned().collect::<Vec<_>>().join(" · ");
@@ -1082,7 +1091,7 @@ impl App {
                 // last, as it comes once AniList says so: no other row moves, and ↑ gets here
                 if matches!(
                     self.related.get(&m.id),
-                    Some(Related::Links | Related::Series(_))
+                    Some(Related::Links | Related::Walking | Related::Series(_))
                 ) {
                     v.push(Item::new("related", "⇅  Related shows…", ""));
                 }
@@ -1395,7 +1404,7 @@ impl App {
                 }
                 self.toast(format!("Saving {}…", m.name()), false);
                 let work = self.entries.begin(Change::Status(m, key));
-                self.spawn(move || Msg::Entry(work.run()));
+                self.spawn(move || Msg::Entry(vec![work.run()]));
             }
             View::Sources(m, q, hits) => {
                 let i: usize = key.parse().unwrap();
@@ -1518,14 +1527,13 @@ impl App {
                         };
                         self.toast(format!("Removing {}…", m.name()), false);
                         let work = self.entries.begin(Change::Remove(m, entry));
-                        self.spawn(move || Msg::Entry(work.run()));
+                        self.spawn(move || Msg::Entry(vec![work.run()]));
                     }
                     Pending::Progress(marks) => {
                         // saved only while AniList still has the progress the question showed
-                        for k in marks.clone() {
-                            let work = self.entries.begin(Change::Progress(k));
-                            self.spawn(move || Msg::Entry(work.run()));
-                        }
+                        let saves = (marks.iter().cloned()).map(Change::Progress);
+                        let works: Vec<Work> = saves.map(|c| self.entries.begin(c)).collect();
+                        self.spawn(move || Msg::Entry(works.into_iter().map(Work::run).collect()));
                         self.pop(1);
                     }
                 }
@@ -1725,7 +1733,8 @@ impl App {
     }
 
     /// The shows related to `m`: at once when this session knows its series, whose other shows
-    /// that goes for too, so hopping along its seasons asks AniList nothing.
+    /// that goes for too, so hopping along its seasons asks AniList nothing. One walk at a time,
+    /// however often it's opened meanwhile.
     fn open_related(&mut self, m: &Media) {
         let seed = m.id;
         let series = match self.related.get(&seed) {
@@ -1734,12 +1743,13 @@ impl App {
         };
         let list = List::related(seed, series.as_ref().map(|s| s.list(seed)));
         let id = self.push("Related shows", View::Shows(list));
-        match series {
-            Some(s) => self.series_shown(id, seed, &s),
-            None => {
-                let (c, stamp) = (self.client.clone(), self.entries.stamp());
-                self.spawn(move || Msg::Series(id, seed, stamp, c.series(seed)));
-            }
+        if let Some(s) = series {
+            return self.series_shown(id, seed, &s);
+        }
+        if !matches!(self.related.get(&seed), Some(Related::Walking)) {
+            self.related.insert(seed, Related::Walking);
+            let (c, stamp) = (self.client.clone(), self.entries.stamp());
+            self.spawn(move || Msg::Series(seed, stamp, c.series(seed)));
         }
     }
 
@@ -1846,15 +1856,23 @@ impl App {
     }
 
     /// Asks before taking `m` back to no episodes watched. It unmarks at least one that was, so
-    /// Don't save goes first.
+    /// Don't save goes first. Not before its parts are known, or theirs would stay marked.
     fn ask_none(&mut self, m: &Media) {
+        if !self.parts_known(m) {
+            self.want_parts(m);
+            let text = format!(
+                "Still checking {}'s parts · try again in a moment",
+                m.name()
+            );
+            return self.toast(text, false);
+        }
         let marks = self.progress(m).none();
         if marks.is_empty() {
             return; // saved in the meantime
         }
-        let also = Mark::also_each(&marks);
+        let also = self.progress(m).none_also();
         let title = format!("Watched no episodes of {}? {also}", m.name());
-        self.push(title.trim_end(), View::Confirm(Pending::Progress(marks)));
+        self.push(title, View::Confirm(Pending::Progress(marks)));
         self.top().menu.select_key("no");
     }
 
@@ -2035,19 +2053,21 @@ impl App {
             // without them, the provider's episodes stay the show's own
             Msg::Parts(id, key, stamp, parts) => {
                 // looked up for other episode counts, or an earlier login
-                let wanted = self.parts.get(&id).is_some_and(|p| p.0 == key);
-                let mut parts = parts.unwrap_or_default();
-                if !wanted
-                    || !self
-                        .entries
-                        .observe(stamp, parts.iter_mut().map(|p| &mut p.1))
-                {
+                if !self.parts.get(&id).is_some_and(|p| p.0 == key) {
+                    return;
+                }
+                // asked again when the show or its episodes open
+                let Ok(mut parts) = parts else {
+                    self.parts.remove(&id);
+                    return;
+                };
+                if !(self.entries).observe(stamp, parts.iter_mut().map(|p| &mut p.1)) {
                     return;
                 }
                 for (_, p) in &parts {
                     self.want_episodes(p);
                 }
-                self.parts.insert(id, (key, parts));
+                self.parts.insert(id, (key, Some(parts)));
                 self.refresh();
             }
             Msg::Linked(id, res) => {
@@ -2062,27 +2082,44 @@ impl App {
                     _ => {}
                 }
             }
-            Msg::Series(id, seed, stamp, res) => {
-                let res = res.and_then(|mut s| {
-                    match self.entries.observe(stamp, &mut s.shows) {
-                        true => Ok(Arc::new(s)),
-                        false => Err(String::new()), // an earlier login's
-                    }
+            Msg::Series(seed, stamp, res) => {
+                let res = res.and_then(|mut s| match self.entries.observe(stamp, &mut s.shows) {
+                    true => Ok(Arc::new(s)),
+                    false => Err(String::new()),
                 });
-                let series = res.as_ref().ok().cloned();
-                self.fill(id, |v| {
-                    if let View::Shows(list) = v {
-                        *list = List::related(seed, Some(res?.list(seed)));
-                    }
-                    Ok(())
-                });
-                if let Some(s) = series {
-                    for m in &s.shows {
-                        self.related.insert(m.id, Related::Series(s.clone()));
-                    }
-                    self.series_shown(id, seed, &s);
-                    self.rebuild();
+                // an earlier login's says nothing, and this login's may be out
+                if res.as_ref().err().is_some_and(String::is_empty) {
+                    return;
                 }
+                match &res {
+                    Ok(s) => {
+                        for id in s.listed_for(seed) {
+                            self.related.insert(id, Related::Series(s.clone()));
+                        }
+                    }
+                    Err(_) => _ = self.related.insert(seed, Related::Links),
+                }
+                let waiting: Vec<u64> = (self.stack.iter())
+                    .filter(|s| {
+                        let list = |l: &List| l.related_to() == Some(seed) && l.loading();
+                        matches!(&s.view, View::Shows(l) if list(l))
+                    })
+                    .map(|s| s.id)
+                    .collect();
+                for id in waiting {
+                    let filled = res.clone();
+                    self.fill(id, |v| {
+                        if let View::Shows(list) = v {
+                            *list = List::related(seed, Some(filled?.list(seed)));
+                        }
+                        Ok(())
+                    });
+                    if let Ok(s) = &res {
+                        self.series_shown(id, seed, s);
+                    }
+                }
+                // a failed one's screen went: what waited for the page below it goes on
+                self.pop(0);
             }
             Msg::Resolved(m, ticket, res) => {
                 // a lookup from before the source was changed by hand
@@ -2119,15 +2156,13 @@ impl App {
                 self.refresh();
             }
             Msg::Entry(done) => {
-                let Some(n) = self.entries.finish(done) else {
+                let answers = done.into_iter().filter_map(|d| self.entries.finish(d));
+                let notices: Vec<_> = answers.collect();
+                // what failed, if anything did, else the show's: it comes first
+                let Some(n) = notices.iter().find(|n| n.error).or(notices.first()) else {
                     return; // an earlier login's
                 };
-                // a show and its parts save one by one: one's success doesn't hide another's error
-                let failed =
-                    (self.toast.as_ref()).is_some_and(|t| t.1 && t.2.elapsed().as_secs() < 4);
-                if n.error || !failed {
-                    self.toast(n.text, n.error);
-                }
+                self.toast(n.text.clone(), n.error);
                 // its list status question is answered, not another show's
                 if matches!(&self.top().view, View::Status(s) if Some(s.id) == n.closes) {
                     self.stack.pop();
