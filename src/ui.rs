@@ -193,14 +193,14 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(user, user_area);
 }
 
-/// What's installed, with an arrow and the version to update to where there's one. With less
-/// `room` ani-cli goes first, then the name, then the number.
+/// What's installed, with an arrow and, in brackets, the version to update to where there's
+/// one. With less `room` ani-cli goes first, then the name, then the number.
 fn versions(app: &App, room: usize) -> Line<'static> {
     let part = |text: String, new: Option<&str>| {
         let mut spans = vec![Span::styled(text, DIM)];
         if let Some(new) = new {
             spans.push(Span::styled(" ↑", ACCENT));
-            spans.push(Span::styled(format!(" {new}"), DIM));
+            spans.push(Span::styled(format!(" ({new})"), DIM));
         }
         spans
     };

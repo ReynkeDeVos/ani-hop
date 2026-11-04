@@ -4145,7 +4145,7 @@ mod tests {
         app.release = Some(("99.0.0".into(), "brew upgrade ani-hop".into()));
         app.ani_cli_newer = Some("5.2".into());
         let drawn = screen(&mut app, 80, 24);
-        let marked = format!(" ani-hop {me} ↑ 99.0.0 · ani-cli 5.1.6 ↑ 5.2");
+        let marked = format!(" ani-hop {me} ↑ (99.0.0) · ani-cli 5.1.6 ↑ (5.2)");
         assert!(
             drawn.lines().last().unwrap().starts_with(&marked),
             "{drawn}"
@@ -4153,7 +4153,7 @@ mod tests {
         assert!(drawn.contains("ani-hop 99.0.0 is out"), "{drawn}");
         assert_eq!(drawn.matches("is out").count(), 1, "{drawn}");
         // with less room what to update to goes before the number does
-        assert!(foot(&mut app, 40).starts_with(&format!(" {me} ↑ 99.0.0 ")));
+        assert!(foot(&mut app, 45).starts_with(&format!(" {me} ↑ (99.0.0) ")));
         assert!(foot(&mut app, 35).starts_with(&format!(" {me}     ")));
         assert!(!foot(&mut app, 28).contains(me));
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -4169,7 +4169,7 @@ mod tests {
         // an ani-cli too old for ani-hop too, without knowing of a release
         let mut app = with_versions();
         app.ani_cli = Some("5.0.2".into());
-        assert!(foot(&mut app, 80).contains("ani-cli 5.0.2 ↑ 5.1"));
+        assert!(foot(&mut app, 80).contains("ani-cli 5.0.2 ↑ (5.1)"));
 
         // an answer about the ani-cli from before an update doesn't bring the ↑ back
         let newer = || Some("5.3".to_string());
