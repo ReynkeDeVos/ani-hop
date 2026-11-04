@@ -345,16 +345,15 @@ pub fn install_command(pkgs: &[&str]) -> Option<String> {
 /// The ani-cli ani-hop was tested with; older ones scrape a source that changed.
 pub const TESTED_ANI_CLI: &str = "5.1";
 
-/// The installed ani-cli's version, if it's older than TESTED_ANI_CLI.
-pub fn old_ani_cli() -> Option<String> {
+/// The installed ani-cli's version.
+pub fn ani_cli_version() -> Option<String> {
     let out = Command::new("ani-cli")
         .arg("-V")
         .stdin(Stdio::null())
         .output()
         .ok()
         .filter(|o| o.status.success())?; // it exits early when curl or a player is missing
-    let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    older(&v, TESTED_ANI_CLI).then_some(v)
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Dotted versions compared number by number: 4.10 < 5.1 < 5.1.5, a leading v is ignored.

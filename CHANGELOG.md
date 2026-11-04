@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.5 – 2026-11-04
+
+### Added
+
+- The main menu's top line shows your ani-hop and ani-cli versions, dimmed. When one has an update, its version turns bright with an ↑. Checking ani-cli is one more request to GitHub a day, or one each start while it gets no answer.
+
 ## 0.10.4 – 2026-11-04
 
 ### Fixed
