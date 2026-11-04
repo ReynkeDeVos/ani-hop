@@ -4134,7 +4134,7 @@ mod tests {
         assert_eq!(start(keys, "type"), Some(right + 2), "{keys}");
 
         // a message too long beside the keys ends on the right edge too, and says it's cut
-        app.toast(&"too long ".repeat(20), true);
+        app.toast("too long ".repeat(20), true);
         let drawn = screen(&mut app, 120, 30);
         let foot = drawn.lines().last().unwrap().trim_end();
         assert_eq!(
