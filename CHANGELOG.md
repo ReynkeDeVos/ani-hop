@@ -2,6 +2,10 @@
 
 ## 0.10.9 – 2026-11-04
 
+### Added
+
+- Ctrl+Backspace deletes the last word you typed in the search bar and other prompts. So do Alt+Backspace, Ctrl+← and Ctrl+W. In a folder path it deletes one folder at a time. With nothing typed, `^h` and Ctrl+← go back.
+
 ### Changed
 
 - The `ani-hop` tag is back on the main menu, so it's on every screen and no longer appears only once you leave the menu.

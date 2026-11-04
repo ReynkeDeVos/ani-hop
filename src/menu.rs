@@ -70,6 +70,12 @@ fn haystack<'a>(s: &'a str, kind: AtomKind, buf: &'a mut Vec<char>) -> Utf32Str<
 /// What ends a char haystack for ' and !: a noncharacter, taken out of every query.
 const END: char = '\u{FFFF}';
 
+/// Takes the last word off `q`: back to a space, or to a `/`, so a path goes a folder at a time.
+fn drop_word(q: &mut String) {
+    let word = q.trim_end().trim_end_matches('/');
+    q.truncate(word.rfind([' ', '/']).map_or(0, |p| p + 1));
+}
+
 pub enum Act {
     Accept,
     Back,
@@ -244,9 +250,14 @@ impl Menu {
 
     pub fn key(&mut self, k: KeyEvent) -> Option<Act> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = k.modifiers.contains(KeyModifiers::ALT);
         match k.code {
             KeyCode::Enter | KeyCode::Right => return Some(Act::Accept),
             KeyCode::Char('l') if ctrl => return Some(Act::Accept),
+            // most terminals send ctrl+backspace as ^h, so it deletes while there's text
+            KeyCode::Char('h') | KeyCode::Left if ctrl && !self.query.is_empty() => {
+                self.edit(drop_word)
+            }
             KeyCode::Left => return Some(Act::Back),
             KeyCode::Char('h') if ctrl => return Some(Act::Back),
             KeyCode::Esc if !self.query.is_empty() => self.edit(String::clear),
@@ -278,10 +289,8 @@ impl Menu {
                 }
             }
             KeyCode::Char('u') if ctrl => self.edit(String::clear),
-            KeyCode::Char('w') if ctrl => self.edit(|q| {
-                let trimmed = q.trim_end().len();
-                q.truncate(q[..trimmed].rfind(' ').map_or(0, |p| p + 1));
-            }),
+            KeyCode::Char('w') if ctrl => self.edit(drop_word),
+            KeyCode::Backspace if ctrl || alt => self.edit(drop_word),
             KeyCode::Backspace => self.edit(|q| _ = q.pop()),
             KeyCode::Char(c) if !ctrl => self.edit(|q| q.push(c)),
             _ => {}
@@ -489,5 +498,48 @@ mod tests {
         m.items[2].about = "A wall with !force painted on it.".into();
         m.edit(|q| *q = "!force".into());
         assert!(m.matches.iter().all(|(i, _)| *i != 2));
+    }
+
+    #[test]
+    fn every_way_of_deleting_a_word_deletes_one() {
+        let (ctrl, alt) = (KeyModifiers::CONTROL, KeyModifiers::ALT);
+        let keys = [
+            (KeyCode::Char('w'), ctrl),
+            (KeyCode::Char('h'), ctrl), // how most terminals send ctrl+backspace
+            (KeyCode::Backspace, ctrl),
+            (KeyCode::Backspace, alt),
+            (KeyCode::Left, ctrl),
+        ];
+        for (code, mods) in keys {
+            let mut m = Menu::new(Vec::new(), false);
+            m.edit(|q| *q = "attack on titan".into());
+            assert!(m.key(KeyEvent::new(code, mods)).is_none());
+            assert_eq!(m.query, "attack on ", "{code:?}");
+            m.key(KeyEvent::new(code, mods));
+            assert_eq!(m.query, "attack ", "{code:?}");
+        }
+        // a path goes a folder at a time, down to nothing
+        let mut m = Menu::new(Vec::new(), false);
+        m.edit(|q| *q = "~/Videos/Anime".into());
+        for left in ["~/Videos/", "~/", ""] {
+            m.key(KeyEvent::new(KeyCode::Char('h'), ctrl));
+            assert_eq!(m.query, left);
+        }
+        // text that isn't ASCII is cut between characters
+        m.edit(|q| *q = "葬送の フリーレン".into());
+        m.key(KeyEvent::new(KeyCode::Char('h'), ctrl));
+        assert_eq!(m.query, "葬送の ");
+        // with nothing typed they still go back, and a plain ← always does
+        m.edit(String::clear);
+        for code in [KeyCode::Char('h'), KeyCode::Left] {
+            let act = m.key(KeyEvent::new(code, ctrl));
+            assert!(matches!(act, Some(Act::Back)), "{code:?}");
+        }
+        m.edit(|q| *q = "frieren".into());
+        assert!(matches!(
+            m.key(KeyEvent::from(KeyCode::Left)),
+            Some(Act::Back)
+        ));
+        assert_eq!(m.query, "frieren");
     }
 }
