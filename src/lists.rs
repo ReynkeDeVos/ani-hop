@@ -35,6 +35,13 @@ pub struct List {
 /// A refresh on its way, and the list changes there were when it was asked for.
 pub struct Ask(u64);
 
+impl Ask {
+    /// A refresh asked for now.
+    pub fn now() -> Ask {
+        Ask(changes())
+    }
+}
+
 /// Bumped on every list change, so refreshes that started before it don't count as fresh.
 static CHANGES: AtomicU64 = AtomicU64::new(0);
 
@@ -141,7 +148,7 @@ impl List {
                 false => shows.truncate(PER_PAGE),
             }
         }
-        let ask = (!fresh).then(|| Ask(changes()));
+        let ask = (!fresh).then(Ask::now);
         let refreshing = ask.is_some();
         let list = List {
             shows,

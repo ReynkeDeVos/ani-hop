@@ -244,6 +244,11 @@ impl Playback {
         }
     }
 
+    /// `attempt` is the one on, and its player hasn't said it shows the episode.
+    pub fn starting(&self, attempt: u64) -> bool {
+        (self.now.as_ref()).is_some_and(|p| p.attempt == attempt && p.step.is_some())
+    }
+
     /// `attempt` ended, its player closed or it failed.
     pub fn ended(&mut self, attempt: u64) {
         self.now.take_if(|p| p.attempt == attempt);

@@ -382,7 +382,10 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     let busy = busy.or_else(|| fetching.then(|| ("more".to_string(), format!("{spin} loading…"))));
     let busy = busy.or(dl_row);
     let width = list_area.width.saturating_sub(1).max(2) as usize; // minus the pointer column
-    let titles = matches!(screen.view, View::Shows(..) | View::Sources(..));
+    let titles = matches!(
+        screen.view,
+        View::Shows(..) | View::Sources(..) | View::Main
+    );
     let selected = m.state.selected();
     let rows: Vec<ListItem> = (m.matches.iter().enumerate())
         .map(|(k, (i, hits))| {

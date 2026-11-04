@@ -120,6 +120,12 @@ impl<'a> Progress<'a> {
         next
     }
 
+    /// The next episode, while it's out as far as anyone knows.
+    pub fn next_out(&self) -> Option<u32> {
+        let next = self.next();
+        self.released().is_none_or(|r| next <= r).then_some(next)
+    }
+
     /// Episodes out right now, the parts' included (None: unknown).
     pub fn released(&self) -> Option<u32> {
         match self.parts.last() {
