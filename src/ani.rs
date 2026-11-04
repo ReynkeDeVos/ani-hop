@@ -892,7 +892,10 @@ pub fn hwdec_unset() -> bool {
 /// Asks with options mpv answers right after reading its config files, and then quits. So nothing
 /// in them starts: another mpv's control socket, a log or a stats file stay as they are, and the
 /// user's scripts don't run. Each profile is asked after, as -v only says what one sets once it
-/// applies, and the file played decides that.
+/// applies, and the file played decides that. Only answers that show they're what was asked for
+/// count, so a changed mpv costs the default, never the user's choice. A built-in profile the user
+/// added to only counts once it's applied: by the config, which -v shows, or by a flag, which
+/// comes after ours.
 fn config_leaves_hwdec(mpv: &dyn Fn() -> Command) -> bool {
     let ask = |args: &[&str]| {
         let child = (mpv().args(args).stdin(Stdio::null()))
@@ -910,18 +913,27 @@ fn config_leaves_hwdec(mpv: &dyn Fn() -> Command) -> bool {
     let Some(said) = ask(&["-v", "--profile=help"]) else {
         return false;
     };
-    if said.contains("Setting option 'hwdec' = ") {
+    if !said.contains("Setting option 'profile' = 'help'") || config_may_set_hwdec(&said) {
         return false;
     }
     let Some(builtin) = ask(&["--no-config", "--profile=help"]) else {
         return false;
     };
     let builtin = profiles(&builtin);
+    if builtin.is_empty() {
+        return false;
+    }
     let mut own = profiles(&said).into_iter().filter(|p| !builtin.contains(p));
     own.all(|p| {
         let shown = ask(&[&format!("--show-profile={p}")]);
-        shown.is_some_and(|shown| !profile_sets_hwdec(&shown))
+        shown.is_some_and(|shown| shown.starts_with("Profile ") && !profile_may_set_hwdec(&shown))
     })
+}
+
+/// From `mpv -v`: hwdec itself, or a config next to each file, which only that file would show.
+fn config_may_set_hwdec(said: &str) -> bool {
+    (said.contains("Setting option 'hwdec' = "))
+        || said.contains("Setting option 'use-filedir-conf' = ")
 }
 
 /// The names in `mpv --profile=help`: "\tname\tdescription", after -v's prefix if it's there.
@@ -932,18 +944,13 @@ fn profiles(list: &str) -> Vec<&str> {
         .collect()
 }
 
-/// From `mpv --show-profile`, where `hwdec-codecs` is another option.
-fn profile_sets_hwdec(shown: &str) -> bool {
+/// From `mpv --show-profile`, where `hwdec-codecs` is another option, and a file a profile includes
+/// isn't shown.
+fn profile_may_set_hwdec(shown: &str) -> bool {
     shown.lines().any(|l| {
-        let line = l.trim_start_matches("[cplayer] ").trim_start();
-        matches!(line.split('=').next(), Some("hwdec" | "no-hwdec"))
+        let option = l.trim_start().split('=').next();
+        matches!(option, Some("hwdec" | "no-hwdec" | "include"))
     })
-}
-
-/// Whether these mpv flags choose how to decode. `--hwdec-codecs` only says for what.
-fn flags_choose_hwdec(flags: &str) -> bool {
-    (flags.split_whitespace())
-        .any(|f| f == "--hwdec" || f == "--no-hwdec" || f.starts_with("--hwdec="))
 }
 
 /// ani-cli set up to take episode `ep` of `src` to the player (with ani-skip), and the file
@@ -955,9 +962,10 @@ fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, O
     if player.contains("mpv") && !subs(audio) {
         flags.push_str(" --sub-visibility=no");
     }
-    // the last flag wins, so not after the user's own. Another player has another config
-    if player == "mpv" && !flags_choose_hwdec(&flags) && hwdec_unset() {
-        flags = format!("{flags} {HWDEC}");
+    // first, as the last flag wins and the user's own come after it. Another player has another
+    // config
+    if player == "mpv" && hwdec_unset() {
+        flags = format!("{HWDEC} {flags}");
     }
     let mut cli = ani_cli();
     let subs = subs_page(m, src, ep, dub(audio)).map(|page| {
@@ -1791,11 +1799,12 @@ mod tests {
             "Profile a: \n no-hwdec=\n",
             "Profile a: \n volume=9\n hwdec=auto\n",
             "Profile a: \n profile=b\n  hwdec=auto\n",
+            "Profile a: \n include=/x.conf\n",
         ] {
-            assert!(profile_sets_hwdec(shown), "{shown}");
+            assert!(profile_may_set_hwdec(shown), "{shown}");
         }
         for shown in ["Profile a: \n", "Profile a: \n hwdec-codecs=all\n"] {
-            assert!(!profile_sets_hwdec(shown), "{shown}");
+            assert!(!profile_may_set_hwdec(shown), "{shown}");
         }
     }
 
@@ -1815,6 +1824,8 @@ mod tests {
         if !have("mpv") || Path::new("/etc/mpv/mpv.conf").exists() {
             return;
         }
+        // its questions are on AHEAD, which the tests of quitting end
+        let _turn = CLOSING.lock().unwrap_or_else(|e| e.into_inner());
         let dir = std::env::temp_dir().join(format!("ani-hop-hwdec-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -1829,6 +1840,9 @@ mod tests {
             ("# hwdec=auto\n", true),
             ("hwdec-codecs=all\n", true),
             ("[extension.mkv]\nhwdec-codecs=all\n", true),
+            ("[fast]\nhwdec=no\n", true), // only once applied, and a flag comes after ours
+            ("really-quiet=yes\n", true),
+            ("msg-level=all=no\n", true),
             ("hwdec=auto\n", false),
             ("hwdec=no\n", false),
             ("no-hwdec\n", false),
@@ -1840,10 +1854,25 @@ mod tests {
             ("[a]\nprofile=b\n[b]\nhwdec=auto\n", false),
             ("really-quiet=yes\n[extension.mkv]\nhwdec=no\n", false),
             ("msg-level=all=no\n[extension.mkv]\nhwdec=no\n", false),
+            ("[extension.mkv]\ninclude=/nowhere.conf\n", false),
+            ("use-filedir-conf=yes\n", false),
+            ("profile=fast\n[fast]\nhwdec=no\n", false),
         ] {
             fs::write(&conf, config).unwrap();
             assert_eq!(config_leaves_hwdec(&mpv), leaves, "{config}");
         }
+        // told to say less than -v, its answer doesn't show it's what was asked for
+        fs::write(&conf, "hwdec=no\n").unwrap();
+        let quiet = || {
+            let mut mpv = mpv();
+            mpv.env("MPV_VERBOSE", "-1");
+            mpv
+        };
+        assert!(!config_leaves_hwdec(&quiet));
+        // a profile mpv doesn't find, as a name with a tab in it would be
+        let tabbed = "[a\tb]\nhwdec=no\n";
+        fs::write(&conf, tabbed).unwrap();
+        assert!(!config_leaves_hwdec(&mpv), "{tabbed}");
 
         // a config naming a control socket, a stats file and a script, with a profile that
         // applies right away: the mpv already on that socket keeps it, and nothing else starts
@@ -1884,22 +1913,6 @@ mod tests {
         std::os::unix::net::UnixStream::connect(&socket).expect("the running mpv still answers");
         assert_eq!(fs::read_to_string(&stats).unwrap(), "kept");
         assert!(!ran.exists(), "the user's script didn't run");
-    }
-
-    #[test]
-    fn only_a_flag_that_chooses_how_to_decode_keeps_ours_out() {
-        for flags in [
-            "--hwdec=no",
-            " --hwdec=vaapi --fs",
-            "--no-hwdec",
-            "--fs --no-hwdec",
-            "--hwdec",
-        ] {
-            assert!(flags_choose_hwdec(flags), "{flags}");
-        }
-        for flags in ["", "--fs", "--hwdec-codecs=all", "--vd-lavc-threads=4"] {
-            assert!(!flags_choose_hwdec(flags), "{flags}");
-        }
     }
 
     #[test]
