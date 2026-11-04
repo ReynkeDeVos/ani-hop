@@ -727,7 +727,7 @@ impl Queue {
         let file = fs::File::create(&path).map_err(|e| e.to_string())?;
         Ok(file.try_lock().ok().map(|()| EpisodeLock {
             path,
-            _held: file,
+            held: file,
             dir: dir.to_path_buf(),
             ep: ep.to_string(),
             folder: None,
@@ -759,7 +759,7 @@ impl Queue {
 /// download it at once.
 struct EpisodeLock {
     path: PathBuf,
-    _held: fs::File,
+    held: fs::File,
     dir: PathBuf,
     ep: String,
     /// its folder, while it downloads into it
@@ -787,6 +787,9 @@ impl Drop for EpisodeLock {
         {
             let _ = fs::remove_file(&self.path);
         }
+        // not just by closing, as a process being started may have a copy of the file; and
+        // only now, so nothing locks the file just removed
+        let _ = self.held.unlock();
     }
 }
 

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.7 – 2026-11-04
+## 0.10.8 – 2026-11-04
 
 ### Added
 
@@ -8,13 +8,17 @@
 
 ### Changed
 
-- The Continue row stands out on the main menu, under a line of its own, and Quit steps back.
+- The Continue row stands out on the main menu, under a line of its own, and Quit steps back. Its prompt says "type to filter", as the keys aren't on screen there.
+- The faint text is easier to read on every Omarchy theme, light and dark. Hints and the words at the bottom now use a mid gray instead of the theme's muted color, which is hard to read on most themes. A setting's value, like `on` or `off`, and help you have to read use main text.
+- Show titles use main text, and their cover's color sweeps across once when the show comes up. Most covers' colors were too pale to read on a light theme.
 - The screen lines up. The top and bottom lines start and end where the panels' text does, and what you type starts where the menu's rows do.
 - The `ani-hop` tag is gone from the main menu. On other screens it starts the way back, and it now starts on the panel's border.
 - Both panels have the same padding, so a poster starts on the search prompt's row, and a show's page has two more columns and two more rows for its text. The logo gets a blank row above it.
 - On a wide window the list stops at about 60 columns, so what a row says on its right stays close to its name, and the preview gets the rest. A show's page stops at 110 columns, so its text stays easy to read.
+- A description stays in one column: beside the poster if all of it fits, otherwise under the poster. It no longer jumps left mid-sentence.
 - The key list starts under the logo instead of six columns in. The filter hint says `'exact` instead of `'word`, like the rest of that line, which names what each one does. `→` lists `^l` only, as the footer already says enter.
 - Prompts no longer have a label before `❯`, as the top line and the help say what they ask for. Typing starts in the same place on every prompt. The login's top line says "AniList client ID" and "AniList token".
+- The login and folder prompts have their help in the right panel, so a web address fits on one row at 80 columns and can be copied in one go.
 - Clearer help on a few screens, such as "Empty resets to ~/Videos/Anime" instead of "Empty goes back to".
 
 ### Removed
@@ -24,7 +28,7 @@
 ### Fixed
 
 - A message too long for the bottom line now ends in `…` instead of being cut off mid-word.
-- A show whose cover color is too dark to read gets the theme's color for its title.
+- Deleting a show right after its download ended could wrongly say a download still holds it. This was also why one of ani-hop's tests failed now and then.
 
 ## 0.10.6 – 2026-11-04
 

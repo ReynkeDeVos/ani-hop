@@ -4194,11 +4194,7 @@ mod tests {
         };
         assert_eq!(cell("▶  Show", "▶").fg, ui::ACCENT);
         assert_eq!(cell("continue episode 4", "4").fg, ui::ACCENT);
-        assert!(
-            cell("Quit", "Q")
-                .modifier
-                .contains(ratatui::style::Modifier::DIM)
-        );
+        assert_eq!(Some(cell("Quit", "Q").fg), ui::SOFT.fg);
         // under a rule of its own, which doesn't cost a screen of 24 rows any row
         let drawn = screen(&mut app, 80, 24);
         let rows: Vec<&str> = drawn.lines().collect();
@@ -4217,6 +4213,140 @@ mod tests {
         let buf = term.backend().buffer();
         let play = (0..120).find(|&x| buf[(x, 4)].symbol() == "▶").unwrap();
         assert_ne!(buf[(play, 4)].fg, ui::ACCENT);
+    }
+
+    #[test]
+    fn help_on_a_prompt_keeps_its_addresses_on_one_row_at_80_columns() {
+        let mut app = app();
+        app.push("AniList client ID", View::Input(Input::ClientId));
+        let drawn = screen(&mut app, 80, 24);
+        assert!(drawn.contains(PIN_REDIRECT), "{drawn}");
+        assert!(drawn.contains("anilist.co/settings/developer"), "{drawn}");
+        // the left panel keeps the prompt and its rule alone
+        let left: String = (drawn.lines().skip(4).take(18))
+            .map(|l| l.chars().take(34).collect::<String>())
+            .collect();
+        assert!(!left.contains(|c: char| c.is_alphanumeric()), "{drawn}");
+        // except beside the show a source is searched for, which has the other panel
+        app.push(
+            "Change source",
+            View::Input(Input::SourceQuery(show(50_410, 12, None))),
+        );
+        let drawn = screen(&mut app, 80, 24);
+        let row = drawn
+            .lines()
+            .find(|l| l.contains("Search ani-cli"))
+            .unwrap();
+        assert!(
+            row.find("Search ani-cli").unwrap() < row.find("││").unwrap(),
+            "{drawn}"
+        );
+    }
+
+    #[test]
+    fn text_never_takes_the_color_meant_for_lines() {
+        let m = show(50_411, 12, Some(3));
+        let mut app = app();
+        app.ani_cli = Some("5.1.6".into());
+        let screens: Vec<(&str, View)> = vec![
+            ("Settings", View::Settings),
+            ("Welcome", View::Setup),
+            ("Search", View::Input(Input::Search)),
+            ("Episodes", View::Episodes(m.clone(), EpMode::Play)),
+            ("Bulk", View::Bulk(vec![m.clone()])),
+            ("Show", View::Show(m.clone())),
+        ];
+        let check = |app: &mut App, name: &str| {
+            let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+            term.draw(|f| ui::render(app, f)).unwrap();
+            app.pressed = true;
+            term.draw(|f| ui::render(app, f)).unwrap();
+            let buf = term.backend().buffer();
+            for pos in buf.area.positions() {
+                let cell = &buf[pos];
+                assert!(
+                    cell.fg != ui::LINE || "─│╭╮╰╯━ ›·\u{a0}".contains(cell.symbol()),
+                    "{name}: {:?} at {pos:?}",
+                    cell.symbol()
+                );
+            }
+        };
+        check(&mut app, "main menu");
+        for (name, view) in screens {
+            app.push(name, view);
+            check(&mut app, name);
+            app.stack.pop();
+        }
+        // and a setting's value reads like the setting
+        app.push("Settings", View::Settings);
+        let mut term = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| ui::render(&mut app, f)).unwrap();
+        let buf = term.backend().buffer();
+        let row = (0..40).find(|&y| {
+            let line: String = (0..50).map(|x| buf[(x, y)].symbol()).collect();
+            line.contains("Download folder…")
+        });
+        let y = row.unwrap();
+        let end = (0..48)
+            .rev()
+            .find(|&x| buf[(x, y)].symbol() != " ")
+            .unwrap();
+        assert_eq!(buf[(end, y)].fg, ratatui::style::Color::Reset);
+    }
+
+    #[test]
+    fn a_description_keeps_one_left_edge() {
+        // the column each row of it starts at, in the preview
+        let columns = |drawn: &str| -> Vec<usize> {
+            let mut at: Vec<usize> = (drawn.lines())
+                .filter_map(|l| l.find("word").map(|at| l[..at].chars().count()))
+                .collect();
+            at.dedup();
+            at
+        };
+        let shown = |words: usize, w, h| {
+            let mut m = show(50_412, 12, None);
+            m.description = Some("word ".repeat(words));
+            let mut app = app();
+            app.open_show(m);
+            screen(&mut app, w, h)
+        };
+        // too long for the column beside the poster: all of it under the poster, at the inset
+        let long = shown(200, 80, 24);
+        assert_eq!(columns(&long), [36], "{long}");
+        // short enough: all of it beside the poster, also when it runs on past it
+        let short = shown(40, 188, 48);
+        let at = columns(&short);
+        assert!(at.len() == 1 && at[0] > 80, "{short}");
+        // a column too narrow for a wide character doesn't lose it: it goes under the poster
+        let mut m = show(50_414, 12, None);
+        m.description = Some("ビデ".into());
+        let mut app = app();
+        app.open_show(m);
+        let drawn = screen(&mut app, 18, 40);
+        assert!(drawn.contains('ビ') && drawn.contains('デ'), "{drawn}");
+    }
+
+    #[test]
+    fn the_continue_row_says_typing_filters_where_the_keys_would() {
+        let mut app = app_going_on(Some(show(50_413, 12, Some(3))), Vec::new());
+        let drawn = screen(&mut app, 120, 30);
+        let row = drawn.lines().nth(2).unwrap();
+        assert_eq!(
+            row.find("type to filter")
+                .map(|at| row[..at].chars().count()),
+            Some(5),
+            "{row}"
+        );
+        // gone with the first key
+        app.top().menu.edit(|q| *q = "s".into());
+        assert!(!screen(&mut app, 120, 30).contains("type to filter"));
+        app.top().menu.edit(|q| q.clear());
+        // and on the other rows, where the keys are
+        press(&mut app, KeyCode::Down);
+        let drawn = screen(&mut app, 120, 30);
+        assert!(!drawn.contains("type to filter"), "{drawn}");
+        assert!(drawn.contains("filter the list"), "{drawn}");
     }
 
     #[test]

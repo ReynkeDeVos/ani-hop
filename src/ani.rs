@@ -1236,7 +1236,15 @@ fn holds_dir() -> PathBuf {
 
 /// A download folder held by a download into it, from making the folder until the download
 /// is done: it isn't dropped meanwhile, also while still empty. Several may hold one.
-pub struct Hold(#[allow(dead_code)] fs::File);
+pub struct Hold(fs::File);
+
+impl Drop for Hold {
+    /// Closing alone leaves the lock with any copy of the file: a process another thread is
+    /// starting has one until it runs, which made a delete right after this say it's busy.
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
 
 /// FNV-1a, for ids and lock names that are saved or shared with other ani-hops: std's hasher
 /// may change between Rust releases.
@@ -1253,8 +1261,9 @@ fn hold_file(dir: &Path) -> std::io::Result<fs::File> {
 }
 
 /// Whether nothing holds `dir`, while the result is kept: removing it is safe then.
-fn unheld(dir: &Path) -> Option<fs::File> {
-    hold_file(dir).ok().filter(|f| f.try_lock().is_ok())
+fn unheld(dir: &Path) -> Option<Hold> {
+    let file = hold_file(dir).ok()?;
+    file.try_lock().ok().map(|()| Hold(file))
 }
 
 fn index() -> Index {
@@ -2146,8 +2155,11 @@ mod tests {
         let held = delete_show(&dir).unwrap_err();
         assert_eq!(held.kind(), std::io::ErrorKind::ResourceBusy);
         assert!(done.exists() && part.exists() && ours(&dir));
+        // a process started just now has a copy until it runs: letting go still counts
+        let copy = hold.0.try_clone().unwrap();
         drop(hold);
         delete_show(&dir).unwrap();
+        drop(copy);
         assert!(!done.exists() && !part.exists() && !dir.exists() && !ours(&dir));
         fs::remove_dir_all(&root).unwrap();
     }
