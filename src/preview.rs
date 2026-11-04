@@ -249,7 +249,7 @@ impl Preview {
             ),
         ];
         for (_, y, key, what) in hints.into_iter().filter(|h| h.0) {
-            let row = Rect::new(area.x, y, area.width, 1).inner(Margin::new(2, 0));
+            let row = Rect::new(area.x, y, area.width, 1).inner(Margin::new(1, 0));
             // a narrow border drops the words, then "shift"
             let arrow = key["shift".len()..].trim_start();
             let hint = [(key, what), (key, " "), (arrow, " ")]

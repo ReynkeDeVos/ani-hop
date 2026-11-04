@@ -154,9 +154,9 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
         Some((_, name)) => Line::from(vec![
             Span::styled("● ", Color::Green),
             Span::raw(name.as_str()),
-            " ".into(),
+            "  ".into(),
         ]),
-        None => Line::from(Span::styled("○ not logged in to AniList ", DIM)),
+        None => Line::from(Span::styled("○ not logged in to AniList  ", DIM)),
     };
     let [crumbs_area, user_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(user.width() as u16)])
@@ -165,7 +165,7 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
     // newest crumbs first; whatever doesn't fit folds into "…", and the current one is cut
     // in the middle, keeping a season's or part's name
     let crumbs: Vec<&str> = app.stack.iter().skip(1).rev().map(crumb).collect();
-    let mut room = (crumbs_area.width as usize).saturating_sub(10);
+    let mut room = (crumbs_area.width as usize).saturating_sub(12);
     let mut shown: Vec<String> = Vec::new();
     for (i, t) in crumbs.iter().enumerate() {
         // room for " › …" while older ones follow
@@ -181,16 +181,20 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
         room = room.saturating_sub(Span::raw(t.as_str()).width() + 3);
         shown.push(t);
     }
-    let mut crumbs = vec![Span::styled(
-        " ani-hop ",
-        Style::new().fg(Color::Black).bg(ACCENT).bold(),
-    )];
+    // half blocks start its fill on the border's line, which runs through the middle of a
+    // column, and its name where the prompt starts
+    let mut crumbs = vec![
+        Span::styled("▐", ACCENT),
+        Span::styled(" ani-hop ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
+        Span::styled("▌", ACCENT),
+    ];
+    let badge = Line::from(crumbs.clone()).width();
     for t in shown.into_iter().rev() {
         crumbs.push(Span::styled(" › ", DIM));
         crumbs.push(Span::raw(t));
     }
     // the name whole or not at all
-    if crumbs_area.width as usize >= crumbs[0].width() {
+    if crumbs_area.width as usize >= badge {
         f.render_widget(Line::from(crumbs), crumbs_area);
     }
     f.render_widget(user, user_area);
@@ -238,8 +242,9 @@ fn question(screen: &crate::Screen) -> Option<(&str, usize)> {
     asks.then_some((screen.title.as_str(), screen.menu.items.len()))
 }
 
-/// Where the menu's rows go in its panel at `area`.
-fn menu_inner(area: Rect) -> Rect {
+/// Where a panel's content goes: two columns in from its outer edge, where the top and bottom
+/// lines' text starts and ends too, so the whole screen shares its edges.
+fn panel_inner(area: Rect) -> Rect {
     panel().inner(area).inner(Margin::new(1, 0))
 }
 
@@ -267,7 +272,7 @@ fn split(body: Rect, asked: Option<(&str, usize)>) -> (Rect, Option<Rect>) {
     let [left, right] =
         Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]).areas(body);
     match asked {
-        Some((q, answers)) if !question_rows(q, answers, menu_inner(left)).1 => (body, None),
+        Some((q, answers)) if !question_rows(q, answers, panel_inner(left)).1 => (body, None),
         _ => (left, Some(right)),
     }
 }
@@ -289,7 +294,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     };
     let screen = app.stack.last_mut().unwrap();
     let block = panel();
-    let inner = menu_inner(area);
+    let inner = panel_inner(area);
     f.render_widget(block, area);
     // a confirmation shows its question where the filter prompt would be, wrapped
     let asked = question(screen);
@@ -302,18 +307,11 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     ])
     .areas(inner);
 
-    let label = match &screen.view {
-        View::Input(Input::ClientId) => "client id ",
-        View::Input(Input::Token) => "token ",
-        View::Input(Input::SourceQuery(_)) => "ani-cli ",
-        View::Input(Input::DownloadDir) => "folder ",
-        _ => "",
-    };
-    // a long text keeps its end in view, where typing goes, with the cursor after it
-    let room = (prompt_area.width as usize).saturating_sub(Span::raw(label).width() + 3);
+    // what's typed starts where the rows' labels do; a long text keeps its end in view, where
+    // typing goes, with the cursor after it
+    let room = (prompt_area.width as usize).saturating_sub(4);
     let prompt = Line::from(vec![
-        Span::styled(label, ACCENT),
-        Span::styled("❯ ", Style::new().fg(ACCENT).bold()),
+        Span::styled("❯  ", Style::new().fg(ACCENT).bold()),
         Span::raw(fit_start(&screen.menu.query, room)),
     ]);
     let cursor_x =
@@ -329,10 +327,21 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         }
     }
 
-    // an input as a fixed menu: its rule alone, and its help where rows would start
+    // an input as a fixed menu: what it asks for on its rule, where a list has its count, and
+    // its help where rows would start
     if let View::Input(input) = &screen.view {
-        let rule = "─".repeat(info_area.width as usize);
-        f.render_widget(Line::styled(rule, DIM), info_area);
+        let label = match input {
+            Input::Search => "",
+            Input::ClientId => "client ID ",
+            Input::Token => "token ",
+            Input::SourceQuery(_) => "ani-cli ",
+            Input::DownloadDir => "folder ",
+        };
+        let rule = "─".repeat((info_area.width as usize).saturating_sub(label.len()));
+        f.render_widget(
+            Line::from(vec![Span::styled(label, ACCENT), Span::styled(rule, DIM)]),
+            info_area,
+        );
         let [_, help_area] =
             Layout::horizontal([Constraint::Length(3), Constraint::Fill(1)]).areas(list_area);
         f.render_widget(
@@ -545,7 +554,7 @@ fn input_help(input: &Input) -> Text<'static> {
             vec![
                 "A show's English or Japanese name, or a nickname like aot.".into(),
                 "".into(),
-                "Filter the shows it finds:".into(),
+                "Then filter the list:".into(),
                 row("'titan", "exact match"),
                 row("^attack", "starts with"),
                 row("titan$", "ends with"),
@@ -571,14 +580,14 @@ fn input_help(input: &Input) -> Text<'static> {
                 Style::new().italic(),
             ),
             "".into(),
-            "Wrong client ID? Press enter with this empty.".into(),
+            "Wrong client ID? Leave this empty and press enter to change it.".into(),
         ],
         Input::SourceQuery(_) => vec![
             "Search ani-cli with this text, then pick the right source. ani-hop keeps it.".into(),
         ],
         Input::DownloadDir => vec![
             "Downloads go here. ~ works.".into(),
-            format!("Empty goes back to {}.", ani::tilde(&ani::default_root())).into(),
+            format!("Empty resets to {}.", ani::tilde(&ani::default_root())).into(),
             "".into(),
             "Shows downloaded before keep their folder, also for new episodes.".into(),
         ],
@@ -587,9 +596,8 @@ fn input_help(input: &Input) -> Text<'static> {
 }
 
 fn preview(app: &mut App, f: &mut Frame, area: Rect) {
-    let block = panel();
-    let inner = block.inner(area).inner(Margin::new(2, 1));
-    f.render_widget(block, area);
+    let inner = panel_inner(area);
+    f.render_widget(panel(), area);
     let screen = app.stack.last().unwrap();
     let media = match &screen.view {
         View::Shows(list) => screen
@@ -765,7 +773,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v.push(row(
         kitty::supported(),
         "graphics",
-        "posters: Ghostty or kitty",
+        "posters in Ghostty or kitty",
     ));
     v.extend(["".into(), Line::styled("AniList", Style::new().bold())]);
     match &app.user {
@@ -774,8 +782,8 @@ fn setup(app: &App) -> Vec<Line<'static>> {
             format!("logged in as {name}").into(),
         ])),
         None => v.extend([
-            Line::styled("  Log in to get Watching/Planning first", DIM),
-            Line::styled("  and progress saved after each episode.", DIM),
+            Line::styled("  Log in to see your lists", DIM),
+            Line::styled("  and save progress after each episode.", DIM),
         ]),
     }
     v
@@ -786,13 +794,13 @@ fn setup(app: &App) -> Vec<Line<'static>> {
 fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
     // a key, what it does, and the other keys that do the same
     let key = |k: &'static str, what: &'static str, also: &'static str| {
-        // padded only beside other keys: trailing spaces would wrap at 80 columns
+        // padded only beside other keys: trailing spaces would wrap in a narrow preview
         let (what, also) = match also {
             "" => (what.to_string(), String::new()),
-            _ => (format!("{what:<18}"), format!("{also:>8}")),
+            _ => (format!("{what:<21}"), format!("{also:>8}")),
         };
         Line::from(vec![
-            Span::styled(format!("{k:>10}  "), ACCENT),
+            Span::styled(format!("{k:>4}  "), ACCENT),
             Span::raw(what),
             Span::styled(also, DIM),
         ])
@@ -815,12 +823,12 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
         }
         v.extend([
             key("↑ ↓", "move", "^k ^j"),
-            key("→", "select", "enter ^l"),
+            key("→", "select", "^l"),
             key("←", "back", "^h"),
             "".into(),
             key("type", "filter the list", ""),
-            // 40 columns, all 80 leave the preview
-            Line::styled(format!("{:12}'word ^start end$ !not a | b", ""), DIM),
+            // 35 columns, of the 42 that 80 leave the preview
+            Line::styled(format!("{:6}'exact ^start end$ !not a | b", ""), DIM),
             key("esc", "clear the filter, then back", ""),
         ]);
     }
@@ -833,6 +841,12 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
 }
 
 fn footer(app: &App, f: &mut Frame, area: Rect) {
+    // what it says starts where the prompt does: a column in, and one from each text below
+    let area = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(1),
+        ..area
+    };
     let screen = app.stack.last().unwrap();
     let enter = app.enter_verb();
     // esc empties a typed filter (or a prefilled input) before it goes back
@@ -878,7 +892,7 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         // shortcut: what's still underway is told apart by its "…"; give toasts a kind once a
         // finished one can end in "…"
         (Some((text, err, _)), _) => Line::styled(
-            format!(" {text}"),
+            fit(format!(" {text}"), (area.width as usize).saturating_sub(2)),
             match (*err, text.ends_with('…')) {
                 (true, _) => Color::Red,
                 (false, true) => ACCENT,
@@ -917,17 +931,19 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         }
         _ => Line::default(),
     };
-    // a toast that doesn't fit beside the hints gets the line until it fades
-    // and the column between them
+    // a toast that doesn't fit beside the hints gets their place until it fades, up to the edge
+    // they end at
     let crowded = toast.is_some() && status.width() + hints.width() + 1 > area.width as usize;
-    let hints_width = if crowded { 0 } else { hints.width() as u16 };
+    let hints_width = if crowded { 1 } else { hints.width() as u16 };
     // a column between them, so a cut status line doesn't run into the keys
     let [status_area, hints_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(hints_width)])
             .spacing(1)
             .areas(area);
     f.render_widget(status, status_area);
-    f.render_widget(hints, hints_area);
+    if !crowded {
+        f.render_widget(hints, hints_area);
+    }
 }
 
 /// A row's label, a span per grapheme as drawn (joined emoji stay whole), with the filter's
@@ -1058,10 +1074,10 @@ mod tests {
         // too long beside the preview in a small terminal: it takes the whole width
         let (menu, preview) = split(body(40, 12), Some((q, 2)));
         assert_eq!((menu, preview), (body(40, 12), None));
-        assert_eq!(question_rows(q, 2, menu_inner(menu)), (4, true));
+        assert_eq!(question_rows(q, 2, panel_inner(menu)), (4, true));
         // beside the preview where it fits
         let (menu, preview) = split(body(80, 24), Some((q, 2)));
-        assert!(preview.is_some() && question_rows(q, 2, menu_inner(menu)).1);
+        assert!(preview.is_some() && question_rows(q, 2, panel_inner(menu)).1);
         assert!(
             split(body(40, 12), None).1.is_some(),
             "other screens keep it"

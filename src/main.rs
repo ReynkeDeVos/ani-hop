@@ -4095,8 +4095,68 @@ mod tests {
     }
 
     #[test]
+    fn the_screen_shares_its_edges() {
+        let mut app = app();
+        app.user = Some((1, "RenkeB".into()));
+        app.ani_cli = Some("5.1.6".into());
+        app.top().menu.edit(|q| *q = "wat".into());
+        let drawn = screen(&mut app, 120, 30);
+        let lines: Vec<&str> = drawn.lines().collect();
+        let (top, foot) = (lines[0], lines[29]);
+        // the column `text` starts at, and the one it ends at
+        let start = |line: &str, text: &str| line.find(text).map(|at| line[..at].chars().count());
+        let end = |line: &str, text: &str| start(line, text).unwrap() + text.chars().count() - 1;
+
+        // its fill starts on the border's line, in the middle of the column
+        assert!(top.starts_with('▐'), "{top}");
+        assert!(lines[1].starts_with('╭'), "{}", lines[1]);
+        // the left edge's text
+        let edge = Some(2);
+        assert_eq!(start(top, "ani-hop"), edge, "{top}");
+        assert_eq!(start(lines[2], "❯"), edge, "{}", lines[2]);
+        assert_eq!(start(lines[3], "2/13"), edge, "{}", lines[3]);
+        assert_eq!(start(foot, "ani-hop"), edge, "{foot}");
+        // what's typed starts where the rows' labels do
+        assert_eq!(start(lines[2], "wat"), Some(5), "{}", lines[2]);
+        assert_eq!(start(lines[4], "Watching"), Some(5), "{}", lines[4]);
+        // the right edge's text
+        assert_eq!(end(top, "RenkeB"), 117, "{top}");
+        assert_eq!(end(foot, "quit"), 117, "{foot}");
+
+        // both panels start on the same row, with the same inset
+        let right = start(lines[1], "╮╭").unwrap() + 1;
+        assert_eq!(start(lines[2], "▄▀█"), Some(right + 2), "{}", lines[2]);
+        // and the key table starts under the logo, at its widest key
+        let keys = lines
+            .iter()
+            .find(|l| l.contains("filter the list"))
+            .unwrap();
+        assert_eq!(start(keys, "type"), Some(right + 2), "{keys}");
+
+        // a message too long beside the keys ends on the right edge too, and says it's cut
+        app.toast(&"too long ".repeat(20), true);
+        let drawn = screen(&mut app, 120, 30);
+        let foot = drawn.lines().last().unwrap().trim_end();
+        assert_eq!(
+            (foot.chars().count(), foot.chars().last()),
+            (118, Some('…'))
+        );
+
+        // a prompt says what it asks for on its rule, as a list says its count, so typing starts
+        // on the same column everywhere
+        app.push("Download folder", View::Input(Input::DownloadDir));
+        app.top().menu.edit(|q| *q = "~/x".into());
+        let drawn = screen(&mut app, 120, 30);
+        let lines: Vec<&str> = drawn.lines().collect();
+        assert_eq!(start(lines[2], "❯"), edge, "{}", lines[2]);
+        assert_eq!(start(lines[2], "~/x"), Some(5), "{}", lines[2]);
+        assert_eq!(start(lines[3], "folder ─"), edge, "{}", lines[3]);
+    }
+
+    #[test]
     fn the_main_menu_says_the_versions_unless_anything_else_is_there() {
-        let foot = |app: &mut App, w| screen(app, w, 24).lines().last().unwrap().to_string();
+        // what it says, past the column every line of it keeps free
+        let foot = |app: &mut App, w| screen(app, w, 24).lines().last().unwrap()[1..].to_string();
         let me = env!("CARGO_PKG_VERSION");
         let with_versions = || {
             let mut app = app();
@@ -4109,8 +4169,8 @@ mod tests {
         // nothing up top, where the name is whole or not there
         let top = |app: &mut App, w| screen(app, w, 24).lines().next().unwrap().to_string();
         assert!(!top(&mut app, 80).contains(me));
-        assert!(top(&mut app, 19).starts_with(" ani-hop "));
-        assert!(!top(&mut app, 18).contains("ani"));
+        assert!(top(&mut app, 22).starts_with("▐ ani-hop ▌"));
+        assert!(!top(&mut app, 21).contains("ani"));
 
         // less room: only ani-hop, then only its number, then nothing
         let narrow = foot(&mut app, 50);
@@ -4148,7 +4208,7 @@ mod tests {
         let drawn = screen(&mut app, 80, 24);
         let marked = format!(" ani-hop {me} ↑ (99.0.0) · ani-cli 5.1.6 ↑ (5.2)");
         assert!(
-            drawn.lines().last().unwrap().starts_with(&marked),
+            drawn.lines().last().unwrap()[1..].starts_with(&marked),
             "{drawn}"
         );
         assert!(drawn.contains("↑ ani-hop 99.0.0 is out"), "{drawn}");
@@ -4156,7 +4216,7 @@ mod tests {
         // with less room what's out goes before the number does
         assert!(foot(&mut app, 60).starts_with(&format!(" ani-hop {me} ↑ (99.0.0 is out) ")));
         assert!(foot(&mut app, 50).starts_with(&format!(" {me} ↑ (99.0.0 is out) ")));
-        assert!(foot(&mut app, 35).starts_with(&format!(" {me}     ")));
+        assert!(foot(&mut app, 35).starts_with(&format!(" {me}    ")));
         assert!(!foot(&mut app, 28).contains(me));
         // one update fits at 80 columns with its words
         app.release = None;
@@ -4167,7 +4227,7 @@ mod tests {
         term.draw(|f| ui::render(&mut app, f)).unwrap();
         let buf = term.backend().buffer();
         let bright: String = (0..marked.chars().count() as u16)
-            .map(|x| &buf[(x, 23)])
+            .map(|x| &buf[(x + 1, 23)])
             .filter(|cell| cell.fg == ui::ACCENT)
             .map(|cell| cell.symbol())
             .collect();

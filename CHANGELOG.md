@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.10.7 – 2026-11-04
+
+### Changed
+
+- The screen lines up. The `ani-hop` tag starts on the panel's border, and its name starts above the search prompt and the versions at the bottom. Your AniList name ends above the keys at the bottom right. What you type starts where the menu's rows do.
+- Both panels have the same padding, so the poster and the logo start on the search prompt's row, and a show's page has two more columns and two more rows for its text.
+- The key list starts under the logo instead of six columns in. The filter hint says `'exact` instead of `'word`, like the rest of that line, which names what each one does. `→` lists `^l` only, as the footer already says enter.
+- Prompts for your client ID, token, folder or an ani-cli search say so on the line under them, so typing starts in the same place on every prompt.
+- Clearer help on a few screens, such as "Empty resets to ~/Videos/Anime" instead of "Empty goes back to".
+
+### Fixed
+
+- A message too long for the bottom line now ends in `…` instead of being cut off mid-word.
+
 ## 0.10.6 – 2026-11-04
 
 ### Changed
