@@ -190,6 +190,8 @@ enum Msg {
     DlDone(String, Result<(), String>),
     /// (version, update command) of a newer ani-hop
     Release(Option<(String, String)>),
+    /// (the ani-cli version it's about, and whether a newer one is out)
+    AniCliRelease(Option<String>, bool),
 }
 
 const PAUSED: &str = "Paused downloads · enter on a queued episode resumes them";
@@ -232,10 +234,12 @@ pub struct App {
     /// a key came since the start
     pub pressed: bool,
     pub missing: Vec<(&'static str, &'static str, &'static str)>,
-    /// the installed ani-cli's version, when it's older than ani::TESTED_ANI_CLI
-    pub old_ani_cli: Option<String>,
+    /// the installed ani-cli's version
+    pub ani_cli: Option<String>,
     /// (version, update command) of a newer ani-hop release
     pub release: Option<(String, String)>,
+    /// a newer ani-cli release is out
+    pub ani_cli_newer: bool,
     /// shell command to run in the real terminal (TUI paused), e.g. installing packages
     external: Option<String>,
     /// asked for on a show's page while ani-cli searched, waiting to get back to that page
@@ -373,10 +377,11 @@ fn main() -> std::io::Result<()> {
     res
 }
 
-/// The newest release's version, if it's newer than this ani-hop. GitHub is asked at most
-/// once a day, through the redirect of /releases/latest (no API, so no rate limit).
-fn newer_release() -> Option<String> {
-    let seen = ani::cache_dir().join("latest-release");
+/// The newest release's version of GitHub's `repo`, if it's newer than `installed`. An answer
+/// is kept a day in `file`; without one the next start asks again. Through the redirect of
+/// /releases/latest (no API, so no rate limit).
+fn newer_release(repo: &str, file: &str, installed: &str) -> Option<String> {
+    let seen = ani::cache_dir().join(file);
     let day = Duration::from_secs(24 * 60 * 60);
     let fresh = fs::metadata(&seen)
         .and_then(|m| m.modified())
@@ -384,7 +389,7 @@ fn newer_release() -> Option<String> {
     let tag = match fresh {
         true => fs::read_to_string(&seen).ok()?,
         false => {
-            let to = anilist::location("https://github.com/ReynkeDeVos/ani-hop/releases/latest");
+            let to = anilist::location(&format!("https://github.com/{repo}/releases/latest"));
             // .../releases/tag/v0.6.0; before the first release just .../releases
             let tag = to.ok()?.rsplit('/').next()?.to_string();
             let _ = fs::write(&seen, &tag);
@@ -392,7 +397,7 @@ fn newer_release() -> Option<String> {
         }
     };
     let v = tag.trim().trim_start_matches('v');
-    ani::older(env!("CARGO_PKG_VERSION"), v).then(|| v.to_string())
+    ani::older(installed, v).then(|| v.to_string())
 }
 
 /// Runs `cmd` in the plain terminal (sudo prompts work) and waits for enter.
@@ -550,8 +555,9 @@ impl App {
             started: Instant::now(),
             pressed: false,
             missing: Vec::new(),
-            old_ani_cli: None,
+            ani_cli: None,
             release: None,
+            ani_cli_newer: false,
             external: None,
             parked: None,
             marking: None,
@@ -590,13 +596,13 @@ impl App {
         let mut app = App::with(seams, AniCli);
         app.user = user.map(|(id, name, _)| (id, name));
         app.missing = ani::missing_deps();
-        app.old_ani_cli = ani::old_ani_cli();
+        app.ani_cli = ani::ani_cli_version();
         app.preloading = ani::preload_on();
         app.read_continue();
         app.push("ani-hop", View::Main);
         let welcomed = ani::config_dir().join("welcomed");
         let first = !welcomed.exists();
-        if first || !app.missing.is_empty() || app.old_ani_cli.is_some() {
+        if first || !app.missing.is_empty() || app.old_ani_cli().is_some() {
             let _ = fs::create_dir_all(ani::config_dir());
             let _ = fs::write(&welcomed, "");
             app.push(if first { "Welcome" } else { "Setup" }, View::Setup);
@@ -620,7 +626,15 @@ impl App {
             let c = app.client.clone();
             app.spawn(move || Msg::Viewer(c.token.clone(), c.viewer()));
         }
-        app.spawn(|| Msg::Release(newer_release().map(|v| (v, ani::update_command()))));
+        app.spawn(|| {
+            let new = newer_release(
+                "ReynkeDeVos/ani-hop",
+                "latest-release",
+                env!("CARGO_PKG_VERSION"),
+            );
+            Msg::Release(new.map(|v| (v, ani::update_command())))
+        });
+        app.check_ani_cli();
         // so the first episode doesn't wait for it. Not without mpv: its answer lasts the run, and
         // the setup screen may still install mpv
         if ani::have("mpv") {
@@ -629,11 +643,30 @@ impl App {
         app
     }
 
+    /// The installed ani-cli's version, when it's older than ani::TESTED_ANI_CLI.
+    pub fn old_ani_cli(&self) -> Option<&str> {
+        (self.ani_cli.as_deref()).filter(|v| ani::older(v, ani::TESTED_ANI_CLI))
+    }
+
+    /// Asks whether ani-cli has an update. Its tags, not its master: that's what packages ship,
+    /// so a newer master would ask for an update they can't give.
+    fn check_ani_cli(&self) {
+        let installed = self.ani_cli.clone();
+        self.spawn(move || {
+            let newer = (installed.as_deref())
+                .and_then(|v| newer_release("pystardust/ani-cli", "latest-ani-cli", v));
+            Msg::AniCliRelease(installed, newer.is_some())
+        });
+    }
+
     fn after_install(&mut self) {
         self.missing = ani::missing_deps();
-        self.old_ani_cli = ani::old_ani_cli();
+        self.ani_cli = ani::ani_cli_version();
+        // that was about the ani-cli before this, and GitHub can take a while
+        self.ani_cli_newer = false;
+        self.check_ani_cli();
         let names: Vec<&str> = self.missing.iter().map(|d| d.0).collect();
-        match (names.is_empty(), &self.old_ani_cli) {
+        match (names.is_empty(), self.old_ani_cli()) {
             (false, _) => self.toast(format!("Still missing: {}", names.join(", ")), true),
             (true, Some(v)) => self.toast(
                 format!(
@@ -1286,7 +1319,7 @@ impl App {
                 if let Some(cmd) = ani::install_command(&pkgs).filter(|_| !pkgs.is_empty()) {
                     v.push(Item::new("install", "Install missing packages", cmd));
                 }
-                if let Some(cmd) = ani::ani_cli_update().filter(|_| self.old_ani_cli.is_some()) {
+                if let Some(cmd) = ani::ani_cli_update().filter(|_| self.old_ani_cli().is_some()) {
                     v.push(Item::new("update", "Update ani-cli", cmd));
                 }
                 if self.user.is_none() {
@@ -2753,6 +2786,9 @@ impl App {
                 self.refresh();
             }
             Msg::Release(v) => self.release = v,
+            // an answer from before an update isn't about this ani-cli
+            Msg::AniCliRelease(asked, newer) if asked == self.ani_cli => self.ani_cli_newer = newer,
+            Msg::AniCliRelease(..) => {}
         }
     }
 }
@@ -4056,5 +4092,55 @@ mod tests {
         assert!(wide.contains("continue episode 13"), "{wide}");
         app.top().menu.edit(|q| *q = "continue".into());
         assert_eq!(cursor(&mut app), "continue:50330");
+    }
+
+    #[test]
+    fn the_main_menu_says_the_versions_and_what_can_be_updated() {
+        let top = |app: &mut App, w| screen(app, w, 24).lines().next().unwrap().to_string();
+        let me = env!("CARGO_PKG_VERSION");
+        let mut app = app();
+        app.ani_cli = Some("5.1.6".into());
+        assert!(top(&mut app, 80).contains(&format!("{me} · ani-cli 5.1.6")));
+
+        // less room: only ani-hop, then only its number, then nothing
+        let narrow = top(&mut app, 36);
+        assert!(narrow.contains(&format!(" ani-hop  {me}")), "{narrow}");
+        assert!(!narrow.contains("ani-cli"), "{narrow}");
+        let narrower = top(&mut app, 24);
+        assert!(narrower.contains(me), "{narrower}");
+        assert!(!narrower.contains("ani-hop"), "{narrower}");
+        let narrowest = top(&mut app, 14);
+        assert!(!narrowest.contains(me), "{narrowest}");
+        assert!(!narrowest.contains("ani-hop"), "{narrowest}");
+
+        // not by color alone; only ani-hop's says how, as ani-cli has too many ways to update
+        app.release = Some(("99.0.0".into(), "brew upgrade ani-hop".into()));
+        app.ani_cli_newer = true;
+        let drawn = screen(&mut app, 80, 24);
+        assert!(
+            drawn.contains(&format!("{me} ↑ · ani-cli 5.1.6 ↑")),
+            "{drawn}"
+        );
+        assert!(drawn.contains("ani-hop 99.0.0 is out"), "{drawn}");
+        assert_eq!(drawn.matches("is out").count(), 1, "{drawn}");
+
+        // an ani-cli too old for ani-hop too, without knowing of a release
+        app.ani_cli_newer = false;
+        app.ani_cli = Some("5.0.2".into());
+        assert!(top(&mut app, 80).contains("ani-cli 5.0.2 ↑"));
+
+        // an answer about the ani-cli from before an update doesn't bring the ↑ back
+        app.ani_cli = Some("5.2".into());
+        app.on_msg(Msg::AniCliRelease(Some("5.0.2".into()), true));
+        assert!(!app.ani_cli_newer);
+        app.on_msg(Msg::AniCliRelease(Some("5.2".into()), true));
+        assert!(app.ani_cli_newer);
+        // and an update takes it along at once, with the new answer still on its way
+        app.after_install();
+        assert!(!app.ani_cli_newer);
+
+        // only there
+        app.push("Search", View::Settings);
+        assert!(!top(&mut app, 80).contains("ani-cli"));
     }
 }

@@ -189,8 +189,47 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
         crumbs.push(Span::styled(" › ", DIM));
         crumbs.push(Span::raw(t));
     }
+    // only on the main menu, where no crumbs need the room. Without room for the name and its
+    // number, the number goes on alone, and then nothing does
+    if app.stack.len() == 1 {
+        match versions(app, room) {
+            v if v.is_empty() => crumbs = versions(app, crumbs_area.width as usize),
+            v => crumbs.extend(v),
+        }
+    }
     f.render_widget(Line::from(crumbs), crumbs_area);
     f.render_widget(user, user_area);
+}
+
+/// What's installed, after the name. Quiet until a part can be updated; a part that doesn't fit
+/// `room` goes whole, ani-cli first.
+fn versions(app: &App, room: usize) -> Vec<Span<'static>> {
+    let ani_cli_outdated = app.old_ani_cli().is_some() || app.ani_cli_newer;
+    let parts = [
+        (
+            Some(env!("CARGO_PKG_VERSION").to_string()),
+            app.release.is_some(),
+        ),
+        (
+            app.ani_cli.as_ref().map(|v| format!("ani-cli {v}")),
+            ani_cli_outdated,
+        ),
+    ];
+    let mut spans = Vec::new();
+    let mut used = 0;
+    for (part, outdated) in parts.into_iter().filter_map(|(p, o)| Some((p?, o))) {
+        let (part, style) = match outdated {
+            true => (format!("{part} ↑"), ACCENT),
+            false => (part, DIM),
+        };
+        let gap = if spans.is_empty() { " " } else { " · " };
+        used += Span::raw(gap).width() + Span::raw(part.as_str()).width();
+        if used > room {
+            break;
+        }
+        spans.extend([Span::styled(gap, DIM), Span::styled(part, style)]);
+    }
+    spans
 }
 
 /// The question a confirmation asks, and how many answers it has.
@@ -700,7 +739,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
             v.push(Line::styled("xdg-open: xdg-utils from your distro", DIM));
         }
     }
-    if let Some(old) = &app.old_ani_cli {
+    if let Some(old) = app.old_ani_cli() {
         v.push("".into());
         v.push(Line::styled(
             format!(
@@ -716,7 +755,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     }
     v.extend(["".into(), Line::styled("Tools", Style::new().bold())]);
     for (bin, _, what) in ani::deps() {
-        let old = bin == "ani-cli" && app.old_ani_cli.is_some();
+        let old = bin == "ani-cli" && app.old_ani_cli().is_some();
         v.push(row(
             !old && !app.missing.iter().any(|d| d.0 == bin),
             bin,
