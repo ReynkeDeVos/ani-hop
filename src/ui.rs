@@ -21,8 +21,6 @@ const SELECTED: Style = Style::new()
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const LOGO: [&str; 2] = ["▄▀█ █▄ █ █ ▄▄ █ █ █▀█ █▀█", "█▀█ █ ▀█ █    █▀█ █▄█ █▀▀"];
 const SHADES: [&str; 4] = ["░", "▒", "▓", "█"];
-/// Marks an update. Not ↑, which is a key on the same screen.
-const UPDATE: &str = "⇡";
 const BOOT_MS: u128 = 240;
 const POP_MS: u128 = 160;
 
@@ -205,7 +203,7 @@ fn versions(app: &App, room: usize) -> Line<'static> {
     let part = |text: &str, new: Option<&str>, word: &str| {
         let mut spans = vec![Span::styled(text.to_string(), DIM)];
         if let Some(new) = new {
-            spans.push(Span::styled(format!(" {UPDATE}"), ACCENT));
+            spans.push(Span::styled(" ↑", ACCENT));
             spans.push(Span::styled(format!(" ({new}{word})"), DIM));
         }
         spans
@@ -802,7 +800,7 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
     let mut v = Vec::new();
     if let Some((new, cmd)) = &app.release {
         v.push(Line::styled(
-            format!("{UPDATE} ani-hop {new} is out: {cmd}"),
+            format!("↑ ani-hop {new} is out: {cmd}"),
             ACCENT,
         ));
     }

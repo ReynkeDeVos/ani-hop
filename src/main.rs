@@ -4142,25 +4142,25 @@ mod tests {
         app.release = Some(("99.0.0".into(), "brew upgrade ani-hop".into()));
         app.ani_cli_newer = Some("5.2".into());
         let wide = foot(&mut app, 90);
-        let all_said = format!(" ani-hop {me} ⇡ (99.0.0 is out) · ani-cli 5.1.6 ⇡ (5.2 is out)");
+        let all_said = format!(" ani-hop {me} ↑ (99.0.0 is out) · ani-cli 5.1.6 ↑ (5.2 is out)");
         assert!(wide.starts_with(&all_said), "{wide}");
         // both at 80 columns: the words go before ani-cli does
         let drawn = screen(&mut app, 80, 24);
-        let marked = format!(" ani-hop {me} ⇡ (99.0.0) · ani-cli 5.1.6 ⇡ (5.2)");
+        let marked = format!(" ani-hop {me} ↑ (99.0.0) · ani-cli 5.1.6 ↑ (5.2)");
         assert!(
             drawn.lines().last().unwrap().starts_with(&marked),
             "{drawn}"
         );
-        assert!(drawn.contains("⇡ ani-hop 99.0.0 is out"), "{drawn}");
+        assert!(drawn.contains("↑ ani-hop 99.0.0 is out"), "{drawn}");
         assert_eq!(drawn.matches("is out").count(), 1, "{drawn}");
         // with less room what's out goes before the number does
-        assert!(foot(&mut app, 60).starts_with(&format!(" ani-hop {me} ⇡ (99.0.0 is out) ")));
-        assert!(foot(&mut app, 50).starts_with(&format!(" {me} ⇡ (99.0.0 is out) ")));
+        assert!(foot(&mut app, 60).starts_with(&format!(" ani-hop {me} ↑ (99.0.0 is out) ")));
+        assert!(foot(&mut app, 50).starts_with(&format!(" {me} ↑ (99.0.0 is out) ")));
         assert!(foot(&mut app, 35).starts_with(&format!(" {me}     ")));
         assert!(!foot(&mut app, 28).contains(me));
         // one update fits at 80 columns with its words
         app.release = None;
-        assert!(foot(&mut app, 80).contains(" · ani-cli 5.1.6 ⇡ (5.2 is out)"));
+        assert!(foot(&mut app, 80).contains(" · ani-cli 5.1.6 ↑ (5.2 is out)"));
         app.release = Some(("99.0.0".into(), "brew upgrade ani-hop".into()));
         screen(&mut app, 80, 24);
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -4171,12 +4171,12 @@ mod tests {
             .filter(|cell| cell.fg == ui::ACCENT)
             .map(|cell| cell.symbol())
             .collect();
-        assert_eq!(bright, " ⇡ ⇡");
+        assert_eq!(bright, " ↑ ↑");
 
         // an ani-cli too old for ani-hop too, without knowing of a release
         let mut app = with_versions();
         app.ani_cli = Some("5.0.2".into());
-        assert!(foot(&mut app, 80).contains("ani-cli 5.0.2 ⇡ (5.1 is out)"));
+        assert!(foot(&mut app, 80).contains("ani-cli 5.0.2 ↑ (5.1 is out)"));
 
         // an answer about the ani-cli from before an update doesn't bring the arrow back
         let newer = || Some("5.3".to_string());
