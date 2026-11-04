@@ -240,6 +240,8 @@ pub struct App {
     pub release: Option<(String, String)>,
     /// a newer ani-cli release is out
     pub ani_cli_newer: bool,
+    /// the versions in the footer have made way, for good
+    pub versions_over: bool,
     /// shell command to run in the real terminal (TUI paused), e.g. installing packages
     external: Option<String>,
     /// asked for on a show's page while ani-cli searched, waiting to get back to that page
@@ -558,6 +560,7 @@ impl App {
             ani_cli: None,
             release: None,
             ani_cli_newer: false,
+            versions_over: false,
             external: None,
             parked: None,
             marking: None,
@@ -4095,39 +4098,69 @@ mod tests {
     }
 
     #[test]
-    fn the_main_menu_says_the_versions_and_what_can_be_updated() {
-        let top = |app: &mut App, w| screen(app, w, 24).lines().next().unwrap().to_string();
+    fn the_main_menu_says_the_versions_until_anything_else_is_there() {
+        let foot = |app: &mut App, w| screen(app, w, 24).lines().last().unwrap().to_string();
         let me = env!("CARGO_PKG_VERSION");
-        let mut app = app();
-        app.ani_cli = Some("5.1.6".into());
-        assert!(top(&mut app, 80).contains(&format!("{me} · ani-cli 5.1.6")));
+        let with_versions = || {
+            let mut app = app();
+            app.ani_cli = Some("5.1.6".into());
+            app
+        };
+        let mut app = with_versions();
+        let all = format!(" ani-hop {me} · ani-cli 5.1.6");
+        assert!(foot(&mut app, 80).starts_with(&all));
+        // nothing up top
+        assert!(
+            !screen(&mut app, 80, 24)
+                .lines()
+                .next()
+                .unwrap()
+                .contains(me)
+        );
 
         // less room: only ani-hop, then only its number, then nothing
-        let narrow = top(&mut app, 36);
-        assert!(narrow.contains(&format!(" ani-hop  {me}")), "{narrow}");
+        let narrow = foot(&mut app, 50);
+        assert!(narrow.starts_with(&format!(" ani-hop {me} ")), "{narrow}");
         assert!(!narrow.contains("ani-cli"), "{narrow}");
-        let narrower = top(&mut app, 24);
-        assert!(narrower.contains(me), "{narrower}");
-        assert!(!narrower.contains("ani-hop"), "{narrower}");
-        let narrowest = top(&mut app, 14);
+        let narrower = foot(&mut app, 35);
+        assert!(narrower.starts_with(&format!(" {me} ")), "{narrower}");
+        let narrowest = foot(&mut app, 28);
         assert!(!narrowest.contains(me), "{narrowest}");
-        assert!(!narrowest.contains("ani-hop"), "{narrowest}");
+
+        // moving along the main menu leaves them; going in and coming back ends them
+        press(&mut app, KeyCode::Down);
+        assert!(foot(&mut app, 80).starts_with(&all));
+        app.push("Search", View::Settings);
+        assert!(!foot(&mut app, 80).contains(me));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.stack.len(), 1);
+        assert!(!foot(&mut app, 80).contains(me));
+
+        // and so does anything else in their place, also once it's gone
+        let mut app = with_versions();
+        assert!(foot(&mut app, 80).starts_with(&all));
+        app.toast("Saved", false);
+        assert!(foot(&mut app, 80).starts_with(" Saved"));
+        app.toast = None;
+        assert!(!foot(&mut app, 80).contains(me));
 
         // not by color alone; only ani-hop's says how, as ani-cli has too many ways to update
+        let mut app = with_versions();
         app.release = Some(("99.0.0".into(), "brew upgrade ani-hop".into()));
         app.ani_cli_newer = true;
         let drawn = screen(&mut app, 80, 24);
+        let marked = format!(" ani-hop {me} ↑ · ani-cli 5.1.6 ↑");
         assert!(
-            drawn.contains(&format!("{me} ↑ · ani-cli 5.1.6 ↑")),
+            drawn.lines().last().unwrap().starts_with(&marked),
             "{drawn}"
         );
         assert!(drawn.contains("ani-hop 99.0.0 is out"), "{drawn}");
         assert_eq!(drawn.matches("is out").count(), 1, "{drawn}");
 
         // an ani-cli too old for ani-hop too, without knowing of a release
-        app.ani_cli_newer = false;
+        let mut app = with_versions();
         app.ani_cli = Some("5.0.2".into());
-        assert!(top(&mut app, 80).contains("ani-cli 5.0.2 ↑"));
+        assert!(foot(&mut app, 80).contains("ani-cli 5.0.2 ↑"));
 
         // an answer about the ani-cli from before an update doesn't bring the ↑ back
         app.ani_cli = Some("5.2".into());
@@ -4138,9 +4171,5 @@ mod tests {
         // and an update takes it along at once, with the new answer still on its way
         app.after_install();
         assert!(!app.ani_cli_newer);
-
-        // only there
-        app.push("Search", View::Settings);
-        assert!(!top(&mut app, 80).contains("ani-cli"));
     }
 }

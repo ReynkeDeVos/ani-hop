@@ -38,6 +38,13 @@ pub fn render(app: &mut App, f: &mut Frame) {
     if let Some(right) = right {
         preview(app, f, right);
     }
+    // the versions are only for a look at the start: anything else in their place, or leaving
+    // the main menu, ends them
+    app.versions_over = app.versions_over
+        || app.stack.len() > 1
+        || app.toast.is_some()
+        || app.playback.now().is_some()
+        || app.downloads.snapshot().pending > 0;
     footer(app, f, foot);
     starting(app, f);
     boot(app, f.buffer_mut());
@@ -189,47 +196,30 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
         crumbs.push(Span::styled(" › ", DIM));
         crumbs.push(Span::raw(t));
     }
-    // only on the main menu, where no crumbs need the room. Without room for the name and its
-    // number, the number goes on alone, and then nothing does
-    if app.stack.len() == 1 {
-        match versions(app, room) {
-            v if v.is_empty() => crumbs = versions(app, crumbs_area.width as usize),
-            v => crumbs.extend(v),
-        }
-    }
     f.render_widget(Line::from(crumbs), crumbs_area);
     f.render_widget(user, user_area);
 }
 
-/// What's installed, after the name. Quiet until a part can be updated; a part that doesn't fit
-/// `room` goes whole, ani-cli first.
-fn versions(app: &App, room: usize) -> Vec<Span<'static>> {
+/// What's installed, quiet until a part can be updated. With less `room` ani-cli goes first, then
+/// the name, then the number.
+fn versions(app: &App, room: usize) -> Line<'static> {
+    let part = |text: String, outdated: bool| match outdated {
+        true => Span::styled(format!("{text} ↑"), ACCENT),
+        false => Span::styled(text, DIM),
+    };
+    let own = |text: String| part(text, app.release.is_some());
+    let number = env!("CARGO_PKG_VERSION");
+    let named = own(format!(" ani-hop {number}"));
     let ani_cli_outdated = app.old_ani_cli().is_some() || app.ani_cli_newer;
-    let parts = [
-        (
-            Some(env!("CARGO_PKG_VERSION").to_string()),
-            app.release.is_some(),
-        ),
-        (
-            app.ani_cli.as_ref().map(|v| format!("ani-cli {v}")),
-            ani_cli_outdated,
-        ),
+    let ani_cli = (app.ani_cli.as_ref()).map(|v| part(format!("ani-cli {v}"), ani_cli_outdated));
+    let widest_first = [
+        ani_cli.map(|v| Line::from(vec![named.clone(), Span::styled(" · ", DIM), v])),
+        Some(Line::from(named)),
+        Some(Line::from(own(format!(" {number}")))),
     ];
-    let mut spans = Vec::new();
-    let mut used = 0;
-    for (part, outdated) in parts.into_iter().filter_map(|(p, o)| Some((p?, o))) {
-        let (part, style) = match outdated {
-            true => (format!("{part} ↑"), ACCENT),
-            false => (part, DIM),
-        };
-        let gap = if spans.is_empty() { " " } else { " · " };
-        used += Span::raw(gap).width() + Span::raw(part.as_str()).width();
-        if used > room {
-            break;
-        }
-        spans.extend([Span::styled(gap, DIM), Span::styled(part, style)]);
-    }
-    spans
+    (widest_first.into_iter().flatten())
+        .find(|line| line.width() <= room)
+        .unwrap_or_default()
 }
 
 /// The question a confirmation asks, and how many answers it has.
@@ -910,6 +900,9 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
                 Span::styled(head, ACCENT),
                 Span::styled(fit(tail, room), DIM),
             ])
+        }
+        _ if !app.versions_over => {
+            versions(app, (area.width as usize).saturating_sub(hints.width() + 1))
         }
         _ => Line::default(),
     };
