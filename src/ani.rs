@@ -92,8 +92,9 @@ exec mpv "$@"
 /// the arguments of the mpv that started it: a stream fetched ahead starts mpv without FAKE_MPV,
 /// and thumbfast clears the environment on a Mac, and did everywhere up to June 2026.
 /// shortcut: a `mpv_path` in thumbfast.conf goes unused on a stream; read it if someone has one
-/// shortcut: `ps` joins arguments with spaces, so one in a referrer would cut it short; ani-cli's
-/// is only ever a scheme and host, look at /proc if that changes
+/// shortcut: `ps` joins arguments with spaces, so one in a referrer would cut it short, and a title
+/// saying ` --referrer=` would pass for one, which costs only the previews. ani-cli's referrer is
+/// only ever a scheme and host; look at /proc if that changes, and find another way for a Mac
 const FAKE_THUMB_MPV: &str = r#"#!/bin/sh
 # ani-hop: thumbfast's mpv, with the referrer of the mpv it makes previews for. -ww as ps otherwise
 # cuts its answer to $COLUMNS
@@ -2428,7 +2429,7 @@ mod tests {
             run(&["--referrer=https://r/", "--referrer=https://s/", "v.m3u8"]),
             format!("--referrer=https://s/\n{own}")
         );
-        // the option, not its name inside a value
+        // the option, not its name inside a URL
         assert_eq!(
             run(&["--referrer=https://r/?next=--referrer=https://s/", "v.m3u8"]),
             format!("--referrer=https://r/?next=--referrer=https://s/\n{own}")
