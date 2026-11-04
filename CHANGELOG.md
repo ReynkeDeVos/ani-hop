@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.3 – 2026-11-04
+
+### Fixed
+
+- ani-hop no longer trusts certificates from the distrusted emSign intermediates, whose private keys are public (RUSTSEC-2026-0381, RUSTSEC-2026-0382). The fix comes with updated dependencies, among them `ureq` 3.5.1.
+
 ## 0.10.2 – 2026-11-04
 
 ### Added

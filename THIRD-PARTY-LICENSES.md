@@ -826,7 +826,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## Community Data License Agreement Permissive 2.0
 
-Used by webpki-roots 1.0.9.
+Used by webpki-roots 1.0.11.
 
 ```text
 # Community Data License Agreement - Permissive - Version 2.0
@@ -1454,7 +1454,7 @@ CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
 
 ## ISC License
 
-Used by rustls-webpki 0.103.15.
+Used by rustls-webpki 0.103.16.
 
 ```text
 Except as otherwise noted, this project is licensed under the following
@@ -1643,7 +1643,7 @@ DEALINGS IN THE SOFTWARE.
 
 ## MIT License
 
-Used by bitflags 2.13.2, log 0.4.34, num-traits 0.2.19.
+Used by bitflags 2.13.2, log 0.4.35, num-traits 0.2.19.
 
 ```text
 Copyright (c) 2014 The Rust Project Developers
@@ -1745,7 +1745,7 @@ DEALINGS IN THE SOFTWARE.
 
 ## MIT License
 
-Used by heck 0.5.0, unicode-segmentation 1.13.3, unicode-width 0.2.2.
+Used by heck 0.5.0, unicode-segmentation 1.13.3, unicode-width 0.2.3.
 
 ```text
 Copyright (c) 2015 The Rust Project Developers
@@ -2114,7 +2114,7 @@ DEALINGS IN THE SOFTWARE.
 
 ## MIT License
 
-Used by smallvec 1.16.3.
+Used by smallvec 1.16.4.
 
 ```text
 Copyright (c) 2018 The Servo Project Developers
@@ -2584,7 +2584,7 @@ DEALINGS IN THE SOFTWARE.
 
 ## MIT License
 
-Used by ureq-proto 0.6.5.
+Used by ureq-proto 0.7.1.
 
 ```text
 Copyright 2022 Martin Algesten
@@ -2689,7 +2689,7 @@ SOFTWARE.
 
 ## MIT License
 
-Used by crc32fast 1.5.2.
+Used by crc32fast 1.5.4.
 
 ```text
 MIT License
@@ -2737,7 +2737,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 
 ## MIT License
 
-Used by ureq 3.4.2.
+Used by ureq 3.5.1.
 
 ```text
 MIT License
@@ -3135,7 +3135,7 @@ SOFTWARE.
 
 ## MIT License
 
-Used by adler2 2.0.1, indoc 2.0.8, itoa 1.0.18, linux-raw-sys 0.12.1, once_cell 1.21.4, proc-macro2 1.0.107, quote 1.0.47, rustix 1.1.5, rustversion 1.0.23, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, syn 2.0.119, syn 3.0.9, thiserror-impl 2.0.21, thiserror 2.0.21, unicode-ident 1.0.27, utf8-zero 0.8.1, zmij 1.0.23.
+Used by adler2 2.0.1, indoc 2.0.8, itoa 1.0.18, linux-raw-sys 0.12.1, once_cell 1.21.4, proc-macro2 1.0.107, quote 1.0.47, rustix 1.1.6, rustversion 1.0.23, serde 1.0.229, serde_core 1.0.229, serde_derive 1.0.229, serde_json 1.0.154, syn 2.0.119, syn 3.0.9, thiserror-impl 2.0.21, thiserror 2.0.21, unicode-ident 1.0.27, utf8-zero 0.8.1, zmij 1.0.23.
 
 ```text
 Permission is hereby granted, free of charge, to any
