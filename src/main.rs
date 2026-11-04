@@ -4318,6 +4318,13 @@ mod tests {
         let short = shown(40, 188, 48);
         let at = columns(&short);
         assert!(at.len() == 1 && at[0] > 80, "{short}");
+        // a column too narrow for a wide character doesn't lose it: it goes under the poster
+        let mut m = show(50_414, 12, None);
+        m.description = Some("ビデ".into());
+        let mut app = app();
+        app.open_show(m);
+        let drawn = screen(&mut app, 18, 40);
+        assert!(drawn.contains('ビ') && drawn.contains('デ'), "{drawn}");
     }
 
     #[test]

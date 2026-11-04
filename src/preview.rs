@@ -311,7 +311,11 @@ impl Preview {
         let text: Vec<_> = text.into_iter().filter(|t| !t.0.is_empty()).collect();
         let beside = head_h + u16::from(page.about.is_empty());
         let in_column = flow(&text, info.width);
-        let fits = usize::from(beside) + in_column.len() <= usize::from(area.height);
+        // and as wide: a column of one would lose a character two columns wide
+        let fits = usize::from(beside) + in_column.len() <= usize::from(area.height)
+            && in_column
+                .iter()
+                .all(|l| l.width() <= usize::from(info.width));
         let (column, top, mut text) = match fits {
             true => (info, beside, in_column),
             false => (area, rows.max(head_h) + 1, flow(&text, area.width)),
