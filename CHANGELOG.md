@@ -2,6 +2,10 @@
 
 ## 0.10.6 – 2026-11-04
 
+### Changed
+
+- Your ani-hop and ani-cli versions moved from the top line to the bottom left of the main menu. A message, the player or a download takes that spot while it's there, and the versions come back after. With an update, only the ↑ stands out, followed by what's out in brackets: `ani-cli 5.1.6 ↑ (5.2 is out)`.
+
 ### Fixed
 
 - If you use mpv's thumbfast script, its previews on the timeline now work on streamed episodes too. Turn them on with `network=yes` in thumbfast's own config. Without thumbfast, nothing changes.

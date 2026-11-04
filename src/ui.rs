@@ -189,47 +189,47 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
         crumbs.push(Span::styled(" › ", DIM));
         crumbs.push(Span::raw(t));
     }
-    // only on the main menu, where no crumbs need the room. Without room for the name and its
-    // number, the number goes on alone, and then nothing does
-    if app.stack.len() == 1 {
-        match versions(app, room) {
-            v if v.is_empty() => crumbs = versions(app, crumbs_area.width as usize),
-            v => crumbs.extend(v),
-        }
+    // the name whole or not at all
+    if crumbs_area.width as usize >= crumbs[0].width() {
+        f.render_widget(Line::from(crumbs), crumbs_area);
     }
-    f.render_widget(Line::from(crumbs), crumbs_area);
     f.render_widget(user, user_area);
 }
 
-/// What's installed, after the name. Quiet until a part can be updated; a part that doesn't fit
-/// `room` goes whole, ani-cli first.
-fn versions(app: &App, room: usize) -> Vec<Span<'static>> {
-    let ani_cli_outdated = app.old_ani_cli().is_some() || app.ani_cli_newer;
-    let parts = [
-        (
-            Some(env!("CARGO_PKG_VERSION").to_string()),
-            app.release.is_some(),
-        ),
-        (
-            app.ani_cli.as_ref().map(|v| format!("ani-cli {v}")),
-            ani_cli_outdated,
-        ),
-    ];
-    let mut spans = Vec::new();
-    let mut used = 0;
-    for (part, outdated) in parts.into_iter().filter_map(|(p, o)| Some((p?, o))) {
-        let (part, style) = match outdated {
-            true => (format!("{part} ↑"), ACCENT),
-            false => (part, DIM),
-        };
-        let gap = if spans.is_empty() { " " } else { " · " };
-        used += Span::raw(gap).width() + Span::raw(part.as_str()).width();
-        if used > room {
-            break;
+/// What's installed, with an arrow and, in brackets, what's out where there's an update. With
+/// less `room` the words "is out" go first, then ani-cli, then the name, then what's out, and
+/// then the number.
+fn versions(app: &App, room: usize) -> Line<'static> {
+    let part = |text: &str, new: Option<&str>, word: &str| {
+        let mut spans = vec![Span::styled(text.to_string(), DIM)];
+        if let Some(new) = new {
+            spans.push(Span::styled(" ↑", ACCENT));
+            spans.push(Span::styled(format!(" ({new}{word})"), DIM));
         }
-        spans.extend([Span::styled(gap, DIM), Span::styled(part, style)]);
-    }
-    spans
+        spans
+    };
+    let own_new = app.release.as_ref().map(|r| r.0.as_str());
+    let number = env!("CARGO_PKG_VERSION");
+    let (named, alone) = (format!(" ani-hop {number}"), format!(" {number}"));
+    // too old, and GitHub hasn't said what's newest: what ani-hop needs is out for sure
+    let needed = app.old_ani_cli().map(|_| ani::TESTED_ANI_CLI);
+    let ani_cli_new = app.ani_cli_newer.as_deref().or(needed);
+    let ani_cli = app.ani_cli.as_ref().map(|v| format!("ani-cli {v}"));
+    let both = |word: &str| {
+        let ani_cli = part(ani_cli.as_ref()?, ani_cli_new, word);
+        let dot = Span::styled(" · ", DIM);
+        Some([part(&named, own_new, word), vec![dot], ani_cli].concat())
+    };
+    let widest_first = [
+        both(" is out"),
+        both(""),
+        Some(part(&named, own_new, " is out")),
+        Some(part(&alone, own_new, " is out")),
+        Some(part(&alone, None, "")),
+    ];
+    (widest_first.into_iter().flatten().map(Line::from))
+        .find(|line| line.width() <= room)
+        .unwrap_or_default()
 }
 
 /// The question a confirmation asks, and how many answers it has.
@@ -910,6 +910,10 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
                 Span::styled(head, ACCENT),
                 Span::styled(fit(tail, room), DIM),
             ])
+        }
+        // only with nothing else to say, and only on the main menu
+        _ if app.stack.len() == 1 => {
+            versions(app, (area.width as usize).saturating_sub(hints.width() + 1))
         }
         _ => Line::default(),
     };
