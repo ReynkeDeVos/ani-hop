@@ -944,12 +944,15 @@ fn profiles(list: &str) -> Vec<&str> {
         .collect()
 }
 
-/// From `mpv --show-profile`, where `hwdec-codecs` is another option, and a file a profile includes
-/// isn't shown.
+/// From `mpv --show-profile`, where `hwdec-codecs` is another option, and neither a file a profile
+/// includes nor the one next to each file played is shown.
 fn profile_may_set_hwdec(shown: &str) -> bool {
     shown.lines().any(|l| {
         let option = l.trim_start().split('=').next();
-        matches!(option, Some("hwdec" | "no-hwdec" | "include"))
+        matches!(
+            option,
+            Some("hwdec" | "no-hwdec" | "include" | "use-filedir-conf")
+        )
     })
 }
 
@@ -1800,6 +1803,7 @@ mod tests {
             "Profile a: \n volume=9\n hwdec=auto\n",
             "Profile a: \n profile=b\n  hwdec=auto\n",
             "Profile a: \n include=/x.conf\n",
+            "Profile a: \n use-filedir-conf=yes\n",
         ] {
             assert!(profile_may_set_hwdec(shown), "{shown}");
         }
@@ -1856,6 +1860,7 @@ mod tests {
             ("msg-level=all=no\n[extension.mkv]\nhwdec=no\n", false),
             ("[extension.mkv]\ninclude=/nowhere.conf\n", false),
             ("use-filedir-conf=yes\n", false),
+            ("[extension.mkv]\nuse-filedir-conf=yes\n", false),
             ("profile=fast\n[fast]\nhwdec=no\n", false),
         ] {
             fs::write(&conf, config).unwrap();
