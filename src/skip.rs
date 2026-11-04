@@ -178,19 +178,26 @@ pub fn flags(times: &Times) -> Vec<String> {
     };
     let mut chapters = String::from(";FFMETADATA1\n");
     let mut opts = Vec::new();
-    if let Some(op) = times.op {
-        chapters += &chapter(op.start, op.end, "Opening");
-        let story_ends = times.ed.map_or(op.end, |ed| ed.start);
-        chapters += &chapter(op.end, story_ends, "Episode");
-        opts.push(format!("skip-op_start={},skip-op_end={}", op.start, op.end));
-    }
-    if let Some(ed) = times.ed {
-        chapters += &chapter(ed.start, ed.end, "Ending");
-        opts.push(format!("skip-ed_start={},skip-ed_end={}", ed.start, ed.end));
+    let mut story = 0.0;
+    let parts = [
+        (times.op, "Opening", "skip-op"),
+        (times.ed, "Ending", "skip-ed"),
+    ];
+    for (span, title, opt) in parts {
+        let Some(span) = span else { continue };
+        if story < span.start {
+            chapters += &chapter(story, span.start, "Episode");
+        }
+        chapters += &chapter(span.start, span.end, title);
+        opts.push(format!("{opt}_start={},{opt}_end={}", span.start, span.end));
+        story = span.end;
     }
     if opts.is_empty() {
         return Vec::new();
     }
+    // mpv ignores a chapter's END, so without this one what follows the last part would count as
+    // that part, like a scene after the ending. The episode's length isn't known here.
+    chapters += &chapter(story, story, "Episode");
     let hex: String = chapters.bytes().map(|b| format!("{b:02x}")).collect();
     vec![
         format!("--chapters-file=hex://{hex}"),
@@ -430,15 +437,16 @@ mod tests {
             f[1],
             "--script-opts=skip-op_start=1.5,skip-op_end=91.5,skip-ed_start=1300,skip-ed_end=1390.25"
         );
-        let text = chapters(&f[0]);
-        assert!(text.starts_with(";FFMETADATA1\n[CHAPTER]\n"), "{text}");
-        for part in [
+        let want = [
+            "START=0\nEND=1500\nTITLE=Episode\n",
             "START=1500\nEND=91500\nTITLE=Opening\n",
             "START=91500\nEND=1300000\nTITLE=Episode\n",
             "START=1300000\nEND=1390250\nTITLE=Ending\n",
-        ] {
-            assert!(text.contains(part), "{part} in {text}");
-        }
+            "START=1390250\nEND=1390250\nTITLE=Episode\n",
+        ]
+        .map(|part| format!("[CHAPTER]\nTIMEBASE=1/1000\n{part}"))
+        .concat();
+        assert_eq!(chapters(&f[0]), format!(";FFMETADATA1\n{want}"));
         // ani-cli splits them on spaces and hands them on unquoted
         assert!(f.iter().all(|flag| !flag.contains(char::is_whitespace)));
     }
@@ -451,7 +459,14 @@ mod tests {
             ed: None,
         });
         assert_eq!(only_op[1], "--script-opts=skip-op_start=0,skip-op_end=90");
-        assert!(!chapters(&only_op[0]).contains("Ending"));
+        let text = chapters(&only_op[0]);
+        assert!(!text.contains("Ending"));
+        // nothing comes before an opening at the very start
+        assert!(!text.contains("START=0\nEND=0\n"), "{text}");
+        assert!(
+            text.contains("START=90000\nEND=90000\nTITLE=Episode\n"),
+            "{text}"
+        );
         let only_ed = flags(&Times {
             op: None,
             ed: span(1300.0, 1390.0),
@@ -460,7 +475,25 @@ mod tests {
             only_ed[1],
             "--script-opts=skip-ed_start=1300,skip-ed_end=1390"
         );
-        assert!(!chapters(&only_ed[0]).contains("Opening"));
+        let text = chapters(&only_ed[0]);
+        assert!(!text.contains("Opening"));
+        assert!(
+            text.contains("START=0\nEND=1300000\nTITLE=Episode\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("START=1390000\nEND=1390000\nTITLE=Episode\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn an_ending_right_after_the_opening_has_no_episode_between_them() {
+        let f = flags(&Times {
+            op: span(0.0, 90.0),
+            ed: span(90.0, 180.0),
+        });
+        assert_eq!(chapters(&f[0]).matches("TITLE=Episode").count(), 1);
     }
 
     #[test]

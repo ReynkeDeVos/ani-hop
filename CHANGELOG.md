@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.4 – 2026-11-04
+
+### Fixed
+
+- mpv's timeline no longer calls everything after the ending "Ending". A scene after the credits or a look at the next episode now says "Episode", and so does a scene before the opening.
+
 ## 0.10.3 – 2026-11-04
 
 ### Changed
