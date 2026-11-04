@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.9 – 2026-11-04
+
+### Added
+
+- Ctrl+Backspace deletes the last word you typed in the search bar and other prompts. So do Alt+Backspace, Ctrl+← and Ctrl+W. A word stops at a space or a `/`, so a folder path doesn't go all at once. With nothing typed, `^h` and Ctrl+← go back, and on a question they always do.
+
+### Changed
+
+- The `ani-hop` tag is back on the main menu, so it's on every screen and no longer appears only once you leave the menu.
+- An empty prompt says what typing does on its screen: "type to filter" on every list and every row, "type to search AniList" on Search, and what to paste on the login's two prompts.
+
 ## 0.10.8 – 2026-11-04
 
 ### Added
