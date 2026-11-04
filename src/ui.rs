@@ -38,10 +38,8 @@ pub fn render(app: &mut App, f: &mut Frame) {
     if let Some(right) = right {
         preview(app, f, right);
     }
-    // the versions are only for a look at the start: anything else in their place, or leaving
-    // the main menu, ends them
+    // the versions are only for a look at the start: anything else in their place ends them
     app.versions_over = app.versions_over
-        || app.stack.len() > 1
         || app.toast.is_some()
         || app.playback.now().is_some()
         || app.downloads.snapshot().pending > 0;

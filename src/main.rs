@@ -1043,6 +1043,8 @@ impl App {
         self.scan_local();
         let menu = Menu::new(self.items(&view), multi);
         self.next_id += 1;
+        // here, not when drawing: keys can open a screen and leave it between two frames
+        self.versions_over |= !self.stack.is_empty();
         self.stack.push(Screen {
             id: self.next_id,
             title: title.into(),
@@ -4132,6 +4134,13 @@ mod tests {
         assert!(foot(&mut app, 80).starts_with(&all));
         app.push("Search", View::Settings);
         assert!(!foot(&mut app, 80).contains(me));
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.stack.len(), 1);
+        assert!(!foot(&mut app, 80).contains(me));
+
+        // also between two frames, as keys can come in faster than those
+        let mut app = with_versions();
+        app.push("Search", View::Settings);
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.stack.len(), 1);
         assert!(!foot(&mut app, 80).contains(me));
