@@ -1609,6 +1609,11 @@ impl App {
         {
             return self.preview.scroll(k.code == KeyCode::Down);
         }
+        // a question has no prompt, so any filter it has is out of sight: these keep going back
+        let asked = matches!(self.top().view, View::Confirm(_));
+        if asked && ctrl && matches!(k.code, KeyCode::Char('h') | KeyCode::Left) {
+            return self.pop(1);
+        }
         // typing is the text itself on an input: ← doesn't throw it away, esc clears it first
         let typed = matches!(self.top().view, View::Input(_)) && !self.top().menu.query.is_empty();
         match self.top().menu.key(k) {
@@ -4098,6 +4103,29 @@ mod tests {
         assert!(wide.contains("continue episode 13"), "{wide}");
         app.top().menu.edit(|q| *q = "continue".into());
         assert_eq!(cursor(&mut app), "continue:50330");
+    }
+
+    #[test]
+    fn a_question_has_no_prompt_so_its_back_keys_still_go_back() {
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        for code in [KeyCode::Char('h'), KeyCode::Left] {
+            let mut app = app();
+            app.push("Quit?", View::Confirm(Pending::Quit));
+            // typing still filters its answers, out of sight
+            press(&mut app, KeyCode::Char('q'));
+            assert_eq!(app.top().menu.query, "q");
+            app.on_key(ctrl(code));
+            assert_eq!(app.stack.len(), 1, "{code:?}");
+        }
+        // where the text is on screen they delete a word of it instead
+        let mut app = app();
+        app.push("Search", View::Input(Input::Search));
+        app.top().menu.edit(|q| *q = "attack on".into());
+        app.on_key(ctrl(KeyCode::Char('h')));
+        assert_eq!(
+            (app.stack.len(), app.top().menu.query.as_str()),
+            (2, "attack ")
+        );
     }
 
     #[test]

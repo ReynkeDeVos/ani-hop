@@ -70,7 +70,7 @@ fn haystack<'a>(s: &'a str, kind: AtomKind, buf: &'a mut Vec<char>) -> Utf32Str<
 /// What ends a char haystack for ' and !: a noncharacter, taken out of every query.
 const END: char = '\u{FFFF}';
 
-/// Takes the last word off `q`: back to a space, or to a `/`, so a path goes a folder at a time.
+/// Takes the last word off `q`: back to a space, or to a `/`, so a path doesn't go all at once.
 fn drop_word(q: &mut String) {
     let word = q.trim_end().trim_end_matches('/');
     q.truncate(word.rfind([' ', '/']).map_or(0, |p| p + 1));

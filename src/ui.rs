@@ -863,7 +863,12 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
         v.extend([
             key("↑ ↓", "move", "^k ^j"),
             key("→", "select", "^l"),
-            key("←", "back", "^h"),
+            // with text typed ^h deletes a word of it instead
+            key(
+                "←",
+                "back",
+                if top.menu.query.is_empty() { "^h" } else { "" },
+            ),
             "".into(),
             key("type", "filter the list", ""),
             // 35 columns, of the 42 that 80 leave the preview

@@ -4,7 +4,7 @@
 
 ### Added
 
-- Ctrl+Backspace deletes the last word you typed in the search bar and other prompts. So do Alt+Backspace, Ctrl+← and Ctrl+W. In a folder path it deletes one folder at a time. With nothing typed, `^h` and Ctrl+← go back.
+- Ctrl+Backspace deletes the last word you typed in the search bar and other prompts. So do Alt+Backspace, Ctrl+← and Ctrl+W. A word stops at a space or a `/`, so a folder path doesn't go all at once. With nothing typed, `^h` and Ctrl+← go back, and on a question they always do.
 
 ### Changed
 
