@@ -8,8 +8,7 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/ReynkeDeVos/ani-hop"
 license=('GPL-3.0-or-later')
 depends=('ani-cli' 'mpv' 'yt-dlp' 'ffmpeg' 'curl' 'patch' 'xdg-utils')
-optdepends=('ani-skip: skips openings and endings'
-            'curl-impersonate: gets ani-cli past Cloudflare'
+optdepends=('curl-impersonate: gets ani-cli past Cloudflare'
             'ghostty: posters'
             'kitty: posters')
 provides=('ani-hop')

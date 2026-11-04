@@ -46,7 +46,6 @@
                 --prefix PATH : ${
                   lib.makeBinPath [
                     ani-cli
-                    pkgs.ani-skip
                     pkgs.yt-dlp
                     pkgs.ffmpeg
                     pkgs.curl

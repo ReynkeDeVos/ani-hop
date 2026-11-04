@@ -664,8 +664,8 @@ fn setup(app: &App) -> Vec<Line<'static>> {
         false => Span::styled("  ✗ ", Color::Red),
     };
     let row = |good: bool, name: &str, what: &'static str| {
-        // extras: without them ani-hop works, just plainer
-        let mark = match good || !(ani::optional(name) || name == "graphics") {
+        // an extra: without it ani-hop works, just plainer
+        let mark = match good || name != "graphics" {
             true => mark(good),
             false => Span::styled("  ○ ", Color::Yellow),
         };
@@ -688,16 +688,12 @@ fn setup(app: &App) -> Vec<Line<'static>> {
         // it per OS if another one is added
         let names: Vec<&str> = app.missing.iter().map(|d| d.0).collect();
         let brew: Vec<&str> = (names.iter().copied())
-            .filter(|n| !matches!(*n, "ani-skip" | "xdg-open"))
+            .filter(|n| *n != "xdg-open")
             .collect();
         v.push("".into());
         if !brew.is_empty() {
             let text = format!("Install with Homebrew (brew.sh): {}", brew.join(" "));
             v.push(Line::styled(text, Color::Yellow));
-        }
-        if names.contains(&"ani-skip") {
-            let text = "ani-skip (optional): github.com/synacktraa/ani-skip";
-            v.push(Line::styled(text, DIM));
         }
         if names.contains(&"xdg-open") {
             // only on Linux (deps() leaves it out on macOS), and Homebrew has no xdg-utils

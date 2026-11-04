@@ -3,9 +3,9 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh
 #
-# System packages come from the distro, with sudo, and so do ani-cli and ani-skip where it has
-# them new enough (on Arch the AUR, through yay or paru). Otherwise they, ani-hop and, where the
-# distro's is too old (Debian, Ubuntu), yt-dlp go into ~/.local/bin, so `ani-cli -U` needs no sudo.
+# System packages come from the distro, with sudo, and so does ani-cli where it has one new
+# enough (on Arch the AUR, through yay or paru). Otherwise it, ani-hop and, where the distro's is
+# too old (Debian, Ubuntu), yt-dlp go into ~/.local/bin, so `ani-cli -U` needs no sudo.
 # Run it again to update them. ANI_HOP_RELEASE_URL picks another release, for example
 # https://github.com/ReynkeDeVos/ani-hop/releases/download/v0.6.0
 # ANI_HOP_KEEP=1 leaves ani-hop alone, for one installed another way, such as with mise.
@@ -14,7 +14,6 @@ set -eu
 BIN=$HOME/.local/bin
 RELEASE=${ANI_HOP_RELEASE_URL:-https://github.com/ReynkeDeVos/ani-hop/releases/latest/download}
 ANI_CLI=https://raw.githubusercontent.com/pystardust/ani-cli/master/ani-cli
-ANI_SKIP=https://raw.githubusercontent.com/synacktraa/ani-skip/master
 YT_DLP=https://github.com/yt-dlp/yt-dlp/releases/latest/download
 
 say() { printf '==> %s\n' "$*"; }
@@ -55,17 +54,9 @@ new_enough() {
 	[ -n "$1" ] && [ "$(printf '%s\n5.1\n' "$1" | sort -V 2>/dev/null | head -n 1)" = 5.1 ]
 }
 
-SKIP_LUA=${XDG_CONFIG_HOME:-$HOME/.config}/mpv/scripts/skip.lua
-
-# ani-skip's mpv script is the one that reads the "skip" script-opts ani-skip hands to mpv.
-SKIP_MARK='read_options(.*"skip")'
-
-# What the system provides, however it got there: an ani-cli ani-hop can use, ani-skip, and
-# ani-skip's mpv script where mpv loads it for everyone.
+# What the system provides, however it got there: an ani-cli ani-hop can use.
 packaged() {
 	pkg_cli=$(new_enough "$(/usr/bin/ani-cli -V 2>/dev/null || true)" && echo 1 || true)
-	pkg_skip=$([ -x /usr/bin/ani-skip ] && echo 1 || true)
-	sys_lua=$(grep -l "$SKIP_MARK" /etc/mpv/scripts/*.lua 2>/dev/null | head -n 1 || true)
 }
 
 drop() {
@@ -74,12 +65,9 @@ drop() {
 	say "Removed $1, the system's copy is used instead"
 }
 
-# Removes an earlier run's copies the system's now replace: ours would come first on PATH,
-# and mpv would load the skip script twice.
+# Removes an earlier run's copy the system's now replaces: ours would come first on PATH.
 drop_copies() {
 	[ -z "$pkg_cli" ] || drop "$BIN/ani-cli"
-	[ -z "$pkg_skip" ] || drop "$BIN/ani-skip"
-	if [ -n "$sys_lua" ] && grep -q "$SKIP_MARK" "$SKIP_LUA" 2>/dev/null; then drop "$SKIP_LUA"; fi
 }
 
 # The last step is a rename inside the target dir, so a failed download never leaves half
@@ -131,9 +119,9 @@ main() {
 	# Image-based systems (Silverblue, Bazzite, Bluefin, Endless) can't install into /usr.
 	[ ! -e /run/ostree-booted ] || os=other
 
-	# ani-hop-bin brings ani-cli and the rest, ani-skip-git the skipping; both update with
-	# the system. The steps below still run, to fill in what the packages leave out (an ani-cli
-	# too old, a skip script mpv doesn't load); only the release download is skipped.
+	# ani-hop-bin brings ani-cli and the rest, which update with the system. The steps below
+	# still run, to fill in what the packages leave out (an ani-cli too old); only the release
+	# download is skipped.
 	hop=$BIN/ani-hop
 	if [ -n "${ANI_HOP_KEEP-}" ]; then
 		hop=$(command -v ani-hop) || die "ANI_HOP_KEEP is set, but there's no ani-hop on your PATH"
@@ -143,7 +131,7 @@ main() {
 			"$helper" -Si ani-hop-bin >/dev/null 2>&1 || continue
 			say "Installing ani-hop-bin from the AUR with $helper"
 			# an older /usr/bin/ani-hop left by a failed install mustn't replace a newer copy of ours
-			if arch_install "$helper" -S --needed ani-hop-bin ani-skip-git && [ -x /usr/bin/ani-hop ]; then
+			if arch_install "$helper" -S --needed ani-hop-bin && [ -x /usr/bin/ani-hop ]; then
 				hop=/usr/bin/ani-hop
 				drop "$BIN/ani-hop"
 			else
@@ -198,19 +186,15 @@ main() {
 		place yt-dlp "$BIN/yt-dlp" 755
 	fi
 
-	# ani-cli and ani-skip: the system's packages where they're new enough, as those update with
-	# the system; the AUR only has what's missing installed, without a system upgrade.
+	# ani-cli: the system's package where it's new enough, as that updates with the system; the
+	# AUR only has it installed if it's missing, without a system upgrade.
 	case $os in
 	arch)
 		for helper in yay paru; do
 			have "$helper" || continue
-			want=
-			pacman -T ani-cli >/dev/null || want=" ani-cli"
-			pacman -T ani-skip >/dev/null || want="$want ani-skip-git"
-			[ -n "$want" ] || break
-			say "Installing$want from the AUR with $helper"
-			# shellcheck disable=SC2086 # one package per word
-			arch_install "$helper" -S --needed $want || warn "the AUR install failed, so upstream's copies are used"
+			pacman -T ani-cli >/dev/null && break
+			say "Installing ani-cli from the AUR with $helper"
+			arch_install "$helper" -S --needed ani-cli || warn "the AUR install failed, so upstream's copy is used"
 			break
 		done
 		;;
@@ -232,21 +216,6 @@ main() {
 		get "$ANI_CLI" ani-cli
 		place ani-cli "$BIN/ani-cli" 755
 	fi
-	if [ -z "$pkg_skip" ]; then
-		say "Installing ani-skip into $BIN"
-		get "$ANI_SKIP/ani-skip" ani-skip
-		place ani-skip "$BIN/ani-skip" 755
-	fi
-	# its mpv script also when ani-skip is packaged but brings none mpv loads
-	if [ -z "$sys_lua" ]; then
-		# a script by that name that isn't ani-skip's is the user's own
-		if [ -e "$SKIP_LUA" ] && ! grep -q "$SKIP_MARK" "$SKIP_LUA"; then
-			warn "$SKIP_LUA is another script, so ani-hop left it alone; ani-skip needs its mpv script there to skip openings and endings"
-		else
-			get "$ANI_SKIP/integrations/mpv.lua" skip.lua
-			place skip.lua "$SKIP_LUA" 644
-		fi
-	fi
 
 	if [ "$hop" = "$BIN/ani-hop" ] && [ -z "${ANI_HOP_KEEP-}" ]; then
 		say "Installing ani-hop into $BIN"
@@ -261,7 +230,7 @@ main() {
 
 	case ":$PATH:" in
 	*":$BIN:"*)
-		for cmd in ani-hop ani-cli ani-skip yt-dlp; do
+		for cmd in ani-hop ani-cli yt-dlp; do
 			found=$(command -v "$cmd" || true)
 			if [ -e "$BIN/$cmd" ] && [ "$found" != "$BIN/$cmd" ]; then
 				warn "$found comes first on your PATH, so $BIN/$cmd won't run; remove the old one"

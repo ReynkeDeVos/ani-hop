@@ -43,7 +43,7 @@ pub trait Player: Send + Sync {
     fn locate(&self, m: &Media, lookup: Lookup) -> Result<Source, String>;
 }
 
-/// ani-cli for streams (with ani-skip), mpv for files.
+/// ani-cli for streams, mpv for files.
 pub struct Mpv;
 
 impl Player for Mpv {

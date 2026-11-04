@@ -5,6 +5,9 @@
 ### Changed
 
 - Episodes play with hardware decoding unless mpv's config says otherwise, for smoother playback. A `hwdec` you've set stays as it is, also `hwdec=no`.
+- Skipping works on more episodes, and openings land closer. ani-hop first asks the provider, whose times are for the stream you're watching and for sub or dub. It asks AniSkip, through its current API, only for what's missing, the opening and the ending each on its own. Of 584 episodes checked, 65% have times for both, up from 34%, and 82% of the newest airing episodes, up from 25%.
+- A show's last episode keeps its ending, as the story can go on after the credits.
+- ani-hop no longer needs `ani-skip`, and skipping needs nothing besides mpv. You can uninstall it if nothing else uses it. An mpv set in `ANI_CLI_PLAYER` that can't read ani-hop's cache folder, such as Windows' `mpv.exe`, only skips with `ani-skip`'s own mpv script installed.
 
 ### Fixed
 

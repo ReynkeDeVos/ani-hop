@@ -1,4 +1,4 @@
-//! Everything that touches ani-cli, ani-skip, mpv and the download folder.
+//! Everything that touches ani-cli, mpv and the download folder.
 //!
 //! ani-cli has no machine-readable output, so we read its menus instead: with stdin not
 //! being a tty it switches to rofi, and we put a stand-in `rofi` first in its PATH that
@@ -6,6 +6,7 @@
 //! keeps working after `ani-cli -U`.
 
 use crate::anilist::{Entry, Media};
+use crate::skip;
 use crate::source::{Source, by_hand};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -67,6 +68,11 @@ case " $* " in
 *" --sub-file="*) ;;
 *) [ -n "$ANIHOP_SUBS_PAGE" ] && ani-hop-subs "$ANIHOP_SUBS_PAGE" "$ANIHOP_SUBS_FILE" && set -- --sub-file="$ANIHOP_SUBS_FILE" "$@" ;;
 esac
+# ani-skip's stand-in named the times, this is what jumps over them. Here as it can't say a path
+# with spaces: ani-cli splits what it says on those
+case " $* " in
+*" --script-opts=skip-"*) set -- --script="${0%/*}/ani-hop-skip.lua" "$@" ;;
+esac
 # fetched ahead: what mpv would start with goes in a file, for when the episode is wanted
 if [ -n "$ANIHOP_HOLD" ]; then
 	printf '%s\0' "$@" >"$ANIHOP_HOLD.$$" && mv -f "$ANIHOP_HOLD.$$" "$ANIHOP_HOLD"
@@ -75,6 +81,40 @@ fi
 PATH=${PATH#"${0%/*}:"}
 echo ani-hop-player-starts
 exec mpv "$@"
+"#;
+
+const FAKE_SKIP: &str = r#"#!/bin/sh
+# ani-hop: ani-cli runs this as ani-skip, with -i <MyAnimeList id> -e <episode>, and hands what it
+# prints to mpv. ani-hop answers it: no answer just means no skipping.
+while [ $# -gt 1 ]; do
+	case $1 in -i) id=$2 ;; -e) ep=$2 ;; esac
+	shift
+done
+# an update can take away the ani-hop that started this, and the one on PATH is the new one
+[ -x "$ANIHOP_EXE" ] || ANIHOP_EXE=ani-hop
+exec "$ANIHOP_EXE" --skip-flags "$id" "$ep"
+"#;
+
+/// The mpv script that jumps over what skip::flags names, once each, so seeking back shows it.
+/// It reads the options ani-skip's own script reads: one a user keeps loaded does the same.
+const SKIP_SCRIPT: &str = r#"-- ani-hop: jumps over an episode's opening and ending
+local times = { op_start = 0, op_end = 0, ed_start = 0, ed_end = 0 }
+require("mp.options").read_options(times, "skip")
+
+local done = {}
+local function jump(part, now, from, to)
+    if not done[part] and now >= from and now < to then
+        done[part] = true
+        mp.set_property_number("time-pos", to)
+    end
+end
+
+mp.observe_property("time-pos", "number", function(_, now)
+    if now then
+        jump("op", now, times.op_start, times.op_end)
+        jump("ed", now, times.ed_start, times.ed_end)
+    end
+end)
 "#;
 
 const FAKE_SUBS: &str = r#"#!/bin/sh
@@ -224,10 +264,9 @@ pub fn tilde(p: &Path) -> String {
 }
 
 /// What ani-hop shells out to: (command, Arch package, what it's for).
-const DEPS: [(&str, &str, &str); 7] = [
+const DEPS: [(&str, &str, &str); 6] = [
     ("ani-cli", "ani-cli", "streams and downloads"),
     ("mpv", "mpv", "plays episodes"),
-    ("ani-skip", "ani-skip-git", "skips openings and endings"),
     ("yt-dlp", "yt-dlp", "downloads episodes"),
     ("ffmpeg", "ffmpeg", "finishes downloads"),
     ("curl", "curl", "fetches pages for ani-cli"),
@@ -243,11 +282,6 @@ pub fn have(bin: &str) -> bool {
 pub fn deps() -> impl Iterator<Item = (&'static str, &'static str, &'static str)> {
     DEPS.into_iter()
         .filter(|d| !(cfg!(target_os = "macos") && d.0 == "xdg-open"))
-}
-
-/// A tool ani-hop works without, just plainer: ani-skip (which Homebrew doesn't have).
-pub fn optional(bin: &str) -> bool {
-    bin == "ani-skip"
 }
 
 pub fn missing_deps() -> Vec<(&'static str, &'static str, &'static str)> {
@@ -275,10 +309,10 @@ fn aur_helper() -> Option<&'static str> {
     ["yay", "paru"].into_iter().find(|h| have(h))
 }
 
-/// One command for everything missing (Arch package names, as in DEPS). ani-cli and
-/// ani-skip live in the AUR, so plain pacman only qualifies when neither is needed; other
-/// distros get install.sh, which fetches both from upstream. macOS, and Linux when
-/// ani-hop came from Homebrew, get brew, which has no ani-skip or xdg-utils.
+/// One command for everything missing (Arch package names, as in DEPS). ani-cli lives in the
+/// AUR, so plain pacman only qualifies when it isn't needed; other distros get install.sh, which
+/// fetches it from upstream. macOS, and Linux when ani-hop came from Homebrew, get brew, which
+/// has no xdg-utils.
 pub fn install_command(pkgs: &[&str]) -> Option<String> {
     let list = pkgs.join(" ");
     // -S without -y: no system upgrade (Omarchy refuses one outside omarchy update), and the
@@ -290,14 +324,14 @@ pub fn install_command(pkgs: &[&str]) -> Option<String> {
     if have("pacman") && !aur {
         return Some(format!("sudo pacman -S --needed {list}"));
     }
-    if let Some(sh) = install_sh(&exe()) {
+    if let Some(sh) = install_sh(exe()) {
         return Some(sh);
     }
     let brew: Vec<&str> = pkgs
         .iter()
         .filter_map(|p| match *p {
             "ani-cli" => Some("pystardust/ani-cli/ani-cli"),
-            "ani-skip-git" | "xdg-utils" => None,
+            "xdg-utils" => None,
             p => Some(p),
         })
         .collect();
@@ -379,15 +413,20 @@ fn system_update() -> String {
 }
 
 /// This ani-hop's binary, symlinks resolved.
-fn exe() -> PathBuf {
-    std::env::current_exe()
-        .and_then(fs::canonicalize)
-        .unwrap_or_default()
+/// Where ani-hop is, as of when it started: an update replaces the file, and asked after that,
+/// Linux says "(deleted)" while the same path holds the new one.
+fn exe() -> &'static Path {
+    static EXE: OnceLock<PathBuf> = OnceLock::new();
+    EXE.get_or_init(|| {
+        std::env::current_exe()
+            .and_then(fs::canonicalize)
+            .unwrap_or_default()
+    })
 }
 
 /// How to update this ani-hop, judged by where it lives.
 pub fn update_command() -> String {
-    update_command_for(&exe())
+    update_command_for(exe())
 }
 
 fn update_command_for(exe: &Path) -> String {
@@ -451,6 +490,7 @@ fn run_dir() -> PathBuf {
 }
 
 pub fn setup() -> std::io::Result<()> {
+    exe();
     let bin = cache_dir().join("bin");
     fs::create_dir_all(&bin)?;
     fs::create_dir_all(cache_dir().join("probe"))?;
@@ -458,6 +498,8 @@ pub fn setup() -> std::io::Result<()> {
         ("rofi", FAKE_ROFI),
         ("ffmpeg", FAKE_FFMPEG),
         ("mpv", FAKE_MPV),
+        ("ani-skip", FAKE_SKIP),
+        ("ani-hop-skip.lua", SKIP_SCRIPT),
         ("ani-hop-subs", FAKE_SUBS),
     ] {
         write_helper(&bin.join(name), script)?;
@@ -607,7 +649,7 @@ fn wait_within(child: Child, limit: Duration) -> Option<Output> {
 }
 
 /// How long ani-cli gets to reach the player or a menu: every one of its requests has a limit,
-/// but ani-skip's doesn't, and a stalled one would leave the pop-up up for good.
+/// but something stalled would leave the pop-up up for good.
 const ANI_CLI_LIMIT: Duration = Duration::from_secs(60);
 
 pub fn ani_cli() -> Command {
@@ -726,9 +768,6 @@ pub fn follow(mut child: Child, mut line: impl FnMut(&str)) -> (bool, Vec<u8>) {
 /// What FAKE_MPV says right before it starts mpv.
 const PLAYER_STARTS: &str = "ani-hop-player-starts";
 
-/// How long ani-skip gets to say an episode's times, before a downloaded episode plays anyway.
-const SKIP_LIMIT: Duration = Duration::from_secs(5);
-
 /// mpv prints "VO: [gpu-next] 1920x1080 ..." once its window opens.
 fn player_up(line: &str, up: &mut impl FnMut()) {
     if line.starts_with("VO:") {
@@ -745,7 +784,7 @@ fn stream_step(line: &str, step: &dyn Fn(Option<&'static str>)) {
     }
 }
 
-/// Whether ani-skip jumps over openings and endings (switched in the main menu).
+/// Whether mpv jumps over openings and endings (switched in the main menu).
 pub fn skip_on() -> bool {
     !config_dir().join("no-skip").exists()
 }
@@ -854,7 +893,7 @@ fn mode(dub: bool) -> &'static str {
 /// longer than one still airing) holds several parts or is another. Those would get another
 /// episode's subtitles.
 /// shortcut: a wrong source of the same length still passes, it plays the wrong show anyway;
-/// telling them apart needs the id ani-cli only gives ani-skip.
+/// telling them apart needs the id ani-cli only gives its ani-skip.
 fn subs_page(m: &Media, src: &Source, ep: &str, dub: bool) -> Option<String> {
     let mal = m.id_mal?;
     let eps = src.episodes.len();
@@ -956,7 +995,12 @@ fn profile_may_set_hwdec(shown: &str) -> bool {
     })
 }
 
-/// ani-cli set up to take episode `ep` of `src` to the player (with ani-skip), and the file
+/// What jumps over openings and endings: setup writes it next to the helpers.
+pub fn skip_script() -> PathBuf {
+    cache_dir().join("bin").join("ani-hop-skip.lua")
+}
+
+/// ani-cli set up to take episode `ep` of `src` to the player, and the file
 /// the player will read subtitles from, if ani-cli finds none.
 fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, Option<PathBuf>) {
     let mut flags = std::env::var("ANI_CLI_PLAYER_FLAGS").unwrap_or_default();
@@ -971,6 +1015,10 @@ fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, O
         flags = format!("{HWDEC} {flags}");
     }
     let mut cli = ani_cli();
+    cli.env("ANIHOP_EXE", exe());
+    if skip::last_episode(m, &src.episodes, ep) {
+        cli.env(skip::LAST_EPISODE, "1");
+    }
     let subs = subs_page(m, src, ep, dub(audio)).map(|page| {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -983,8 +1031,7 @@ fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, O
     cli.env("ANI_CLI_PLAYER", player)
         .env("ANI_CLI_MODE", mode(dub(audio)))
         .env("ANI_CLI_PLAYER_FLAGS", flags)
-        // ani-cli stops when --skip finds no ani-skip, and ani-skip is optional
-        .args((skip_on() && have("ani-skip")).then_some("--skip"))
+        .args(skip_on().then_some("--skip"))
         .args([
             "--exit-after-play",
             "-S",
@@ -998,7 +1045,7 @@ fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, O
     (cli, subs)
 }
 
-/// Streams through ani-cli (with ani-skip); `step` hears when mpv starts, and None once it
+/// Streams through ani-cli; `step` hears when mpv starts, and None once it
 /// shows the episode.
 pub fn stream(
     m: &Media,
@@ -1045,8 +1092,8 @@ pub fn stream(
     }
 }
 
-/// A stream's way into mpv, fetched ahead: what ani-cli would start it with, the links and
-/// ani-skip's times among them, as separate arguments, never through a shell.
+/// A stream's way into mpv, fetched ahead: what ani-cli would start it with, the links and the
+/// skip times among them, as separate arguments, never through a shell.
 pub struct Held {
     pub(crate) args: Vec<String>,
     /// the subtitles those name, if ani-hop-subs had to fetch them: gone with this
@@ -1147,13 +1194,9 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
         }
     }
     if let Some(mal) = m.id_mal.filter(|_| skip_on()) {
-        // it has no limit of its own past connecting: the episode plays without skipping then
-        let mut skip = Command::new("ani-skip");
-        skip.args(["-i", &mal.to_string(), "-e", ep])
-            .stdin(Stdio::null());
-        if let Some(o) = output_within(&mut skip, SKIP_LIMIT) {
-            mpv.args(String::from_utf8_lossy(&o.stdout).split_whitespace());
-        }
+        let last = skip::last_episode(m, &[], ep);
+        mpv.arg(format!("--script={}", skip_script().display()))
+            .args(skip::flags(&skip::times(mal, ep, is_dub(file), last)));
     }
     let child = mpv
         .arg(file)
@@ -1570,7 +1613,7 @@ pub fn parts(dir: &Path, eps: &[String]) -> Vec<PathBuf> {
 }
 
 /// Whether `m` may become the show saved for a download folder: one ani-cli found never
-/// replaces one AniList knows, whose details and MAL id (for ani-skip) Downloads needs.
+/// replaces one AniList knows, whose details and MAL id (for skip times) Downloads needs.
 fn replaces(m: &Media, saved: &Media) -> bool {
     m.on_anilist() || saved.id == 0 // 0: a new entry
 }
@@ -2654,6 +2697,47 @@ mod tests {
     }
 
     #[test]
+    fn ani_clis_ani_skip_asks_ani_hop_with_the_id_and_episode_it_was_given() {
+        // alone in a process, as in the test below
+        if std::env::var_os("ANIHOP_CHILD").is_none() {
+            let name =
+                "ani::tests::ani_clis_ani_skip_asks_ani_hop_with_the_id_and_episode_it_was_given";
+            assert!(crate::in_child(name, &[]));
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ani-hop-skip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let (helper, exe) = (dir.join("ani-skip"), dir.join("ani-hop"));
+        write_helper(&helper, FAKE_SKIP).unwrap();
+        write_helper(&exe, "#!/bin/sh\nprintf '%s,' \"$@\"\n").unwrap();
+        // as ani-cli runs it: `ani-skip -i "$mal_id" -e "$ep_no"`
+        let said = |args: &[&str]| {
+            let o = Command::new(&helper)
+                .args(args)
+                .env("ANIHOP_EXE", &exe)
+                .output()
+                .unwrap();
+            String::from_utf8(o.stdout).unwrap()
+        };
+        assert_eq!(said(&["-i", "52991", "-e", "12"]), "--skip-flags,52991,12,");
+        // ani-cli found no id: asked anyway, ani-hop answers with nothing
+        assert_eq!(said(&["-i", "", "-e", "12"]), "--skip-flags,,12,");
+        // an update took away the ani-hop that's running: the one on PATH answers
+        let gone = Command::new(&helper)
+            .args(["-i", "1", "-e", "2"])
+            .env("ANIHOP_EXE", dir.join("gone"))
+            .env(
+                "PATH",
+                format!("{}:{}", dir.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(gone.stdout, b"--skip-flags,1,2,");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn fake_mpv_finds_subtitles_only_when_ani_cli_has_none() {
         // alone in a process: a script can't run while another test's fork still holds it open
         // from being written ("Text file busy")
@@ -2772,6 +2856,15 @@ esac
                 name.to_string_lossy().starts_with("subs.vtt")
             }));
         }
+
+        // no times, no script
+        let (mpv, _, _) = run(&stream, None, all);
+        assert!(!mpv.contains("--script"));
+        // times from ani-cli: the script that acts on them, whatever its folder is called
+        let timed = ["--script-opts=skip-op_start=1,skip-op_end=9", "v.m3u8"];
+        let (mpv, _, _) = run(&timed, None, all);
+        let script = format!("--script={}", fake.join("ani-hop-skip.lua").display());
+        assert_eq!(mpv, format!("{script}\n{}\n", timed.join("\n")));
 
         // it's there: mpv gets the English file, with its other arguments as they were
         let (mpv, curl, got) = run(&stream, page, all);
