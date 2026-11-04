@@ -11,7 +11,7 @@ use crate::kitty::{self, Posters};
 use crate::list_label;
 use crate::progress::Progress;
 use crate::source::Source;
-use crate::ui::{ACCENT, DIM, MATCH, SOFT, cover_color, swept};
+use crate::ui::{ACCENT, LINE, MATCH, SOFT, cover_color, swept};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -56,11 +56,8 @@ pub fn page(s: &Shown) -> Page {
         .map(|ep| s.progress.entry(ep).0)
         .filter(|p| p.id != show.id);
     let m = part.unwrap_or(show);
-    let accent = accent(m);
-    let mut lines = vec![Line::styled(
-        m.name().to_string(),
-        Style::new().fg(accent).bold(),
-    )];
+    // not in its cover's color: most are too pale to read on a light theme
+    let mut lines = vec![Line::styled(m.name().to_string(), Style::new().bold())];
     let alt = [&m.title.romaji, &m.title.english]
         .into_iter()
         .flatten()
@@ -112,7 +109,10 @@ pub fn page(s: &Shown) -> Page {
             Some((head, last)) => format!("{head}\u{a0}{last}"),
             None => name.to_string(),
         };
-        lines.push(Line::styled(format!("Episodes\u{a0}{eps} are {name}"), DIM));
+        lines.push(Line::styled(
+            format!("Episodes\u{a0}{eps} are {name}"),
+            SOFT,
+        ));
         lines.extend(status(p));
     }
     if let Some(a) = &m.next_airing_episode
@@ -137,7 +137,7 @@ pub fn page(s: &Shown) -> Page {
             true => Some(format!("ani-cli: {n}")),
             false => Some(format!("ani-cli: {} · {n}", src.title)),
         };
-        lines.extend(line.map(|l| Line::styled(l, DIM)));
+        lines.extend(line.map(|l| Line::styled(l, SOFT)));
     }
     let mut about = String::new();
     if let Some(ep) = ep.filter(|_| !s.next)
@@ -151,7 +151,7 @@ pub fn page(s: &Shown) -> Page {
         };
         lines.push(Line::styled(heading, Style::new().bold()));
         if let Some(d) = i.aired.as_deref().filter(|d| !d.is_empty()) {
-            lines.push(Line::styled(format!("aired {}", day(d)), DIM));
+            lines.push(Line::styled(format!("aired {}", day(d)), SOFT));
         }
         about = summary.to_string();
     }
@@ -264,7 +264,7 @@ impl Preview {
                     Line::from(vec![
                         " ".into(),
                         Span::styled(k, ACCENT),
-                        Span::styled(w, DIM),
+                        Span::styled(w, SOFT),
                     ])
                 })
                 .into_iter()
@@ -301,14 +301,21 @@ impl Preview {
         let head = Paragraph::new(page.head.clone()).wrap(Wrap { trim: true });
         let head_h = head.line_count(info.width) as u16;
 
-        // the episode's summary right under its title, then the description: beside the poster
-        // (and in the row under it) first, where the facts leave rows empty, then full width
+        // the episode's summary right under its title, then the description, with one left edge
+        // for all of it: beside the poster if it fits down to the pane's last row, else under it
         let desc = m.description.as_deref().map(strip_html).unwrap_or_default();
-        let text = [(page.about.as_str(), SOFT), (desc.as_str(), Style::new())];
+        let text = [
+            (page.about.as_str(), Style::new()),
+            (desc.as_str(), Style::new()),
+        ];
         let text: Vec<_> = text.into_iter().filter(|t| !t.0.is_empty()).collect();
-        let top = head_h + u16::from(page.about.is_empty());
-        let narrow = (rows + 1).saturating_sub(top) as usize;
-        let mut text = flow(&text, narrow, info.width, area.width);
+        let beside = head_h + u16::from(page.about.is_empty());
+        let in_column = flow(&text, info.width);
+        let fits = usize::from(beside) + in_column.len() <= usize::from(area.height);
+        let (column, top, mut text) = match fits {
+            true => (info, beside, in_column),
+            false => (area, rows.max(head_h) + 1, flow(&text, area.width)),
+        };
         // shortcut: rows end at u16::MAX, which no AniList description gets near even one column
         // wide; page the text in parts if one ever does
         text.truncate(usize::from((u16::MAX - area.y).saturating_sub(top)));
@@ -328,12 +335,8 @@ impl Preview {
         }
         let head_area = Rect::new(info.x, info.y, info.width, head_h);
         head.render(head_area, &mut buf);
-        // only true RGB titles: a named color has no RGB value to fade back into
-        if let Color::Rgb(r, g, b) = accent {
-            self.shine(&mut buf, head_area, (r, g, b));
-        }
+        self.shine(&mut buf, head_area, accent);
         for (i, line) in text.into_iter().enumerate() {
-            let column = if i < narrow { info } else { area };
             let y = area.y + top + i as u16;
             line.render(Rect::new(column.x, y, column.width, 1), &mut buf);
         }
@@ -351,18 +354,18 @@ impl Preview {
         (off > 0, off < max)
     }
 
-    /// A white sweep across the title that settles into its cover color.
-    fn shine(&self, buf: &mut Buffer, area: Rect, (r, g, b): (u8, u8, u8)) {
+    /// The cover's color sweeps across the title once. It's over too soon to need reading,
+    /// whatever the theme.
+    fn shine(&self, buf: &mut Buffer, area: Rect, color: Color) {
         let t = self.glint.1.elapsed().as_millis() as f32 / GLINT_MS as f32;
         if t >= 1.0 {
             return;
         }
-        let lerp = |c: u8, w: f32| (c as f32 + (255.0 - c as f32) * w) as u8;
         for pos in area.positions() {
             let cell = &mut buf[pos];
-            if cell.fg == Color::Rgb(r, g, b) {
-                let w = 1.0 - (swept(t, pos.x - area.x, area.width, 12.0) / 12.0).clamp(0.0, 1.0);
-                cell.fg = Color::Rgb(lerp(r, w), lerp(g, w), lerp(b, w));
+            let passed = swept(t, pos.x - area.x, area.width, 12.0);
+            if cell.modifier.contains(Modifier::BOLD) && (0.0..12.0).contains(&passed) {
+                cell.fg = color;
             }
         }
     }
@@ -391,7 +394,7 @@ fn facts(m: &Media) -> Vec<Line<'static>> {
     ];
     for d in detail.into_iter().flatten() {
         if !facts.is_empty() {
-            facts.push(Span::styled("\u{a0}· ", DIM));
+            facts.push(Span::styled("\u{a0}· ", LINE));
         }
         facts.push(d.into());
     }
@@ -457,29 +460,23 @@ fn day(iso: &str) -> String {
     }
 }
 
-/// Wraps paragraphs word by word like Paragraph does, the first `narrow` lines to `first`
-/// columns and the rest to `rest`, with a blank line between the parts of `text`. A word
-/// wider than its line is broken between characters (graphemes), so text without spaces
-/// (Japanese, a URL) is never cut.
-fn flow(text: &[(&str, Style)], narrow: usize, first: u16, rest: u16) -> Vec<Line<'static>> {
+/// Wraps paragraphs word by word like Paragraph does, to `columns`, with a blank line between
+/// the parts of `text`. A word wider than its line is broken between characters (graphemes),
+/// so text without spaces (Japanese, a URL) is never cut.
+fn flow(text: &[(&str, Style)], columns: u16) -> Vec<Line<'static>> {
     let width = |s: &str| Span::raw(s).width();
-    let room = |n: usize| usize::from(if n < narrow { first } else { rest.max(1) });
+    let room = usize::from(columns.max(1));
     let mut out = Vec::new();
     for (i, &(s, style)) in text.iter().enumerate() {
         if i > 0 {
             out.push(Line::default());
         }
         for para in s.lines() {
-            // the last narrow line is the row under the poster: a paragraph starting there
-            // would look indented, so it starts full width below it
-            if out.len() + 1 == narrow && !para.trim().is_empty() {
-                out.push(Line::default());
-            }
             let mut line = String::new();
             // no-break spaces stay inside a word, like in the facts
             for word in para.split(' ').filter(|w| !w.is_empty()) {
                 if !line.is_empty() {
-                    if width(&line) + 1 + width(word) <= room(out.len()) {
+                    if width(&line) + 1 + width(word) <= room {
                         line.push(' ');
                         line.push_str(word);
                         continue;
@@ -488,12 +485,8 @@ fn flow(text: &[(&str, Style)], narrow: usize, first: u16, rest: u16) -> Vec<Lin
                 }
                 let word = Span::raw(word);
                 for g in word.styled_graphemes(style).map(|g| g.symbol) {
-                    if !line.is_empty() && width(&line) + width(g) > room(out.len()) {
+                    if !line.is_empty() && width(&line) + width(g) > room {
                         out.push(Line::styled(std::mem::take(&mut line), style));
-                    }
-                    // a narrow line too small for a wide character stays empty
-                    while line.is_empty() && out.len() < narrow && width(g) > room(out.len()) {
-                        out.push(Line::default());
                     }
                     line.push_str(g);
                 }
@@ -661,36 +654,26 @@ mod tests {
     }
 
     #[test]
-    fn flows_around_the_poster() {
+    fn flow_wraps_by_width() {
         let text = |lines: Vec<Line>| lines.iter().map(Line::to_string).collect::<Vec<_>>();
-        // two lines beside the poster, then full width; paragraphs and parts keep a blank
-        let out = flow(
-            &[("aa bb cc dd ee\n\nff", SOFT), ("gg", DIM.into())],
-            2,
-            5,
-            8,
-        );
+        // paragraphs and parts keep a blank
+        let plain = Style::new();
+        let out = flow(&[("aa bb cc dd ee\n\nff", SOFT), ("gg", plain)], 5);
         assert_eq!(
             text(out.clone()),
             ["aa bb", "cc dd", "ee", "", "ff", "", "gg"]
         );
-        assert_eq!((out[0].style, out[6].style), (SOFT, DIM.into()));
+        assert_eq!((out[0].style, out[6].style), (SOFT, plain));
         // words wider than their line are broken, by width: ビデオ is 6 columns
-        let out = flow(&[("ビデオビデオ x", Style::new())], 2, 5, 4);
+        let out = flow(&[("ビデオビデオ x", Style::new())], 4);
         assert_eq!(text(out), ["ビデ", "オビ", "デオ", "x"]);
         assert_eq!(
-            text(flow(&[("a\u{a0}b c", Style::new())], 0, 1, 3)),
+            text(flow(&[("a\u{a0}b c", Style::new())], 3)),
             ["a\u{a0}b", "c"]
         );
-        assert!(flow(&[], 3, 5, 8).is_empty());
-        // a narrow line too small for a wide character is skipped; joined emoji stay whole
-        assert_eq!(text(flow(&[("ビデ", SOFT)], 2, 1, 4)), ["", "", "ビデ"]);
-        assert_eq!(text(flow(&[("a ビ", SOFT)], 3, 0, 4)), ["", "", "", "a ビ"]);
+        assert!(flow(&[], 8).is_empty());
+        // joined emoji stay whole
         let family = "\u{1F469}\u{200D}\u{1F469}\u{200D}\u{1F467}";
-        assert_eq!(text(flow(&[(family, SOFT)], 0, 9, 2)), [family]);
-        // no paragraph starts on the last narrow line, under the poster
-        assert_eq!(text(flow(&[("aa bb", SOFT)], 1, 2, 8)), ["", "aa bb"]);
-        let out = flow(&[("aa", SOFT), ("bb", SOFT)], 3, 5, 8);
-        assert_eq!(text(out), ["aa", "", "", "bb"]);
+        assert_eq!(text(flow(&[(family, SOFT)], 2)), [family]);
     }
 }

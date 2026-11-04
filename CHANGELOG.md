@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.10.8 – 2026-11-04
+
+### Changed
+
+- The faint text is easier to read on every Omarchy theme, light and dark. Hints and the words at the bottom now use a mid gray instead of the theme's muted color, which is hard to read on most themes. A setting's value, like `on` or `off`, and help you have to read use main text.
+- Show titles use main text, and their cover's color sweeps across once when the show comes up. Most covers' colors were too pale to read on a light theme.
+- The login and folder prompts have their help in the right panel, so a web address fits on one row at 80 columns and can be copied in one go.
+- A description stays in one column: beside the poster if all of it fits, otherwise under the poster. It no longer jumps left mid-sentence.
+- The Continue row's prompt says "type to filter", as the keys aren't on screen there.
+
+### Fixed
+
+- Deleting a show right after its download ended could wrongly say a download still holds it. This was also why one of ani-hop's tests failed now and then.
+
 ## 0.10.7 – 2026-11-04
 
 ### Added

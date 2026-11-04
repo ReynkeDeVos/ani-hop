@@ -10,14 +10,14 @@ use ratatui::widgets::{
 // ANSI colors on purpose: they follow the terminal (and Omarchy) theme.
 pub const ACCENT: Color = Color::Magenta;
 pub const MATCH: Color = Color::Cyan;
-pub const DIM: Color = Color::DarkGray;
-/// Text to read that steps back: faint main text is easier on the eyes than DIM in most
-/// themes (Omarchy's color 7 is the main text itself, so there's no ANSI shade between).
-pub const SOFT: Style = Style::new().add_modifier(Modifier::DIM);
+/// Borders, rules and separators, not text: color 8 is below 3:1 on most Omarchy themes, and
+/// 1.5:1 on some.
+pub const LINE: Color = Color::DarkGray;
+/// Text to read that steps back: a mid gray, the one thing at 3:1 or better on every Omarchy
+/// theme, light and dark. Ghostty's faint falls under 2:1 on all the light ones.
+pub const SOFT: Style = Style::new().fg(Color::Indexed(244));
 /// the row under the cursor
-const SELECTED: Style = Style::new()
-    .add_modifier(Modifier::BOLD)
-    .remove_modifier(Modifier::DIM);
+const SELECTED: Style = Style::new().add_modifier(Modifier::BOLD);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const LOGO: [&str; 2] = ["▄▀█ █▄ █ █ ▄▄ █ █ █▀█ █▀█", "█▀█ █ ▀█ █    █▀█ █▄█ █▀▀"];
 const SHADES: [&str; 4] = ["░", "▒", "▓", "█"];
@@ -69,7 +69,7 @@ fn starting(app: &App, f: &mut Frame) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(color)
-        .title(Span::styled(" ▶ Starting ", Style::new().fg(color).bold()));
+        .title(Span::styled(" ▶ Starting ", Style::new().bold()));
     let inner = block.inner(area).inner(Margin::new(2, 1));
     // a light band runs over the bar, like over the loading lists
     let band = (app.started.elapsed().as_millis() / 20) as usize % (inner.width as usize + 10);
@@ -80,7 +80,7 @@ fn starting(app: &App, f: &mut Frame) {
                 if (x + 5).abs_diff(band) < 5 {
                     color
                 } else {
-                    DIM
+                    LINE
                 },
             )
         })
@@ -89,7 +89,7 @@ fn starting(app: &App, f: &mut Frame) {
         Line::styled(p.title.as_str(), Style::new().bold()),
         Line::from(vec![
             Span::styled(format!("{} ", spinner(app)), color),
-            Span::styled(format!("{step}…"), DIM),
+            Span::styled(format!("{step}…"), SOFT),
         ]),
         Line::from(bar),
     ];
@@ -145,7 +145,7 @@ fn crumb(s: &crate::Screen) -> &str {
 fn panel() -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(DIM)
+        .border_style(LINE)
 }
 
 fn spinner(app: &App) -> &'static str {
@@ -159,7 +159,7 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
             Span::raw(name.as_str()),
             "  ".into(),
         ]),
-        None => Line::from(Span::styled("○ not logged in to AniList  ", DIM)),
+        None => Line::from(Span::styled("○ not logged in to AniList  ", SOFT)),
     };
     let [crumbs_area, user_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(user.width() as u16)])
@@ -193,7 +193,7 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
     ];
     let badge = Line::from(crumbs.clone()).width();
     for t in shown.into_iter().rev() {
-        crumbs.push(Span::styled(" › ", DIM));
+        crumbs.push(Span::styled(" › ", LINE));
         crumbs.push(Span::raw(t));
     }
     // the way back from any other screen, so the main menu doesn't need it; the name whole or
@@ -209,10 +209,10 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
 /// then the number.
 fn versions(app: &App, room: usize) -> Line<'static> {
     let part = |text: &str, new: Option<&str>, word: &str| {
-        let mut spans = vec![Span::styled(text.to_string(), DIM)];
+        let mut spans = vec![Span::styled(text.to_string(), SOFT)];
         if let Some(new) = new {
             spans.push(Span::styled(" ↑", ACCENT));
-            spans.push(Span::styled(format!(" ({new}{word})"), DIM));
+            spans.push(Span::styled(format!(" ({new}{word})"), SOFT));
         }
         spans
     };
@@ -225,7 +225,7 @@ fn versions(app: &App, room: usize) -> Line<'static> {
     let ani_cli = app.ani_cli.as_ref().map(|v| format!("ani-cli {v}"));
     let both = |word: &str| {
         let ani_cli = part(ani_cli.as_ref()?, ani_cli_new, word);
-        let dot = Span::styled(" · ", DIM);
+        let dot = Span::styled(" · ", LINE);
         Some([part(&named, own_new, word), vec![dot], ani_cli].concat())
     };
     let widest_first = [
@@ -316,12 +316,17 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     // what's typed starts where the rows' labels do; a long text keeps its end in view, where
     // typing goes, with the cursor after it
     let room = (prompt_area.width as usize).saturating_sub(4);
-    let prompt = Line::from(vec![
+    let mut prompt = Line::from(vec![
         Span::styled("❯  ", Style::new().fg(ACCENT).bold()),
         Span::raw(fit_start(&screen.menu.query, room)),
     ]);
     let cursor_x =
         (prompt_area.x + prompt.width() as u16).min(prompt_area.right().saturating_sub(1));
+    // on any other row the keys say so; this one has its show there instead
+    let on_continue = (screen.menu.current()).is_some_and(|it| it.key.starts_with("continue:"));
+    if screen.menu.query.is_empty() && matches!(screen.view, View::Main) && on_continue {
+        prompt.push_span(Span::styled("type to filter", SOFT));
+    }
     match question {
         Some(q) => f.render_widget(
             Paragraph::new(Line::styled(q, Style::new().bold())).wrap(Wrap { trim: true }),
@@ -333,17 +338,20 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         }
     }
 
-    // an input as a fixed menu: its rule alone, and its help where rows would start. The top
-    // line and the help say what it asks for
+    // an input as a fixed menu: its rule alone. The top line and the help say what it asks
+    // for. The help is in the preview's wider column, so an address fits on one row, unless
+    // that has the show a source is searched for
     if let View::Input(input) = &screen.view {
         let rule = "─".repeat(info_area.width as usize);
-        f.render_widget(Line::styled(rule, DIM), info_area);
-        let [_, help_area] =
-            Layout::horizontal([Constraint::Length(3), Constraint::Fill(1)]).areas(list_area);
-        f.render_widget(
-            Paragraph::new(input_help(input)).wrap(Wrap { trim: false }),
-            help_area,
-        );
+        f.render_widget(Line::styled(rule, LINE), info_area);
+        if matches!(input, Input::SourceQuery(_)) {
+            let [_, help_area] =
+                Layout::horizontal([Constraint::Length(3), Constraint::Fill(1)]).areas(list_area);
+            f.render_widget(
+                Paragraph::new(input_help(input)).wrap(Wrap { trim: false }),
+                help_area,
+            );
+        }
         return;
     }
 
@@ -369,7 +377,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         } else {
             count
         },
-        DIM,
+        SOFT,
     )];
     if screen.loading() {
         // where the count comes, while there's none yet
@@ -389,7 +397,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     // a gap only after something: a fixed menu's rule starts where its rows do
     let gap = if used > 0 { " " } else { "" };
     let line = "─".repeat((info_area.width as usize).saturating_sub(used + gap.len()));
-    info.push(Span::styled(format!("{gap}{line}"), DIM));
+    info.push(Span::styled(format!("{gap}{line}"), LINE));
     f.render_widget(Line::from(info), info_area);
     // an empty list says so, instead of a bare 0
     let empty = match &screen.view {
@@ -405,7 +413,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         _ => None,
     };
     if let Some(text) = empty {
-        let line = Line::from(vec!["   ".into(), Span::styled(text, DIM)]);
+        let line = Line::from(vec!["   ".into(), Span::styled(text, SOFT)]);
         return f.render_widget(line, list_area);
     }
 
@@ -476,10 +484,12 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 used += 1;
             }
             let room = width.saturating_sub(used + 1);
-            let (hint, color) = match &busy {
-                Some((key, text)) if *key == item.key => (text.clone(), ACCENT),
-                _ if hero => (item.hint.clone(), ACCENT),
-                _ => (item.hint.clone(), DIM),
+            let (hint, style): (String, Style) = match &busy {
+                Some((key, text)) if *key == item.key => (text.clone(), ACCENT.into()),
+                _ if hero => (item.hint.clone(), ACCENT.into()),
+                // what Settings is there to show
+                _ if matches!(screen.view, View::Settings) => (item.hint.clone(), Style::new()),
+                _ => (item.hint.clone(), SOFT),
             };
             let mut hint = hint;
             if Span::raw(hint.as_str()).width() > room && !item.short.is_empty() {
@@ -493,13 +503,16 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
             // a hint cut to less than half says nothing ("not l…", "loses pr…"), so it goes
             let w = Span::raw(hint.as_str()).width();
             if !hint.is_empty() && (w <= room || room > 3 && room * 2 >= w) {
-                let hint = Span::styled(fit(hint, room), color);
+                let hint = Span::styled(fit(hint, room), style);
                 spans.push(" ".repeat(width.saturating_sub(used + hint.width())).into());
                 spans.push(hint);
             }
-            // its row only, not a rule under it
+            // its row only, not a rule under it, and what's gray reads in full there
             if selected == Some(k) {
                 for s in &mut spans {
+                    if s.style.fg == SOFT.fg {
+                        s.style.fg = None;
+                    }
                     s.style = s.style.patch(SELECTED);
                 }
             }
@@ -522,12 +535,19 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
 /// A faint line where a list's next group starts, with its name if it has one.
 fn rule(name: &str, width: usize) -> Line<'static> {
     // in line with the labels, past the check column
-    let head = match name {
-        "" => "  ".to_string(),
-        _ => format!("  ── {} ", fit(name.to_string(), width.saturating_sub(8))),
+    let (lead, name) = match name {
+        "" => ("  ", String::new()),
+        _ => (
+            "  ── ",
+            format!("{} ", fit(name.to_string(), width.saturating_sub(8))),
+        ),
     };
-    let rest = width.saturating_sub(Span::raw(head.as_str()).width());
-    Line::styled(head + &"─".repeat(rest), DIM)
+    let rest = width.saturating_sub(lead.chars().count() + Span::raw(name.as_str()).width());
+    Line::from(vec![
+        Span::styled(lead, LINE),
+        Span::styled(name, SOFT),
+        Span::styled("─".repeat(rest), LINE),
+    ])
 }
 
 /// Placeholder rows with a light band running over them while the first fetch is out.
@@ -539,7 +559,7 @@ fn skeleton(area: Rect, tick: usize) -> Text<'static> {
             let spans: Vec<Span> = (0..len)
                 .map(|x| {
                     let lit = (x + 3 + row).abs_diff(band) < 4;
-                    Span::styled("━", if lit { Color::Gray } else { DIM })
+                    Span::styled("━", if lit { Color::Gray } else { LINE })
                 })
                 .collect();
             Line::from([vec!["   ".into()], spans].concat())
@@ -548,13 +568,13 @@ fn skeleton(area: Rect, tick: usize) -> Text<'static> {
         .into()
 }
 
-fn input_help(input: &Input) -> Text<'static> {
-    let lines: Vec<Line> = match input {
+fn input_help(input: &Input) -> Vec<Line<'static>> {
+    match input {
         // AniList takes the text as it is; fzf's syntax is for the list it finds
         Input::Search => {
             let row = |typed: &'static str, does: &'static str| {
                 Line::from(vec![
-                    Span::styled(format!("{typed:<11}"), Style::new().fg(ACCENT).not_dim()),
+                    Span::styled(format!("{typed:<11}"), ACCENT),
                     does.into(),
                 ])
             };
@@ -569,14 +589,14 @@ fn input_help(input: &Input) -> Text<'static> {
                 row("fri | aot", "either one"),
             ]
         }
-        // one line per step or idea, wrapped by the pane, as 80 columns leave it 27
+        // one line per step or idea, wrapped by the pane, as 80 columns leave it 42
         Input::ClientId => vec![
             "One-time setup: ani-hop needs your own AniList API client.".into(),
             "".into(),
             "1. On anilist.co/settings/developer, choose Create New Client.".into(),
             "2. Name it ani-hop, with this redirect URL:".into(),
-            Line::styled(PIN_REDIRECT, Style::new().fg(ACCENT).not_dim()),
-            "3. Paste its client ID here and press enter.".into(),
+            Line::styled(PIN_REDIRECT, ACCENT),
+            "3. Paste its client ID at ❯ and press enter.".into(),
         ],
         Input::Token => vec![
             "Approve ani-hop in your browser, then paste the token AniList shows and press enter."
@@ -587,19 +607,18 @@ fn input_help(input: &Input) -> Text<'static> {
                 Style::new().italic(),
             ),
             "".into(),
-            "Wrong client ID? Leave this empty and press enter to change it.".into(),
+            "Wrong client ID? Leave ❯ empty and press enter to change it.".into(),
         ],
         Input::SourceQuery(_) => vec![
             "Search ani-cli with this text, then pick the right source. ani-hop keeps it.".into(),
         ],
         Input::DownloadDir => vec![
-            "Downloads go here. ~ works.".into(),
+            "Downloads go in the folder at ❯. ~ works.".into(),
             format!("Empty resets to {}.", ani::tilde(&ani::default_root())).into(),
             "".into(),
             "Shows downloaded before keep their folder, also for new episodes.".into(),
         ],
-    };
-    Text::from(lines).style(SOFT)
+    }
 }
 
 fn preview(app: &mut App, f: &mut Frame, area: Rect) {
@@ -676,7 +695,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             .map(|m| {
                 let mut line = Line::from(format!("• {}", m.name()));
                 if app.upcoming(m) {
-                    line.push_span(Span::styled(" · not out yet", DIM));
+                    line.push_span(Span::styled(" · not out yet", SOFT));
                 }
                 line
             })
@@ -698,7 +717,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
                     let head = Line::from(format!("✗ {}", name(p)));
                     let files = files
                         .into_iter()
-                        .map(move |f| Line::styled(format!("    {}", name(&f)), DIM));
+                        .map(move |f| Line::styled(format!("    {}", name(&f)), SOFT));
                     std::iter::once(head).chain(files)
                 })
                 .collect()
@@ -734,12 +753,12 @@ fn setup(app: &App) -> Vec<Line<'static>> {
         Line::from(vec![
             mark,
             format!("{name:<10}").into(),
-            Span::styled(what, DIM),
+            Span::styled(what, SOFT),
         ])
     };
     // enter on Install or Update runs this, which the hint shows cut short
     let command =
-        |cmd: String| Line::from(vec![Span::styled("❯ ", ACCENT), Span::styled(cmd, DIM)]);
+        |cmd: String| Line::from(vec![Span::styled("❯ ", ACCENT), Span::styled(cmd, SOFT)]);
     let mut v: Vec<Line> = logo().collect();
     // what to do first: a long checklist must not push it out of a small terminal
     let pkgs: Vec<&str> = app.missing.iter().map(|d| d.1).collect();
@@ -759,7 +778,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
         }
         if names.contains(&"xdg-open") {
             // only on Linux (deps() leaves it out on macOS), and Homebrew has no xdg-utils
-            v.push(Line::styled("xdg-open: xdg-utils from your distro", DIM));
+            v.push(Line::styled("xdg-open: xdg-utils from your distro", SOFT));
         }
     }
     if let Some(old) = app.old_ani_cli() {
@@ -773,7 +792,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
         ));
         v.push(match ani::ani_cli_update() {
             Some(cmd) => command(cmd),
-            None => Line::styled("Update it with your package manager", DIM),
+            None => Line::styled("Update it with your package manager", SOFT),
         });
     }
     v.extend(["".into(), Line::styled("Tools", Style::new().bold())]);
@@ -797,8 +816,8 @@ fn setup(app: &App) -> Vec<Line<'static>> {
             format!("logged in as {name}").into(),
         ])),
         None => v.extend([
-            Line::styled("  Log in to see your lists", DIM),
-            Line::styled("  and save progress after each episode.", DIM),
+            Line::styled("  Log in to see your lists", SOFT),
+            Line::styled("  and save progress after each episode.", SOFT),
         ]),
     }
     v
@@ -817,7 +836,7 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::styled(format!("{k:>4}  "), ACCENT),
             Span::raw(what),
-            Span::styled(also, DIM),
+            Span::styled(also, SOFT),
         ])
     };
     let mut v = Vec::new();
@@ -827,10 +846,16 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
             ACCENT,
         ));
     }
+    let top = app.stack.last().unwrap();
+    if let View::Input(input) = &top.view {
+        if !v.is_empty() {
+            v.push("".into());
+        }
+        v.extend(input_help(input));
+    }
     // on an input typing is the text itself; on an empty list only esc and ^c do something.
     // Only what nothing else says: the footer and the preview's border name the other keys
     // where they work
-    let top = app.stack.last().unwrap();
     if !matches!(top.view, View::Input(_)) && !top.menu.items.is_empty() {
         // the arrows lead, as esc clears a filter before it goes back
         if !v.is_empty() {
@@ -843,7 +868,7 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
             "".into(),
             key("type", "filter the list", ""),
             // 35 columns, of the 42 that 80 leave the preview
-            Line::styled(format!("{:6}'exact ^start end$ !not a | b", ""), DIM),
+            Line::styled(format!("{:6}'exact ^start end$ !not a | b", ""), SOFT),
             key("esc", "clear the filter, then back", ""),
         ]);
     }
@@ -893,7 +918,7 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
             .flat_map(|(k, what)| {
                 [
                     Span::styled(*k, ACCENT),
-                    Span::styled(format!(" {what}  "), DIM),
+                    Span::styled(format!(" {what}  "), SOFT),
                 ]
             })
             .collect::<Vec<_>>(),
@@ -937,7 +962,7 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
                 (area.width as usize).saturating_sub(hints.width() + Span::raw(&head).width() + 1);
             Line::from(vec![
                 Span::styled(head, ACCENT),
-                Span::styled(fit(tail, room), DIM),
+                Span::styled(fit(tail, room), SOFT),
             ])
         }
         // only with nothing else to say, and only on the main menu
