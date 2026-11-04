@@ -189,12 +189,16 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
         crumbs.push(Span::styled(" › ", DIM));
         crumbs.push(Span::raw(t));
     }
-    f.render_widget(Line::from(crumbs), crumbs_area);
+    // the name whole or not at all
+    if crumbs_area.width as usize >= crumbs[0].width() {
+        f.render_widget(Line::from(crumbs), crumbs_area);
+    }
     f.render_widget(user, user_area);
 }
 
 /// What's installed, with an arrow and, in brackets, the version to update to where there's
-/// one. With less `room` ani-cli goes first, then the name, then the number.
+/// one. With less `room` ani-cli goes first, then the name, then what to update to, then the
+/// number.
 fn versions(app: &App, room: usize) -> Line<'static> {
     let part = |text: String, new: Option<&str>| {
         let mut spans = vec![Span::styled(text, DIM)];

@@ -4106,14 +4106,11 @@ mod tests {
         let mut app = with_versions();
         let all = format!(" ani-hop {me} · ani-cli 5.1.6");
         assert!(foot(&mut app, 80).starts_with(&all));
-        // nothing up top
-        assert!(
-            !screen(&mut app, 80, 24)
-                .lines()
-                .next()
-                .unwrap()
-                .contains(me)
-        );
+        // nothing up top, where the name is whole or not there
+        let top = |app: &mut App, w| screen(app, w, 24).lines().next().unwrap().to_string();
+        assert!(!top(&mut app, 80).contains(me));
+        assert!(top(&mut app, 19).starts_with(" ani-hop "));
+        assert!(!top(&mut app, 18).contains("ani"));
 
         // less room: only ani-hop, then only its number, then nothing
         let narrow = foot(&mut app, 50);
