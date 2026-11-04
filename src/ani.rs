@@ -92,9 +92,12 @@ exec mpv "$@"
 /// the arguments of the mpv that started it: a stream fetched ahead starts mpv without FAKE_MPV,
 /// and thumbfast clears the environment on a Mac, and did everywhere up to June 2026.
 /// shortcut: a `mpv_path` in thumbfast.conf goes unused on a stream; read it if someone has one
+/// shortcut: `ps` joins arguments with spaces, so one in a referrer would cut it short; ani-cli's
+/// is only ever a scheme and host, look at /proc if that changes
 const FAKE_THUMB_MPV: &str = r#"#!/bin/sh
-# ani-hop: thumbfast's mpv, with the referrer of the mpv it makes previews for
-referrer=$(ps -o args= -p "$PPID" 2>/dev/null | sed -n 's/.*--referrer=\([^ ]*\).*/\1/p')
+# ani-hop: thumbfast's mpv, with the referrer of the mpv it makes previews for. -ww as ps otherwise
+# cuts its answer to $COLUMNS
+referrer=$(ps -ww -o args= -p "$PPID" 2>/dev/null | sed -n 's/.* --referrer=\([^ ]*\).*/\1/p')
 exec mpv ${referrer:+--referrer="$referrer"} "$@"
 "#;
 
@@ -2403,6 +2406,8 @@ mod tests {
                 .args(main)
                 .env("HELPER", &helper)
                 .env("LOG", &log)
+                // narrower than any of this: a terminal's width mustn't cut the referrer off
+                .env("COLUMNS", "5")
                 .env("PATH", format!("{}:{sys}", bin.display()))
                 .output()
                 .unwrap();
@@ -2422,6 +2427,11 @@ mod tests {
         assert_eq!(
             run(&["--referrer=https://r/", "--referrer=https://s/", "v.m3u8"]),
             format!("--referrer=https://s/\n{own}")
+        );
+        // the option, not its name inside a value
+        assert_eq!(
+            run(&["--referrer=https://r/?next=--referrer=https://s/", "v.m3u8"]),
+            format!("--referrer=https://r/?next=--referrer=https://s/\n{own}")
         );
         // no referrer: only what thumbfast asked for
         assert_eq!(run(&["v.m3u8"]), own);
