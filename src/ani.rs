@@ -77,6 +77,22 @@ echo ani-hop-player-starts
 exec mpv "$@"
 "#;
 
+/// What HWDEC_SCRIPT says for a profile that sets hwdec.
+const HWDEC_IN_PROFILE: &str = "ani-hop: hwdec in a profile";
+
+/// Finds what mpv's -v can't, in any profile, and ends mpv's wait. Written to stdout, as a config
+/// with `really-quiet` would silence mpv's own way of saying it.
+const HWDEC_SCRIPT: &str = r#"-- ani-hop: says if a profile sets hwdec
+for _, profile in ipairs(mp.get_property_native("profile-list") or {}) do
+    for _, option in ipairs(profile.options or {}) do
+        if option.key == "hwdec" then
+            io.write("ani-hop: hwdec in a profile\n")
+        end
+    end
+end
+mp.commandv("quit")
+"#;
+
 const FAKE_SUBS: &str = r#"#!/bin/sh
 # ani-hop: the emergency fallback for an episode ani-cli finds no subtitles for. ani-cli reads
 # one of the provider's servers, whose copy can lack them (The Apothecary Diaries 1 has no
@@ -458,6 +474,7 @@ pub fn setup() -> std::io::Result<()> {
         ("rofi", FAKE_ROFI),
         ("ffmpeg", FAKE_FFMPEG),
         ("mpv", FAKE_MPV),
+        ("ani-hop-hwdec.lua", HWDEC_SCRIPT),
         ("ani-hop-subs", FAKE_SUBS),
     ] {
         write_helper(&bin.join(name), script)?;
@@ -518,7 +535,7 @@ fn write_helper(path: &Path, script: &str) -> std::io::Result<()> {
 
 /// The players running, ani-cli under them too: quitting closes them.
 static PLAYERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-/// ani-cli fetching a stream ahead, which quitting ends too.
+/// ani-cli fetching a stream ahead and mpv asked about its config, which quitting ends too.
 static AHEAD: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 fn pids(list: &'static Mutex<Vec<u32>>) -> std::sync::MutexGuard<'static, Vec<u32>> {
@@ -887,19 +904,44 @@ const HWDEC: &str = "--hwdec=auto-safe";
 pub fn hwdec_unset() -> bool {
     static UNSET: OnceLock<bool> = OnceLock::new();
     *UNSET.get_or_init(|| {
-        let mut mpv = Command::new("mpv");
-        // without a file it reads its config files, says what they set and quits, also when
-        // they ask it to stay open
-        mpv.args(["-v", "--idle=no", "--force-window=no"])
-            .stdin(Stdio::null());
-        output_within(&mut mpv, Duration::from_secs(5))
+        let script = cache_dir().join("bin").join("ani-hop-hwdec.lua");
+        if !script.exists() {
+            return false; // nothing would end the wait below
+        }
+        // -v says what the config files set. Idle, or mpv quits before the script gets to run: a
+        // profile only says it sets hwdec once it applies, and the file decides that
+        let child = Command::new("mpv")
+            .args([
+                "-v",
+                "--idle=yes",
+                "--force-window=no",
+                "--no-input-terminal",
+            ])
+            .arg(format!("--script={}", script.display()))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        let Ok(child) = child else {
+            return false;
+        };
+        // one stuck on the config files mustn't outlive ani-hop
+        let _listed = Listed::on(&AHEAD, &child);
+        wait_within(child, Duration::from_secs(5))
             .is_some_and(|o| o.status.success() && !sets_hwdec(&o.stdout))
     })
 }
 
-/// From mpv's -v output.
+/// From what `hwdec_unset` asks mpv.
 fn sets_hwdec(log: &[u8]) -> bool {
-    String::from_utf8_lossy(log).contains("Setting option 'hwdec' = ")
+    let log = String::from_utf8_lossy(log);
+    log.contains("Setting option 'hwdec' = ") || log.contains(HWDEC_IN_PROFILE)
+}
+
+/// Whether these mpv flags choose how to decode. `--hwdec-codecs` only says for what.
+fn flags_choose_hwdec(flags: &str) -> bool {
+    (flags.split_whitespace())
+        .any(|f| f == "--hwdec" || f == "--no-hwdec" || f.starts_with("--hwdec="))
 }
 
 /// ani-cli set up to take episode `ep` of `src` to the player (with ani-skip), and the file
@@ -912,7 +954,7 @@ fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, O
         flags.push_str(" --sub-visibility=no");
     }
     // the last flag wins, so not after the user's own. Another player has another config
-    if player == "mpv" && !flags.contains("--hwdec") && hwdec_unset() {
+    if player == "mpv" && !flags_choose_hwdec(&flags) && hwdec_unset() {
         flags = format!("{flags} {HWDEC}");
     }
     let mut cli = ani_cli();
@@ -1741,6 +1783,25 @@ mod tests {
         }
         assert!(!sets_hwdec(set("hwdec-codecs", "all").as_bytes()));
         assert!(!sets_hwdec(b"[cplayer] Reading config file /x/mpv.conf\n"));
+        // what the script says, the same as what it looks for here
+        assert!(HWDEC_SCRIPT.contains(HWDEC_IN_PROFILE));
+        assert!(sets_hwdec(HWDEC_IN_PROFILE.as_bytes()));
+    }
+
+    #[test]
+    fn only_a_flag_that_chooses_how_to_decode_keeps_ours_out() {
+        for flags in [
+            "--hwdec=no",
+            " --hwdec=vaapi --fs",
+            "--no-hwdec",
+            "--fs --no-hwdec",
+            "--hwdec",
+        ] {
+            assert!(flags_choose_hwdec(flags), "{flags}");
+        }
+        for flags in ["", "--fs", "--hwdec-codecs=all", "--vd-lavc-threads=4"] {
+            assert!(!flags_choose_hwdec(flags), "{flags}");
+        }
     }
 
     #[test]
