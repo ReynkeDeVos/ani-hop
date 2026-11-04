@@ -50,7 +50,7 @@ ani-hop runs in WSL. In PowerShell as admin:
 wsl --install -d Ubuntu-26.04
 ```
 
-Restart, open Ubuntu and run the Linux line above. For posters, run ani-hop in Ghostty: `sudo apt install -y ghostty`, then `ghostty &`, and `ani-hop` in the Ghostty window.
+Restart, open Ubuntu and run the Linux line above. For posters, run ani-hop in Ghostty: `sudo apt install -y ghostty`.
 
 <details>
 <summary>Other distros, Nix, or from source</summary>
