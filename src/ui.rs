@@ -21,6 +21,8 @@ const SELECTED: Style = Style::new()
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const LOGO: [&str; 2] = ["▄▀█ █▄ █ █ ▄▄ █ █ █▀█ █▀█", "█▀█ █ ▀█ █    █▀█ █▄█ █▀▀"];
 const SHADES: [&str; 4] = ["░", "▒", "▓", "█"];
+/// Marks an update. Not ↑, which is a key on the same screen.
+const UPDATE: &str = "⇡";
 const BOOT_MS: u128 = 240;
 const POP_MS: u128 = 160;
 
@@ -196,30 +198,36 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(user, user_area);
 }
 
-/// What's installed, with an arrow and, in brackets, the version to update to where there's
-/// one. With less `room` ani-cli goes first, then the name, then what to update to, then the
-/// number.
+/// What's installed, with an arrow and, in brackets, what's out where there's an update. With
+/// less `room` the words "is out" go first, then ani-cli, then the name, then what's out, and
+/// then the number.
 fn versions(app: &App, room: usize) -> Line<'static> {
-    let part = |text: String, new: Option<&str>| {
-        let mut spans = vec![Span::styled(text, DIM)];
+    let part = |text: &str, new: Option<&str>, word: &str| {
+        let mut spans = vec![Span::styled(text.to_string(), DIM)];
         if let Some(new) = new {
-            spans.push(Span::styled(" ↑", ACCENT));
-            spans.push(Span::styled(format!(" ({new})"), DIM));
+            spans.push(Span::styled(format!(" {UPDATE}"), ACCENT));
+            spans.push(Span::styled(format!(" ({new}{word})"), DIM));
         }
         spans
     };
     let own_new = app.release.as_ref().map(|r| r.0.as_str());
     let number = env!("CARGO_PKG_VERSION");
-    let named = part(format!(" ani-hop {number}"), own_new);
+    let (named, alone) = (format!(" ani-hop {number}"), format!(" {number}"));
     // too old, and GitHub hasn't said what's newest: what ani-hop needs is out for sure
     let needed = app.old_ani_cli().map(|_| ani::TESTED_ANI_CLI);
     let ani_cli_new = app.ani_cli_newer.as_deref().or(needed);
-    let ani_cli = (app.ani_cli.as_ref()).map(|v| part(format!("ani-cli {v}"), ani_cli_new));
+    let ani_cli = app.ani_cli.as_ref().map(|v| format!("ani-cli {v}"));
+    let both = |word: &str| {
+        let ani_cli = part(ani_cli.as_ref()?, ani_cli_new, word);
+        let dot = Span::styled(" · ", DIM);
+        Some([part(&named, own_new, word), vec![dot], ani_cli].concat())
+    };
     let widest_first = [
-        ani_cli.map(|v| [named.clone(), vec![Span::styled(" · ", DIM)], v].concat()),
-        Some(named),
-        Some(part(format!(" {number}"), own_new)),
-        Some(part(format!(" {number}"), None)),
+        both(" is out"),
+        both(""),
+        Some(part(&named, own_new, " is out")),
+        Some(part(&alone, own_new, " is out")),
+        Some(part(&alone, None, "")),
     ];
     (widest_first.into_iter().flatten().map(Line::from))
         .find(|line| line.width() <= room)
@@ -794,7 +802,7 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
     let mut v = Vec::new();
     if let Some((new, cmd)) = &app.release {
         v.push(Line::styled(
-            format!("↑ ani-hop {new} is out: {cmd}"),
+            format!("{UPDATE} ani-hop {new} is out: {cmd}"),
             ACCENT,
         ));
     }
