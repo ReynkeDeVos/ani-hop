@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.9 – 2026-11-04
+
+### Changed
+
+- The `ani-hop` tag is back on the main menu, so it's on every screen and no longer appears only once you leave the menu.
+
 ## 0.10.8 – 2026-11-04
 
 ### Added

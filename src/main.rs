@@ -4144,9 +4144,10 @@ mod tests {
             (118, Some('…'))
         );
 
-        // the main menu has no tag; from there on its fill starts on the border's line, in the
-        // middle of the column, and its name on the left edge
-        assert!(!top.contains("ani-hop"), "{top}");
+        // the tag is on every screen: its fill starts on the border's line, in the middle of the
+        // column, and its name on the left edge
+        assert!(top.starts_with('▐'), "{top}");
+        assert_eq!(start(top, "ani-hop"), edge, "{top}");
         // every prompt is alike: the top line and the help say what it asks for
         app.push("Download folder", View::Input(Input::DownloadDir));
         app.top().menu.edit(|q| *q = "~/x".into());
@@ -4391,11 +4392,8 @@ mod tests {
         // nothing up top, where the name is whole or not there
         let top = |app: &mut App, w| screen(app, w, 24).lines().next().unwrap().to_string();
         assert!(!top(&mut app, 80).contains(me));
-        assert!(!top(&mut app, 80).contains("ani"), "not on the main menu");
-        app.push("Settings", View::Settings);
         assert!(top(&mut app, 22).starts_with("▐ ani-hop ▌"));
         assert!(!top(&mut app, 21).contains("ani"));
-        press(&mut app, KeyCode::Esc);
 
         // less room: only ani-hop, then only its number, then nothing
         let narrow = foot(&mut app, 50);

@@ -196,9 +196,8 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
         crumbs.push(Span::styled(" › ", LINE));
         crumbs.push(Span::raw(t));
     }
-    // the way back from any other screen, so the main menu doesn't need it; the name whole or
-    // not at all
-    if app.stack.len() > 1 && crumbs_area.width as usize >= badge {
+    // the name whole or not at all
+    if crumbs_area.width as usize >= badge {
         f.render_widget(Line::from(crumbs), crumbs_area);
     }
     f.render_widget(user, user_area);
