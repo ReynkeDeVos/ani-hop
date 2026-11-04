@@ -193,24 +193,31 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
     f.render_widget(user, user_area);
 }
 
-/// What's installed, quiet until a part can be updated. With less `room` ani-cli goes first, then
-/// the name, then the number.
+/// What's installed, with an arrow and the version to update to where there's one. With less
+/// `room` ani-cli goes first, then the name, then the number.
 fn versions(app: &App, room: usize) -> Line<'static> {
-    let part = |text: String, outdated: bool| match outdated {
-        true => Span::styled(format!("{text} ↑"), ACCENT),
-        false => Span::styled(text, DIM),
+    let part = |text: String, new: Option<&str>| {
+        let mut spans = vec![Span::styled(text, DIM)];
+        if let Some(new) = new {
+            spans.push(Span::styled(" ↑", ACCENT));
+            spans.push(Span::styled(format!(" {new}"), DIM));
+        }
+        spans
     };
-    let own = |text: String| part(text, app.release.is_some());
+    let own_new = app.release.as_ref().map(|r| r.0.as_str());
     let number = env!("CARGO_PKG_VERSION");
-    let named = own(format!(" ani-hop {number}"));
-    let ani_cli_outdated = app.old_ani_cli().is_some() || app.ani_cli_newer;
-    let ani_cli = (app.ani_cli.as_ref()).map(|v| part(format!("ani-cli {v}"), ani_cli_outdated));
+    let named = part(format!(" ani-hop {number}"), own_new);
+    // too old, and GitHub hasn't said what's newest: what ani-hop needs is out for sure
+    let needed = app.old_ani_cli().map(|_| ani::TESTED_ANI_CLI);
+    let ani_cli_new = app.ani_cli_newer.as_deref().or(needed);
+    let ani_cli = (app.ani_cli.as_ref()).map(|v| part(format!("ani-cli {v}"), ani_cli_new));
     let widest_first = [
-        ani_cli.map(|v| Line::from(vec![named.clone(), Span::styled(" · ", DIM), v])),
-        Some(Line::from(named)),
-        Some(Line::from(own(format!(" {number}")))),
+        ani_cli.map(|v| [named.clone(), vec![Span::styled(" · ", DIM)], v].concat()),
+        Some(named),
+        Some(part(format!(" {number}"), own_new)),
+        Some(part(format!(" {number}"), None)),
     ];
-    (widest_first.into_iter().flatten())
+    (widest_first.into_iter().flatten().map(Line::from))
         .find(|line| line.width() <= room)
         .unwrap_or_default()
 }

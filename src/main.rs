@@ -190,8 +190,8 @@ enum Msg {
     DlDone(String, Result<(), String>),
     /// (version, update command) of a newer ani-hop
     Release(Option<(String, String)>),
-    /// (the ani-cli version it's about, and whether a newer one is out)
-    AniCliRelease(Option<String>, bool),
+    /// (the ani-cli version it's about, and a newer one that's out)
+    AniCliRelease(Option<String>, Option<String>),
 }
 
 const PAUSED: &str = "Paused downloads · enter on a queued episode resumes them";
@@ -238,8 +238,8 @@ pub struct App {
     pub ani_cli: Option<String>,
     /// (version, update command) of a newer ani-hop release
     pub release: Option<(String, String)>,
-    /// a newer ani-cli release is out
-    pub ani_cli_newer: bool,
+    /// the newer ani-cli release that's out
+    pub ani_cli_newer: Option<String>,
     /// shell command to run in the real terminal (TUI paused), e.g. installing packages
     external: Option<String>,
     /// asked for on a show's page while ani-cli searched, waiting to get back to that page
@@ -557,7 +557,7 @@ impl App {
             missing: Vec::new(),
             ani_cli: None,
             release: None,
-            ani_cli_newer: false,
+            ani_cli_newer: None,
             external: None,
             parked: None,
             marking: None,
@@ -655,7 +655,7 @@ impl App {
         self.spawn(move || {
             let newer = (installed.as_deref())
                 .and_then(|v| newer_release("pystardust/ani-cli", "latest-ani-cli", v));
-            Msg::AniCliRelease(installed, newer.is_some())
+            Msg::AniCliRelease(installed, newer)
         });
     }
 
@@ -663,7 +663,7 @@ impl App {
         self.missing = ani::missing_deps();
         self.ani_cli = ani::ani_cli_version();
         // that was about the ani-cli before this, and GitHub can take a while
-        self.ani_cli_newer = false;
+        self.ani_cli_newer = None;
         self.check_ani_cli();
         let names: Vec<&str> = self.missing.iter().map(|d| d.0).collect();
         match (names.is_empty(), self.old_ani_cli()) {
@@ -4139,32 +4139,47 @@ mod tests {
         app.toast.as_mut().unwrap().2 -= Duration::from_secs(5);
         assert!(foot(&mut app, 80).starts_with(&all));
 
-        // not by color alone; only ani-hop's says how, as ani-cli has too many ways to update
+        // only the arrows stand out, followed by what to update to. Only ani-hop's says how, as
+        // ani-cli has too many ways to update
         let mut app = with_versions();
         app.release = Some(("99.0.0".into(), "brew upgrade ani-hop".into()));
-        app.ani_cli_newer = true;
+        app.ani_cli_newer = Some("5.2".into());
         let drawn = screen(&mut app, 80, 24);
-        let marked = format!(" ani-hop {me} ↑ · ani-cli 5.1.6 ↑");
+        let marked = format!(" ani-hop {me} ↑ 99.0.0 · ani-cli 5.1.6 ↑ 5.2");
         assert!(
             drawn.lines().last().unwrap().starts_with(&marked),
             "{drawn}"
         );
         assert!(drawn.contains("ani-hop 99.0.0 is out"), "{drawn}");
         assert_eq!(drawn.matches("is out").count(), 1, "{drawn}");
+        // with less room what to update to goes before the number does
+        assert!(foot(&mut app, 40).starts_with(&format!(" {me} ↑ 99.0.0 ")));
+        assert!(foot(&mut app, 35).starts_with(&format!(" {me}     ")));
+        assert!(!foot(&mut app, 28).contains(me));
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| ui::render(&mut app, f)).unwrap();
+        let buf = term.backend().buffer();
+        let bright: String = (0..marked.chars().count() as u16)
+            .map(|x| &buf[(x, 23)])
+            .filter(|cell| cell.fg == ui::ACCENT)
+            .map(|cell| cell.symbol())
+            .collect();
+        assert_eq!(bright, " ↑ ↑");
 
         // an ani-cli too old for ani-hop too, without knowing of a release
         let mut app = with_versions();
         app.ani_cli = Some("5.0.2".into());
-        assert!(foot(&mut app, 80).contains("ani-cli 5.0.2 ↑"));
+        assert!(foot(&mut app, 80).contains("ani-cli 5.0.2 ↑ 5.1"));
 
         // an answer about the ani-cli from before an update doesn't bring the ↑ back
+        let newer = || Some("5.3".to_string());
         app.ani_cli = Some("5.2".into());
-        app.on_msg(Msg::AniCliRelease(Some("5.0.2".into()), true));
-        assert!(!app.ani_cli_newer);
-        app.on_msg(Msg::AniCliRelease(Some("5.2".into()), true));
-        assert!(app.ani_cli_newer);
+        app.on_msg(Msg::AniCliRelease(Some("5.0.2".into()), newer()));
+        assert_eq!(app.ani_cli_newer, None);
+        app.on_msg(Msg::AniCliRelease(Some("5.2".into()), newer()));
+        assert_eq!(app.ani_cli_newer, newer());
         // and an update takes it along at once, with the new answer still on its way
         app.after_install();
-        assert!(!app.ani_cli_newer);
+        assert_eq!(app.ani_cli_newer, None);
     }
 }

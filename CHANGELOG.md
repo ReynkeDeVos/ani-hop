@@ -4,7 +4,7 @@
 
 ### Changed
 
-- The versions moved from the top line to the bottom left of the main menu. A message, the player or a download takes that spot while it's there, and the versions come back after.
+- The versions moved from the top line to the bottom left of the main menu. A message, the player or a download takes that spot while it's there, and the versions come back after. With an update, only the ↑ stands out, followed by the version to update to.
 
 ## 0.10.5 – 2026-11-04
 
