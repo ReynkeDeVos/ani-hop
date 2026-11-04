@@ -85,7 +85,7 @@ const HWDEC_IN_PROFILE: &str = "ani-hop: hwdec in a profile";
 const HWDEC_SCRIPT: &str = r#"-- ani-hop: says if a profile sets hwdec
 for _, profile in ipairs(mp.get_property_native("profile-list") or {}) do
     for _, option in ipairs(profile.options or {}) do
-        if option.key == "hwdec" then
+        if option.key == "hwdec" or option.key == "no-hwdec" then
             io.write("ani-hop: hwdec in a profile\n")
         end
     end
@@ -908,21 +908,7 @@ pub fn hwdec_unset() -> bool {
         if !script.exists() {
             return false; // nothing would end the wait below
         }
-        // -v says what the config files set. Idle, or mpv quits before the script gets to run: a
-        // profile only says it sets hwdec once it applies, and the file decides that
-        let child = Command::new("mpv")
-            .args([
-                "-v",
-                "--idle=yes",
-                "--force-window=no",
-                "--no-input-terminal",
-            ])
-            .arg(format!("--script={}", script.display()))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn();
-        let Ok(child) = child else {
+        let Ok(child) = hwdec_check(&script).spawn() else {
             return false;
         };
         // one stuck on the config files mustn't outlive ani-hop
@@ -930,6 +916,28 @@ pub fn hwdec_unset() -> bool {
         wait_within(child, Duration::from_secs(5))
             .is_some_and(|o| o.status.success() && !sets_hwdec(&o.stdout))
     })
+}
+
+/// mpv asked about its config. -v says what the config files set. Idle, or mpv quits before the
+/// script gets to run: a profile only says it sets hwdec once it applies, and the file decides
+/// that. Without what reaches beyond this mpv: another mpv's control socket, which it would take
+/// over, its log, and the user's scripts.
+fn hwdec_check(script: &Path) -> Command {
+    let mut mpv = Command::new("mpv");
+    mpv.args([
+        "-v",
+        "--idle=yes",
+        "--force-window=no",
+        "--no-input-terminal",
+        "--load-scripts=no",
+        "--input-ipc-server=",
+        "--log-file=",
+    ])
+    .arg(format!("--script={}", script.display()))
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    mpv
 }
 
 /// From what `hwdec_unset` asks mpv.
@@ -1786,6 +1794,67 @@ mod tests {
         // what the script says, the same as what it looks for here
         assert!(HWDEC_SCRIPT.contains(HWDEC_IN_PROFILE));
         assert!(sets_hwdec(HWDEC_IN_PROFILE.as_bytes()));
+    }
+
+    #[test]
+    fn mpv_itself_says_what_its_config_sets_and_leaves_another_mpv_alone() {
+        // mpv reads this config as well, and CI has no mpv
+        if !have("mpv") || Path::new("/etc/mpv/mpv.conf").exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ani-hop-hwdec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("check.lua");
+        fs::write(&script, HWDEC_SCRIPT).unwrap();
+        let conf = dir.join("mpv.conf");
+        let ask = || {
+            let child = hwdec_check(&script).env("MPV_HOME", &dir).spawn().unwrap();
+            wait_within(child, Duration::from_secs(5)).expect("mpv quits by itself")
+        };
+        for (config, set) in [
+            ("volume=80\n", false),
+            ("# hwdec=auto\n", false),
+            ("hwdec-codecs=all\n", false),
+            ("hwdec=auto\n", true),
+            ("hwdec=no\n", true),
+            ("no-hwdec\n", true),
+            ("[extension.mkv]\nhwdec=no\n", true),
+            ("[extension.mkv]\nno-hwdec\n", true),
+            ("[protocol.https]\nhwdec=vaapi\n", true),
+            ("[c]\nprofile-cond=width>100\nhwdec=auto-copy\n", true),
+            ("really-quiet=yes\n[extension.mkv]\nhwdec=no\n", true),
+        ] {
+            fs::write(&conf, config).unwrap();
+            let out = ask();
+            assert!(out.status.success(), "{config}");
+            assert_eq!(sets_hwdec(&out.stdout), set, "{config}");
+        }
+
+        // a config naming a control socket: the mpv already on it keeps it
+        let socket = dir.join("socket");
+        let path = socket.display();
+        fs::write(&conf, format!("input-ipc-server={path}\n")).unwrap();
+        let mut player = Command::new("mpv")
+            .args(["--idle=yes", "--force-window=no", "--no-input-terminal"])
+            .env("MPV_HOME", &dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        ask();
+        let answers = std::os::unix::net::UnixStream::connect(&socket);
+        let _ = player.kill();
+        let _ = player.wait();
+        let _ = fs::remove_dir_all(&dir);
+        answers.expect("the running mpv still answers");
     }
 
     #[test]
