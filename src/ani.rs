@@ -518,7 +518,7 @@ fn write_helper(path: &Path, script: &str) -> std::io::Result<()> {
 
 /// The players running, ani-cli under them too: quitting closes them.
 static PLAYERS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
-/// ani-cli fetching a stream ahead, which quitting ends too.
+/// ani-cli fetching a stream ahead and mpv asked about its config, which quitting ends too.
 static AHEAD: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 fn pids(list: &'static Mutex<Vec<u32>>) -> std::sync::MutexGuard<'static, Vec<u32>> {
@@ -879,6 +879,83 @@ fn own_player() -> Option<String> {
     player.filter(|p| !p.is_empty() && p != "mpv")
 }
 
+/// What mpv gets when its config files don't say: by itself it decodes on the CPU, and stutters.
+const HWDEC: &str = "--hwdec=auto-safe";
+
+/// Whether mpv's config files leave hwdec out; `hwdec=no` is the user's choice. Asked once a run,
+/// in the background at the start or else when the first episode starts. No when mpv can't say.
+pub fn hwdec_unset() -> bool {
+    static UNSET: OnceLock<bool> = OnceLock::new();
+    *UNSET.get_or_init(|| config_leaves_hwdec(&|| Command::new("mpv")))
+}
+
+/// Asks with options mpv answers right after reading its config files, and then quits. So nothing
+/// in them starts: another mpv's control socket, a log or a stats file stay as they are, and the
+/// user's scripts don't run. Each profile is asked after, as -v only says what one sets once it
+/// applies, and the file played decides that. Only answers that show they're what was asked for
+/// count, so a changed mpv costs the default, never the user's choice. A built-in profile the user
+/// added to only counts once it's applied: by the config, which -v shows, or by a flag, which
+/// comes after ours.
+fn config_leaves_hwdec(mpv: &dyn Fn() -> Command) -> bool {
+    let ask = |args: &[&str]| {
+        let child = (mpv().args(args).stdin(Stdio::null()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .ok()?;
+        // one stuck on the config files mustn't outlive ani-hop
+        let _listed = Listed::on(&AHEAD, &child);
+        let out = wait_within(child, Duration::from_secs(5))?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let Some(said) = ask(&["-v", "--profile=help"]) else {
+        return false;
+    };
+    if !said.contains("Setting option 'profile' = 'help'") || config_may_set_hwdec(&said) {
+        return false;
+    }
+    let Some(builtin) = ask(&["--no-config", "--profile=help"]) else {
+        return false;
+    };
+    let builtin = profiles(&builtin);
+    if builtin.is_empty() {
+        return false;
+    }
+    let mut own = profiles(&said).into_iter().filter(|p| !builtin.contains(p));
+    own.all(|p| {
+        let shown = ask(&[&format!("--show-profile={p}")]);
+        shown.is_some_and(|shown| shown.starts_with("Profile ") && !profile_may_set_hwdec(&shown))
+    })
+}
+
+/// From `mpv -v`: hwdec itself, or a config next to each file, which only that file would show.
+fn config_may_set_hwdec(said: &str) -> bool {
+    (said.contains("Setting option 'hwdec' = "))
+        || said.contains("Setting option 'use-filedir-conf' = ")
+}
+
+/// The names in `mpv --profile=help`: "\tname\tdescription", after -v's prefix if it's there.
+fn profiles(list: &str) -> Vec<&str> {
+    list.lines()
+        .filter_map(|l| l.trim_start_matches("[cplayer] ").strip_prefix('\t'))
+        .filter_map(|l| l.split('\t').next())
+        .collect()
+}
+
+/// From `mpv --show-profile`, where `hwdec-codecs` is another option, and neither a file a profile
+/// includes nor the one next to each file played is shown.
+fn profile_may_set_hwdec(shown: &str) -> bool {
+    shown.lines().any(|l| {
+        let option = l.trim_start().split('=').next();
+        matches!(
+            option,
+            Some("hwdec" | "no-hwdec" | "include" | "use-filedir-conf")
+        )
+    })
+}
+
 /// ani-cli set up to take episode `ep` of `src` to the player (with ani-skip), and the file
 /// the player will read subtitles from, if ani-cli finds none.
 fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, Option<PathBuf>) {
@@ -887,6 +964,11 @@ fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, O
     // an mpv flag, other players ani-cli knows (vlc, syncplay) don't start with it
     if player.contains("mpv") && !subs(audio) {
         flags.push_str(" --sub-visibility=no");
+    }
+    // first, as the last flag wins and the user's own come after it. Another player has another
+    // config
+    if player == "mpv" && hwdec_unset() {
+        flags = format!("{HWDEC} {flags}");
     }
     let mut cli = ani_cli();
     let subs = subs_page(m, src, ep, dub(audio)).map(|page| {
@@ -1055,7 +1137,8 @@ pub fn play_held(held: &Held, mut up: impl FnMut()) -> Replayed {
 
 pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Result<(), String> {
     let mut mpv = Command::new("mpv");
-    mpv.arg(format!("--force-media-title={} Episode {ep}", m.name()));
+    mpv.arg(format!("--force-media-title={} Episode {ep}", m.name()))
+        .args(hwdec_unset().then_some(HWDEC));
     let vtt = file.with_extension("vtt");
     if vtt.exists() {
         mpv.arg(format!("--sub-file={}", vtt.display()));
@@ -1703,6 +1786,139 @@ fn left(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_names_are_read_with_and_without_vs_prefix() {
+        let plain = "Available profiles:\n\tfirst\t\n\tmy profile\tdescribed\n\nlast line\n";
+        assert_eq!(profiles(plain), ["first", "my profile"]);
+        let verbose = "[cplayer] Reading\n[cplayer] Available profiles:\n[cplayer] \tfirst\t\n";
+        assert_eq!(profiles(verbose), ["first"]);
+    }
+
+    #[test]
+    fn a_profile_setting_hwdec_counts_and_a_look_alike_does_not() {
+        for shown in [
+            "Profile a: \n hwdec=no\n",
+            "Profile a: \n no-hwdec=\n",
+            "Profile a: \n volume=9\n hwdec=auto\n",
+            "Profile a: \n profile=b\n  hwdec=auto\n",
+            "Profile a: \n include=/x.conf\n",
+            "Profile a: \n use-filedir-conf=yes\n",
+        ] {
+            assert!(profile_may_set_hwdec(shown), "{shown}");
+        }
+        for shown in ["Profile a: \n", "Profile a: \n hwdec-codecs=all\n"] {
+            assert!(!profile_may_set_hwdec(shown), "{shown}");
+        }
+    }
+
+    /// Ended whatever way the test goes.
+    struct Ends(Child);
+
+    impl Drop for Ends {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn mpv_itself_says_what_its_config_sets_and_nothing_in_it_starts() {
+        // mpv reads this config as well, and CI has no mpv
+        if !have("mpv") || Path::new("/etc/mpv/mpv.conf").exists() {
+            return;
+        }
+        // its questions are on AHEAD, which the tests of quitting end
+        let _turn = CLOSING.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("ani-hop-hwdec-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("mpv.conf");
+        let mpv = || {
+            let mut mpv = Command::new("mpv");
+            mpv.env("MPV_HOME", &dir);
+            mpv
+        };
+        for (config, leaves) in [
+            ("volume=80\n", true),
+            ("# hwdec=auto\n", true),
+            ("hwdec-codecs=all\n", true),
+            ("[extension.mkv]\nhwdec-codecs=all\n", true),
+            ("[fast]\nhwdec=no\n", true), // only once applied, and a flag comes after ours
+            ("really-quiet=yes\n", true),
+            ("msg-level=all=no\n", true),
+            ("hwdec=auto\n", false),
+            ("hwdec=no\n", false),
+            ("no-hwdec\n", false),
+            ("[extension.mkv]\nhwdec=no\n", false),
+            ("[extension.mkv]\nno-hwdec\n", false),
+            ("[protocol.https]\nhwdec=vaapi\n", false),
+            ("[c]\nprofile-cond=width>100\nhwdec=auto-copy\n", false),
+            ("[my profile]\nhwdec=auto\n", false),
+            ("[a]\nprofile=b\n[b]\nhwdec=auto\n", false),
+            ("really-quiet=yes\n[extension.mkv]\nhwdec=no\n", false),
+            ("msg-level=all=no\n[extension.mkv]\nhwdec=no\n", false),
+            ("[extension.mkv]\ninclude=/nowhere.conf\n", false),
+            ("use-filedir-conf=yes\n", false),
+            ("[extension.mkv]\nuse-filedir-conf=yes\n", false),
+            ("profile=fast\n[fast]\nhwdec=no\n", false),
+        ] {
+            fs::write(&conf, config).unwrap();
+            assert_eq!(config_leaves_hwdec(&mpv), leaves, "{config}");
+        }
+        // told to say less than -v, its answer doesn't show it's what was asked for
+        fs::write(&conf, "hwdec=no\n").unwrap();
+        let quiet = || {
+            let mut mpv = mpv();
+            mpv.env("MPV_VERBOSE", "-1");
+            mpv
+        };
+        assert!(!config_leaves_hwdec(&quiet));
+        // a profile mpv doesn't find, as a name with a tab in it would be
+        let tabbed = "[a\tb]\nhwdec=no\n";
+        fs::write(&conf, tabbed).unwrap();
+        assert!(!config_leaves_hwdec(&mpv), "{tabbed}");
+
+        // a config naming a control socket, a stats file and a script, with a profile that
+        // applies right away: the mpv already on that socket keeps it, and nothing else starts
+        let (socket, stats) = (dir.join("socket"), dir.join("stats"));
+        let (script, ran) = (dir.join("user.lua"), dir.join("ran"));
+        fs::write(
+            &script,
+            format!("io.open({:?}, 'w')\n", ran.display().to_string()),
+        )
+        .unwrap();
+        fs::write(
+            &conf,
+            format!(
+                "input-ipc-server={0}\ndump-stats={1}\nscript={2}\n[now]\nprofile-cond=true\ninput-ipc-server={0}\n",
+                socket.display(),
+                stats.display(),
+                script.display(),
+            ),
+        )
+        .unwrap();
+        let player = (mpv().args(["--idle=yes", "--force-window=no", "--no-input-terminal"]))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _player = Ends(player);
+        for _ in 0..100 {
+            if socket.exists() && ran.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(ran.exists(), "the script runs in a real player");
+        fs::remove_file(&ran).unwrap();
+        fs::write(&stats, "kept").unwrap();
+        assert!(config_leaves_hwdec(&mpv));
+        std::os::unix::net::UnixStream::connect(&socket).expect("the running mpv still answers");
+        assert_eq!(fs::read_to_string(&stats).unwrap(), "kept");
+        assert!(!ran.exists(), "the user's script didn't run");
+    }
 
     #[test]
     fn a_mise_install_updates_with_mise_and_keeps_its_ani_hop() {

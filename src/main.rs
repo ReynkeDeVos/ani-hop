@@ -615,6 +615,11 @@ impl App {
             app.spawn(move || Msg::Viewer(c.token.clone(), c.viewer()));
         }
         app.spawn(|| Msg::Release(newer_release().map(|v| (v, ani::update_command()))));
+        // so the first episode doesn't wait for it. Not without mpv: its answer lasts the run, and
+        // the setup screen may still install mpv
+        if ani::have("mpv") {
+            app.run(|| _ = ani::hwdec_unset());
+        }
         app
     }
 
