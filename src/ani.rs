@@ -73,6 +73,11 @@ esac
 case " $* " in
 *" --script-opts=skip-"*) set -- --script="${0%/*}/ani-hop-skip.lua" "$@" ;;
 esac
+# thumbfast makes its previews with an mpv of its own, which a stream refuses without the referrer.
+# Nothing reads this without thumbfast. Last, as a --script-opts= after it would undo it
+case " $* " in
+*" --referrer="*) set -- "$@" --script-opts-append=thumbfast-mpv_path="${0%/*}/ani-hop-thumb-mpv" ;;
+esac
 # fetched ahead: what mpv would start with goes in a file, for when the episode is wanted
 if [ -n "$ANIHOP_HOLD" ]; then
 	printf '%s\0' "$@" >"$ANIHOP_HOLD.$$" && mv -f "$ANIHOP_HOLD.$$" "$ANIHOP_HOLD"
@@ -81,6 +86,16 @@ fi
 PATH=${PATH#"${0%/*}:"}
 echo ani-hop-player-starts
 exec mpv "$@"
+"#;
+
+/// What thumbfast starts instead of mpv on a stream, told to by FAKE_MPV. The referrer comes from
+/// the arguments of the mpv that started it: a stream fetched ahead starts mpv without FAKE_MPV,
+/// and thumbfast clears the environment on a Mac, and did everywhere up to June 2026.
+/// shortcut: a `mpv_path` in thumbfast.conf goes unused on a stream; read it if someone has one
+const FAKE_THUMB_MPV: &str = r#"#!/bin/sh
+# ani-hop: thumbfast's mpv, with the referrer of the mpv it makes previews for
+referrer=$(ps -o args= -p "$PPID" 2>/dev/null | sed -n 's/.*--referrer=\([^ ]*\).*/\1/p')
+exec mpv ${referrer:+--referrer="$referrer"} "$@"
 "#;
 
 const FAKE_SKIP: &str = r#"#!/bin/sh
@@ -497,6 +512,7 @@ pub fn setup() -> std::io::Result<()> {
         ("rofi", FAKE_ROFI),
         ("ffmpeg", FAKE_FFMPEG),
         ("mpv", FAKE_MPV),
+        ("ani-hop-thumb-mpv", FAKE_THUMB_MPV),
         ("ani-skip", FAKE_SKIP),
         ("ani-hop-skip.lua", SKIP_SCRIPT),
         ("ani-hop-subs", FAKE_SUBS),
@@ -2345,9 +2361,71 @@ mod tests {
                 b"--referrer=https://a b/".as_slice(),
                 b"--title=It's \"one\"".as_slice(),
                 b"https://x/y".as_slice(),
+                // or an mpv started from these wouldn't get thumbfast the referrer
+                format!(
+                    "--script-opts-append=thumbfast-mpv_path={}",
+                    dir.join("ani-hop-thumb-mpv").display()
+                )
+                .as_bytes(),
             ]
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn thumbfasts_mpv_gets_the_referrer_of_the_mpv_it_makes_previews_for() {
+        // alone in a process: a script can't run while another test's fork still holds it open
+        // from being written ("Text file busy")
+        if std::env::var_os("ANIHOP_CHILD").is_none() {
+            let name =
+                "ani::tests::thumbfasts_mpv_gets_the_referrer_of_the_mpv_it_makes_previews_for";
+            assert!(crate::in_child(name, &[]));
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("ani-hop-thumb {}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let bin = dir.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let helper = dir.join("ani-hop-thumb-mpv");
+        let log = dir.join("log");
+        fs::write(&helper, FAKE_THUMB_MPV).unwrap();
+        fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+        let mpv = bin.join("mpv");
+        fs::write(&mpv, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$LOG\"\n").unwrap();
+        fs::set_permissions(&mpv, fs::Permissions::from_mode(0o755)).unwrap();
+        let sys = std::env::var("PATH").unwrap_or_default();
+        // what mpv got, when the helper is started by something with these arguments. `; :` so the
+        // shell stays around as its parent
+        let run = |main: &[&str]| {
+            let _ = fs::remove_file(&log);
+            let o = Command::new("sh")
+                .args(["-c", "\"$HELPER\" --no-config -- v.m3u8; :", "mpv"])
+                .args(main)
+                .env("HELPER", &helper)
+                .env("LOG", &log)
+                .env("PATH", format!("{}:{sys}", bin.display()))
+                .output()
+                .unwrap();
+            assert!(o.status.success() && o.stderr.is_empty(), "{o:?}");
+            fs::read_to_string(&log).unwrap()
+        };
+        let own = "--no-config\n--\nv.m3u8\n";
+        assert_eq!(
+            run(&[
+                "--referrer=https://r/",
+                "--force-media-title=A B Episode 1",
+                "v.m3u8"
+            ]),
+            format!("--referrer=https://r/\n{own}")
+        );
+        // the last one, as for mpv itself
+        assert_eq!(
+            run(&["--referrer=https://r/", "--referrer=https://s/", "v.m3u8"]),
+            format!("--referrer=https://s/\n{own}")
+        );
+        // no referrer: only what thumbfast asked for
+        assert_eq!(run(&["v.m3u8"]), own);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2858,17 +2936,27 @@ esac
 
         // no times, no script
         let (mpv, _, _) = run(&stream, None, all);
-        assert!(!mpv.contains("--script"));
+        assert!(!mpv.contains("--script="));
         // times from ani-cli: the script that acts on them, whatever its folder is called
         let timed = ["--script-opts=skip-op_start=1,skip-op_end=9", "v.m3u8"];
         let (mpv, _, _) = run(&timed, None, all);
         let script = format!("--script={}", fake.join("ani-hop-skip.lua").display());
         assert_eq!(mpv, format!("{script}\n{}\n", timed.join("\n")));
 
+        // a referrer: thumbfast's mpv gets told to go through the helper, after the times' flag,
+        // which replaces every script option before it
+        let thumbs = format!(
+            "--script-opts-append=thumbfast-mpv_path={}\n",
+            fake.join("ani-hop-thumb-mpv").display()
+        );
+        let timed = ["--referrer=r", timed[0], "v.m3u8"];
+        let (mpv, _, _) = run(&timed, None, all);
+        assert_eq!(mpv, format!("{script}\n{}\n{thumbs}", timed.join("\n")));
+
         // it's there: mpv gets the English file, with its other arguments as they were
         let (mpv, curl, got) = run(&stream, page, all);
         let sub_file = format!("--sub-file={}\n", file.display());
-        assert_eq!(mpv, format!("{sub_file}{}\n", stream.join("\n")));
+        assert_eq!(mpv, format!("{sub_file}{}\n{thumbs}", stream.join("\n")));
         assert_eq!(got.as_deref(), Some(VTT));
         assert!(curl.contains("getSources?id=12763") && curl.contains("https://h/eng.vtt"));
         assert!(
