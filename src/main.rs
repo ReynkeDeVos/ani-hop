@@ -240,8 +240,6 @@ pub struct App {
     pub release: Option<(String, String)>,
     /// a newer ani-cli release is out
     pub ani_cli_newer: bool,
-    /// the versions in the footer have made way, for good
-    pub versions_over: bool,
     /// shell command to run in the real terminal (TUI paused), e.g. installing packages
     external: Option<String>,
     /// asked for on a show's page while ani-cli searched, waiting to get back to that page
@@ -560,7 +558,6 @@ impl App {
             ani_cli: None,
             release: None,
             ani_cli_newer: false,
-            versions_over: false,
             external: None,
             parked: None,
             marking: None,
@@ -1043,8 +1040,6 @@ impl App {
         self.scan_local();
         let menu = Menu::new(self.items(&view), multi);
         self.next_id += 1;
-        // here, not when drawing: keys can open a screen and leave it between two frames
-        self.versions_over |= !self.stack.is_empty();
         self.stack.push(Screen {
             id: self.next_id,
             title: title.into(),
@@ -4100,7 +4095,7 @@ mod tests {
     }
 
     #[test]
-    fn the_main_menu_says_the_versions_until_anything_else_is_there() {
+    fn the_main_menu_says_the_versions_unless_anything_else_is_there() {
         let foot = |app: &mut App, w| screen(app, w, 24).lines().last().unwrap().to_string();
         let me = env!("CARGO_PKG_VERSION");
         let with_versions = || {
@@ -4129,29 +4124,20 @@ mod tests {
         let narrowest = foot(&mut app, 28);
         assert!(!narrowest.contains(me), "{narrowest}");
 
-        // moving along the main menu leaves them; going in and coming back ends them
+        // moving along the main menu leaves them; other screens don't have them, till it's back
         press(&mut app, KeyCode::Down);
         assert!(foot(&mut app, 80).starts_with(&all));
         app.push("Search", View::Settings);
         assert!(!foot(&mut app, 80).contains(me));
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.stack.len(), 1);
-        assert!(!foot(&mut app, 80).contains(me));
-
-        // also between two frames, as keys can come in faster than those
-        let mut app = with_versions();
-        app.push("Search", View::Settings);
-        press(&mut app, KeyCode::Esc);
-        assert_eq!(app.stack.len(), 1);
-        assert!(!foot(&mut app, 80).contains(me));
-
-        // and so does anything else in their place, also once it's gone
-        let mut app = with_versions();
         assert!(foot(&mut app, 80).starts_with(&all));
+
+        // anything else goes over them, until it's faded
         app.toast("Saved", false);
         assert!(foot(&mut app, 80).starts_with(" Saved"));
-        app.toast = None;
-        assert!(!foot(&mut app, 80).contains(me));
+        app.toast.as_mut().unwrap().2 -= Duration::from_secs(5);
+        assert!(foot(&mut app, 80).starts_with(&all));
 
         // not by color alone; only ani-hop's says how, as ani-cli has too many ways to update
         let mut app = with_versions();

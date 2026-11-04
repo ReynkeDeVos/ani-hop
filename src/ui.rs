@@ -38,11 +38,6 @@ pub fn render(app: &mut App, f: &mut Frame) {
     if let Some(right) = right {
         preview(app, f, right);
     }
-    // the versions are only for a look at the start: anything else in their place ends them
-    app.versions_over = app.versions_over
-        || app.toast.is_some()
-        || app.playback.now().is_some()
-        || app.downloads.snapshot().pending > 0;
     footer(app, f, foot);
     starting(app, f);
     boot(app, f.buffer_mut());
@@ -899,7 +894,8 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
                 Span::styled(fit(tail, room), DIM),
             ])
         }
-        _ if !app.versions_over => {
+        // only with nothing else to say, and only on the main menu
+        _ if app.stack.len() == 1 => {
             versions(app, (area.width as usize).saturating_sub(hints.width() + 1))
         }
         _ => Line::default(),
