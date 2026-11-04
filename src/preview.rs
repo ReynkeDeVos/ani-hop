@@ -11,7 +11,7 @@ use crate::kitty::{self, Posters};
 use crate::list_label;
 use crate::progress::Progress;
 use crate::source::Source;
-use crate::ui::{ACCENT, DIM, MATCH, SOFT, hex, swept};
+use crate::ui::{ACCENT, DIM, MATCH, SOFT, cover_color, swept};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -34,6 +34,8 @@ pub struct Shown<'a> {
     pub on_disk: usize,
     /// what the episode is called and about, as ani.zip has it
     pub info: Option<&'a EpInfo>,
+    /// `ep` is the one to watch next, not one the cursor is on
+    pub next: bool,
 }
 
 /// What the Preview says, before it's laid out.
@@ -88,6 +90,10 @@ pub fn page(s: &Shown) -> Page {
         Some(Line::styled(line, Color::Green))
     };
     lines.extend(status(m));
+    // right under how far it got, as a heading over the description would read as its summary
+    if let Some(ep) = ep.filter(|_| s.next) {
+        lines.push(Line::styled(format!("▶ Next: episode {ep}"), ACCENT));
+    }
     // the provider's episodes past the show's own count toward a sequel on AniList; an
     // episode list says so with a rule between them (ui::menu)
     let parts = if ep.is_none() {
@@ -134,17 +140,17 @@ pub fn page(s: &Shown) -> Page {
         lines.extend(line.map(|l| Line::styled(l, DIM)));
     }
     let mut about = String::new();
-    if let Some(ep) = ep {
+    if let Some(ep) = ep.filter(|_| !s.next)
+        && let Some(i) = s.info
+    {
         lines.push("".into());
-        let told = s.info.map(|i| i.told(s.progress.watched(ep)));
-        let (title, summary) = told.unwrap_or_default();
+        let (title, summary) = i.told(s.progress.watched(ep));
         let heading = match title {
             "" => format!("Episode {ep}"),
             title => format!("Episode {ep} · {title}"),
         };
         lines.push(Line::styled(heading, Style::new().bold()));
-        let aired = s.info.and_then(|i| i.aired.as_deref());
-        if let Some(d) = aired.filter(|d| !d.is_empty()) {
+        if let Some(d) = i.aired.as_deref().filter(|d| !d.is_empty()) {
             lines.push(Line::styled(format!("aired {}", day(d)), DIM));
         }
         about = summary.to_string();
@@ -162,9 +168,7 @@ pub fn page(s: &Shown) -> Page {
 
 /// The cover's dominant color, for the title and while the poster loads.
 fn accent(m: &Media) -> Color {
-    (m.cover_image.color.as_deref())
-        .and_then(hex)
-        .unwrap_or(ACCENT)
+    cover_color(m.cover_image.color.as_deref())
 }
 
 pub struct Preview {
@@ -583,6 +587,7 @@ mod tests {
                 source: None,
                 on_disk: 0,
                 info: Some(&info),
+                next: false,
             });
             let head: Vec<String> = p.head.iter().map(Line::to_string).collect();
             (head, p.about)

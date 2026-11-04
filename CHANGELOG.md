@@ -4,7 +4,7 @@
 
 ### Added
 
-- The Continue row shows its show beside the menu: the poster, your progress, the next episode and the description. Any other row shows the keys, as before. A notice about a new ani-hop shows above the poster too.
+- The Continue row shows its show beside the menu: the poster, your progress, the next episode and the description. Any other row shows the keys and, with a new ani-hop out, how to update, as before.
 
 ### Changed
 
@@ -14,12 +14,13 @@
 - Both panels have the same padding, so a poster starts on the search prompt's row, and a show's page has two more columns and two more rows for its text. The logo gets a blank row above it.
 - On a wide window the list stops at about 60 columns, so what a row says on its right stays close to its name, and the preview gets the rest. A show's page stops at 110 columns, so its text stays easy to read.
 - The key list starts under the logo instead of six columns in. The filter hint says `'exact` instead of `'word`, like the rest of that line, which names what each one does. `→` lists `^l` only, as the footer already says enter.
-- Prompts no longer have a label before `❯`, as the top line and the help say what they ask for. Typing starts in the same place on every prompt.
+- Prompts no longer have a label before `❯`, as the top line and the help say what they ask for. Typing starts in the same place on every prompt. The login's top line says "AniList client ID" and "AniList token".
 - Clearer help on a few screens, such as "Empty resets to ~/Videos/Anime" instead of "Empty goes back to".
 
 ### Fixed
 
 - A message too long for the bottom line now ends in `…` instead of being cut off mid-word.
+- A show whose cover color is too dark to read gets the theme's color for its title.
 
 ## 0.10.6 – 2026-11-04
 

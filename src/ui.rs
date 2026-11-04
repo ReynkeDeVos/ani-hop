@@ -57,11 +57,7 @@ fn starting(app: &App, f: &mut Frame) {
     let Some((p, step)) = app.playback.now().and_then(|p| Some((p, p.step?))) else {
         return;
     };
-    // the cover color, unless it's too dark to see
-    let color = match p.color.as_deref().and_then(hex) {
-        Some(Color::Rgb(r, g, b)) if r as u16 + g as u16 + b as u16 > 180 => Color::Rgb(r, g, b),
-        _ => ACCENT,
-    };
+    let color = cover_color(p.color.as_deref());
     // grows out of the middle, fast at first
     let t = (p.since.elapsed().as_millis() as f32 / POP_MS as f32).min(1.0);
     let grow = 1.0 - (1.0 - t).powi(3);
@@ -464,7 +460,8 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                     _ => width - 2,
                 });
             spans.extend(row_label(&item.label, hits, plain, room));
-            if let Some(play) = spans.get_mut(2).filter(|_| hero) {
+            // only under the cursor: elsewhere it would pass for one
+            if let Some(play) = spans.get_mut(2).filter(|_| hero && selected == Some(k)) {
                 play.style = ACCENT.into();
             }
             let mut used: usize = spans.iter().map(|s| s.width()).sum();
@@ -609,7 +606,6 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
     let inner = panel_inner(area);
     f.render_widget(panel(), area);
     let screen = app.stack.last().unwrap();
-    let main = matches!(screen.view, View::Main);
     let media = match &screen.view {
         View::Shows(list) => screen
             .menu
@@ -670,18 +666,9 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             source: app.sources.get(m.id),
             on_disk: app.local.get(&m.id).map_or(0, Vec::len),
             info: ep.as_deref().and_then(|ep| app.ep_about(&m, ep)),
+            next: matches!(screen.view, View::Main),
         });
-        // the Continue row's page has the start panel's place, so its notice stays on screen
-        let mut pane = inner;
-        if let Some(notice) = release_notice(app).filter(|_| main) {
-            let notice = Paragraph::new(notice).wrap(Wrap { trim: false });
-            let rows = notice.line_count(inner.width) as u16 + 1; // and a blank one
-            let [top, rest] =
-                Layout::vertical([Constraint::Length(rows), Constraint::Fill(1)]).areas(inner);
-            f.render_widget(notice, top);
-            pane = rest;
-        }
-        return app.preview.draw(&page, &ahead, f, area, pane);
+        return app.preview.draw(&page, &ahead, f, area, inner);
     }
     let lines: Vec<Line> = match &screen.view {
         View::Bulk(list) => list
@@ -817,15 +804,6 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v
 }
 
-/// That a newer ani-hop is out, and how to get it.
-fn release_notice(app: &App) -> Option<Line<'static>> {
-    let (new, cmd) = app.release.as_ref()?;
-    Some(Line::styled(
-        format!("↑ ani-hop {new} is out: {cmd}"),
-        ACCENT,
-    ))
-}
-
 /// The start panel in `area`: the logo only where everything else fits under it, as a short
 /// screen keeps an update notice (two or three rows at 80 columns) and every key instead.
 fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
@@ -842,7 +820,13 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
             Span::styled(also, DIM),
         ])
     };
-    let mut v: Vec<Line> = release_notice(app).into_iter().collect();
+    let mut v = Vec::new();
+    if let Some((new, cmd)) = &app.release {
+        v.push(Line::styled(
+            format!("↑ ani-hop {new} is out: {cmd}"),
+            ACCENT,
+        ));
+    }
     // on an input typing is the text itself; on an empty list only esc and ^c do something.
     // Only what nothing else says: the footer and the preview's border name the other keys
     // where they work
@@ -1085,6 +1069,14 @@ fn fit_start(s: &str, room: usize) -> String {
         used += width(graphemes[start]);
     }
     format!("…{}", graphemes[start..].concat())
+}
+
+/// A show's cover color (`#rrggbb`), unless it's too dark to see.
+pub fn cover_color(color: Option<&str>) -> Color {
+    match color.and_then(hex) {
+        Some(Color::Rgb(r, g, b)) if r as u16 + g as u16 + b as u16 > 180 => Color::Rgb(r, g, b),
+        _ => ACCENT,
+    }
 }
 
 pub fn hex(s: &str) -> Option<Color> {

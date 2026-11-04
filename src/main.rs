@@ -2036,14 +2036,14 @@ impl App {
     /// until another one is entered.
     fn ask_client_id(&mut self) {
         open_url("https://anilist.co/settings/developer");
-        self.push("AniList setup", View::Input(Input::ClientId));
+        self.push("AniList client ID", View::Input(Input::ClientId));
     }
 
     fn start_auth(&mut self, client_id: &str) {
         open_url(&format!(
             "https://anilist.co/api/v2/oauth/authorize?client_id={client_id}&response_type=token"
         ));
-        self.push("AniList login", View::Input(Input::Token));
+        self.push("AniList token", View::Input(Input::Token));
     }
 
     fn submit(&mut self, input: Input, text: String) {
@@ -4090,7 +4090,7 @@ mod tests {
         assert!(row.contains("ep 13"), "{at_80}");
         assert!(row.contains('…'), "{at_80}");
         // what it plays beside it
-        assert!(at_80.contains("Episode 13"), "{at_80}");
+        assert!(at_80.contains("▶ Next: episode 13"), "{at_80}");
         // and with room it says what it does
         let short = show(50_331, 28, Some(12));
         let mut roomy = app_going_on(Some(short), Vec::new());
@@ -4167,14 +4167,19 @@ mod tests {
         let mut app = app_going_on(Some(watched), Vec::new());
         // the poster's show and next episode, instead of the keys
         let drawn = screen(&mut app, 120, 30);
-        assert!(drawn.contains("Episode 4"), "{drawn}");
+        assert!(drawn.contains("▶ Next: episode 4"), "{drawn}");
         assert!(drawn.contains("What the show is about."), "{drawn}");
         assert!(!drawn.contains("filter the list"), "{drawn}");
-        // a new version says so here too, once
+        // a new version only says how on the start panel; the bottom line says it's out on both
         app.release = Some(("99.0.0".into(), "brew upgrade ani-hop".into()));
         let drawn = screen(&mut app, 120, 30);
+        assert!(!drawn.contains("is out: brew"), "{drawn}");
+        assert!(drawn.contains("↑ (99.0.0 is out)"), "{drawn}");
+        press(&mut app, KeyCode::Down);
+        let drawn = screen(&mut app, 120, 30);
         assert!(drawn.contains("↑ ani-hop 99.0.0 is out: brew"), "{drawn}");
-        assert!(drawn.contains("Episode 4"), "{drawn}");
+        assert!(drawn.contains("↑ (99.0.0 is out)"), "{drawn}");
+        press(&mut app, KeyCode::Up);
         app.release = None;
 
         // it stands out, and Quit steps back
@@ -4205,7 +4210,13 @@ mod tests {
         press(&mut app, KeyCode::Down);
         let drawn = screen(&mut app, 120, 30);
         assert!(drawn.contains("filter the list"), "{drawn}");
-        assert!(!drawn.contains("Episode 4"), "{drawn}");
+        assert!(!drawn.contains("Next: episode 4"), "{drawn}");
+        // and its marker no longer passes for the cursor
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui::render(&mut app, f)).unwrap();
+        let buf = term.backend().buffer();
+        let play = (0..120).find(|&x| buf[(x, 4)].symbol() == "▶").unwrap();
+        assert_ne!(buf[(play, 4)].fg, ui::ACCENT);
     }
 
     #[test]
