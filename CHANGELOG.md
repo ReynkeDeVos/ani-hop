@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.7 – 2026-11-04
+
+### Removed
+
+- ani-hop no longer passes anything to mpv's thumbfast script, so the previews on streamed episodes from 0.10.6 are gone. They froze on one picture while you moved the mouse, and each spot you stopped on downloaded several MB. If you set `network=yes` in thumbfast's own config for them, set it back to `no`, or hovering the timeline on a stream shows an empty box. Downloaded episodes keep their previews.
+
 ## 0.10.6 – 2026-11-04
 
 ### Changed
