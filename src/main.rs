@@ -788,6 +788,13 @@ impl App {
         (last.chain(watching)).find_map(|m| self.progress(m).next_out().map(|ep| (m, ep)))
     }
 
+    /// The show on the Continue row with this `key`, whatever would go there by now.
+    pub fn on_continue_row(&self, key: &str) -> Option<&Media> {
+        let id = key.strip_prefix("continue:")?;
+        let watching = self.watching.iter().flat_map(|l| &l.shows);
+        (self.last_played.iter().chain(watching)).find(|m| m.id.to_string() == id)
+    }
+
     /// Enter on the Continue row: `m`'s page, and its next episode as enter there plays it.
     fn go_on_with(&mut self, m: Media) {
         self.open_show(m);
@@ -1252,6 +1259,8 @@ impl App {
                     // all a row has room for beside a title at 80 columns, so no word in the label
                     it.short = format!("ep {ep}");
                     it.about = "continue".into();
+                    // a rule of its own under it: it's what this menu is for
+                    it.group = "continue".into();
                     v.push(it);
                 }
                 // what you're watching goes first; then finding something new
@@ -1943,11 +1952,8 @@ impl App {
 
     fn main_action(&mut self, key: &str, label: &str) {
         let c = self.client.clone();
-        // the show on the row, whatever would go there by now
-        if let Some(id) = key.strip_prefix("continue:") {
-            let watching = self.watching.iter().flat_map(|l| &l.shows);
-            let m = (self.last_played.iter().chain(watching)).find(|m| m.id.to_string() == id);
-            if let Some(m) = m.cloned() {
+        if key.starts_with("continue:") {
+            if let Some(m) = self.on_continue_row(key).cloned() {
                 self.go_on_with(m);
             }
             return;
@@ -2030,14 +2036,14 @@ impl App {
     /// until another one is entered.
     fn ask_client_id(&mut self) {
         open_url("https://anilist.co/settings/developer");
-        self.push("AniList setup", View::Input(Input::ClientId));
+        self.push("AniList client ID", View::Input(Input::ClientId));
     }
 
     fn start_auth(&mut self, client_id: &str) {
         open_url(&format!(
             "https://anilist.co/api/v2/oauth/authorize?client_id={client_id}&response_type=token"
         ));
-        self.push("AniList login", View::Input(Input::Token));
+        self.push("AniList token", View::Input(Input::Token));
     }
 
     fn submit(&mut self, input: Input, text: String) {
@@ -4083,8 +4089,8 @@ mod tests {
         let row = at_80.lines().find(|l| l.contains('▶')).unwrap();
         assert!(row.contains("ep 13"), "{at_80}");
         assert!(row.contains('…'), "{at_80}");
-        // the start panel stays: a new release is said there
-        assert!(at_80.contains("filter the list"), "{at_80}");
+        // what it plays beside it
+        assert!(at_80.contains("▶ Next: episode 13"), "{at_80}");
         // and with room it says what it does
         let short = show(50_331, 28, Some(12));
         let mut roomy = app_going_on(Some(short), Vec::new());
@@ -4095,8 +4101,154 @@ mod tests {
     }
 
     #[test]
+    fn the_screen_shares_its_edges() {
+        let mut app = app();
+        app.user = Some((1, "RenkeB".into()));
+        app.ani_cli = Some("5.1.6".into());
+        app.top().menu.edit(|q| *q = "wat".into());
+        let drawn = screen(&mut app, 120, 30);
+        let lines: Vec<&str> = drawn.lines().collect();
+        let (top, foot) = (lines[0], lines[29]);
+        // the column `text` starts at, and the one it ends at
+        let start = |line: &str, text: &str| line.find(text).map(|at| line[..at].chars().count());
+        let end = |line: &str, text: &str| start(line, text).unwrap() + text.chars().count() - 1;
+
+        // the left edge's text
+        let edge = Some(2);
+        assert_eq!(start(lines[2], "❯"), edge, "{}", lines[2]);
+        assert_eq!(start(lines[3], "2/13"), edge, "{}", lines[3]);
+        assert_eq!(start(foot, "ani-hop"), edge, "{foot}");
+        // what's typed starts where the rows' labels do
+        assert_eq!(start(lines[2], "wat"), Some(5), "{}", lines[2]);
+        assert_eq!(start(lines[4], "Watching"), Some(5), "{}", lines[4]);
+        // the right edge's text
+        assert_eq!(end(top, "RenkeB"), 117, "{top}");
+        assert_eq!(end(foot, "quit"), 117, "{foot}");
+
+        // the panels share their inset, and the logo gets a blank row more than text
+        let right = start(lines[1], "╮╭").unwrap() + 1;
+        assert_eq!(start(lines[3], "▄▀█"), Some(right + 2), "{}", lines[3]);
+        // and the key table starts under the logo, at its widest key
+        let keys = lines
+            .iter()
+            .find(|l| l.contains("filter the list"))
+            .unwrap();
+        assert_eq!(start(keys, "type"), Some(right + 2), "{keys}");
+
+        // a message too long beside the keys ends on the right edge too, and says it's cut
+        app.toast("too long ".repeat(20), true);
+        let drawn = screen(&mut app, 120, 30);
+        let foot = drawn.lines().last().unwrap().trim_end();
+        assert_eq!(
+            (foot.chars().count(), foot.chars().last()),
+            (118, Some('…'))
+        );
+
+        // the main menu has no tag; from there on its fill starts on the border's line, in the
+        // middle of the column, and its name on the left edge
+        assert!(!top.contains("ani-hop"), "{top}");
+        // every prompt is alike: the top line and the help say what it asks for
+        app.push("Download folder", View::Input(Input::DownloadDir));
+        app.top().menu.edit(|q| *q = "~/x".into());
+        let drawn = screen(&mut app, 120, 30);
+        let lines: Vec<&str> = drawn.lines().collect();
+        assert!(lines[0].starts_with('▐'), "{}", lines[0]);
+        assert!(lines[1].starts_with('╭'), "{}", lines[1]);
+        assert_eq!(start(lines[0], "ani-hop"), edge, "{}", lines[0]);
+        assert_eq!(start(lines[2], "❯"), edge, "{}", lines[2]);
+        assert_eq!(start(lines[2], "~/x"), Some(5), "{}", lines[2]);
+        assert_eq!(start(lines[3], "─"), edge, "{}", lines[3]);
+    }
+
+    #[test]
+    fn the_main_menu_shows_what_its_continue_row_plays() {
+        let mut watched = show(50_400, 12, Some(3));
+        watched.description = Some("What the show is about.".into());
+        let mut app = app_going_on(Some(watched), Vec::new());
+        // the poster's show and next episode, instead of the keys
+        let drawn = screen(&mut app, 120, 30);
+        assert!(drawn.contains("▶ Next: episode 4"), "{drawn}");
+        assert!(drawn.contains("What the show is about."), "{drawn}");
+        assert!(!drawn.contains("filter the list"), "{drawn}");
+        // a new version only says how on the start panel; the bottom line says it's out on both
+        app.release = Some(("99.0.0".into(), "brew upgrade ani-hop".into()));
+        let drawn = screen(&mut app, 120, 30);
+        assert!(!drawn.contains("is out: brew"), "{drawn}");
+        assert!(drawn.contains("↑ (99.0.0 is out)"), "{drawn}");
+        press(&mut app, KeyCode::Down);
+        let drawn = screen(&mut app, 120, 30);
+        assert!(drawn.contains("↑ ani-hop 99.0.0 is out: brew"), "{drawn}");
+        assert!(drawn.contains("↑ (99.0.0 is out)"), "{drawn}");
+        press(&mut app, KeyCode::Up);
+        app.release = None;
+
+        // it stands out, and Quit steps back
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui::render(&mut app, f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let line = |y: u16| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        let cell = |row: &str, glyph: &str| {
+            let y = (0..30).find(|&y| line(y).contains(row)).unwrap();
+            let x = (0..120).find(|&x| buf[(x, y)].symbol() == glyph).unwrap();
+            buf[(x, y)].clone()
+        };
+        assert_eq!(cell("▶  Show", "▶").fg, ui::ACCENT);
+        assert_eq!(cell("continue episode 4", "4").fg, ui::ACCENT);
+        assert!(
+            cell("Quit", "Q")
+                .modifier
+                .contains(ratatui::style::Modifier::DIM)
+        );
+        // under a rule of its own, which doesn't cost a screen of 24 rows any row
+        let drawn = screen(&mut app, 80, 24);
+        let rows: Vec<&str> = drawn.lines().collect();
+        assert!(rows[5].contains("───"), "{drawn}");
+        assert!(rows[6].contains("Watching"), "{drawn}");
+        assert!(drawn.contains("Quit"), "{drawn}");
+
+        // any other row has the keys again, and the show's gone
+        press(&mut app, KeyCode::Down);
+        let drawn = screen(&mut app, 120, 30);
+        assert!(drawn.contains("filter the list"), "{drawn}");
+        assert!(!drawn.contains("Next: episode 4"), "{drawn}");
+        // and its marker no longer passes for the cursor
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui::render(&mut app, f)).unwrap();
+        let buf = term.backend().buffer();
+        let play = (0..120).find(|&x| buf[(x, 4)].symbol() == "▶").unwrap();
+        assert_ne!(buf[(play, 4)].fg, ui::ACCENT);
+    }
+
+    #[test]
+    fn on_a_wide_screen_the_list_stops_growing_and_a_page_stays_readable() {
+        let mut m = show(50_401, 12, None);
+        m.description = Some("word ".repeat(400));
+        let mut app = app();
+        app.open_show(m);
+        let drawn = screen(&mut app, 260, 40);
+        let top = drawn.lines().nth(1).unwrap();
+        let left = top.find("╮╭").map(|at| top[..at].chars().count() + 1);
+        assert_eq!(left, Some(64), "{top}");
+        // nothing of the page past its width, in a preview far wider
+        let past = 64 + 2 + 110;
+        for line in drawn.lines().skip(2).take(36) {
+            let text: String = line.chars().skip(past).take(260 - past - 2).collect();
+            assert_eq!(text.trim(), "", "{line}");
+        }
+        // and narrower screens keep their 42%
+        let mut width = |w: u16| {
+            let drawn = screen(&mut app, w, 24);
+            let top = drawn.lines().nth(1).unwrap().to_string();
+            top.find("╮╭").map(|at| top[..at].chars().count() + 1)
+        };
+        assert_eq!(width(80), Some(34));
+        assert_eq!(width(120), Some(50));
+    }
+
+    #[test]
     fn the_main_menu_says_the_versions_unless_anything_else_is_there() {
-        let foot = |app: &mut App, w| screen(app, w, 24).lines().last().unwrap().to_string();
+        // what it says, past the column every line of it keeps free
+        let foot = |app: &mut App, w| screen(app, w, 24).lines().last().unwrap()[1..].to_string();
         let me = env!("CARGO_PKG_VERSION");
         let with_versions = || {
             let mut app = app();
@@ -4109,8 +4261,11 @@ mod tests {
         // nothing up top, where the name is whole or not there
         let top = |app: &mut App, w| screen(app, w, 24).lines().next().unwrap().to_string();
         assert!(!top(&mut app, 80).contains(me));
-        assert!(top(&mut app, 19).starts_with(" ani-hop "));
-        assert!(!top(&mut app, 18).contains("ani"));
+        assert!(!top(&mut app, 80).contains("ani"), "not on the main menu");
+        app.push("Settings", View::Settings);
+        assert!(top(&mut app, 22).starts_with("▐ ani-hop ▌"));
+        assert!(!top(&mut app, 21).contains("ani"));
+        press(&mut app, KeyCode::Esc);
 
         // less room: only ani-hop, then only its number, then nothing
         let narrow = foot(&mut app, 50);
@@ -4148,7 +4303,7 @@ mod tests {
         let drawn = screen(&mut app, 80, 24);
         let marked = format!(" ani-hop {me} ↑ (99.0.0) · ani-cli 5.1.6 ↑ (5.2)");
         assert!(
-            drawn.lines().last().unwrap().starts_with(&marked),
+            drawn.lines().last().unwrap()[1..].starts_with(&marked),
             "{drawn}"
         );
         assert!(drawn.contains("↑ ani-hop 99.0.0 is out"), "{drawn}");
@@ -4156,7 +4311,7 @@ mod tests {
         // with less room what's out goes before the number does
         assert!(foot(&mut app, 60).starts_with(&format!(" ani-hop {me} ↑ (99.0.0 is out) ")));
         assert!(foot(&mut app, 50).starts_with(&format!(" {me} ↑ (99.0.0 is out) ")));
-        assert!(foot(&mut app, 35).starts_with(&format!(" {me}     ")));
+        assert!(foot(&mut app, 35).starts_with(&format!(" {me}    ")));
         assert!(!foot(&mut app, 28).contains(me));
         // one update fits at 80 columns with its words
         app.release = None;
@@ -4167,7 +4322,7 @@ mod tests {
         term.draw(|f| ui::render(&mut app, f)).unwrap();
         let buf = term.backend().buffer();
         let bright: String = (0..marked.chars().count() as u16)
-            .map(|x| &buf[(x, 23)])
+            .map(|x| &buf[(x + 1, 23)])
             .filter(|cell| cell.fg == ui::ACCENT)
             .map(|cell| cell.symbol())
             .collect();
