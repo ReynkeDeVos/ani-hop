@@ -342,9 +342,6 @@ pub fn install_command(pkgs: &[&str]) -> Option<String> {
     (have("brew") && !brew.is_empty()).then(|| format!("{tap}brew install {}", brew.join(" ")))
 }
 
-/// The ani-cli ani-hop was tested with; older ones scrape a source that changed.
-pub const TESTED_ANI_CLI: &str = "5.1";
-
 /// The installed ani-cli's version.
 pub fn ani_cli_version() -> Option<String> {
     let out = Command::new("ani-cli")
@@ -382,24 +379,6 @@ fn from_brew(p: &Path) -> bool {
 fn from_mise(p: &Path) -> bool {
     p.components()
         .any(|c| c.as_os_str() == "github-reynke-de-vos-ani-hop")
-}
-
-/// How to update ani-cli, judged by where it lives (None: only its package manager knows).
-pub fn ani_cli_update() -> Option<String> {
-    let path = located("ani-cli")?;
-    if from_brew(&path) {
-        return Some("brew upgrade ani-cli".into()); // before -U: brew's files are ours too
-    }
-    if fs::OpenOptions::new().append(true).open(&path).is_ok() {
-        return Some("ani-cli -U".into()); // patches its own file, so only where we may write
-    }
-    if aur_helper().is_some() && have("pacman") {
-        return Some(system_update());
-    }
-    // a distro's old copy: install.sh (or brew, for a brew ani-hop) puts a fresh one first
-    (!path.starts_with("/nix"))
-        .then(|| install_command(&["ani-cli"]))
-        .flatten()
 }
 
 /// The system update that takes AUR packages along. Omarchy wants its own and refuses a
@@ -2405,9 +2384,11 @@ mod tests {
     #[test]
     fn compares_versions_number_by_number() {
         assert!(older("4.10", "5.1"));
-        assert!(older("5.0.2", TESTED_ANI_CLI));
-        assert!(!older("5.1.5", TESTED_ANI_CLI));
-        assert!(!older("5.1", TESTED_ANI_CLI));
+        assert!(older("5.0.2", "v5.1"));
+        assert!(older("5.1.6", "v5.2"));
+        assert!(!older("5.1.0", "v5.1"));
+        // ahead of the latest tag, as from master: no update to show
+        assert!(!older("5.1.6", "v5.1"));
         assert!(older("0.5.0", "v0.6.0"));
         assert!(!older("0.10.0", "v0.9.1"));
         // no release yet: /releases/latest points at /releases

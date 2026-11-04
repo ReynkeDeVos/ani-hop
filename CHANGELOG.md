@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.10 – 2026-11-04
+
+### Removed
+
+- ani-hop no longer checks which ani-cli version you have. Below 5.1 it opened the setup screen on every start, but a version number can't tell whether ani-cli still works, as the sites it uses change. It still checks that ani-cli is installed, and the install script still replaces a package older than 5.1. The bottom line still shows `↑` when ani-cli has a newer release, and not when yours is ahead of it.
+
 ## 0.10.8 – 2026-11-04
 
 ### Added
