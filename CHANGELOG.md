@@ -17,6 +17,10 @@
 - Prompts no longer have a label before `❯`, as the top line and the help say what they ask for. Typing starts in the same place on every prompt. The login's top line says "AniList client ID" and "AniList token".
 - Clearer help on a few screens, such as "Empty resets to ~/Videos/Anime" instead of "Empty goes back to".
 
+### Removed
+
+- ani-hop no longer passes anything to mpv's thumbfast script, so the previews on streamed episodes from 0.10.6 are gone. They froze on one picture while you moved the mouse, and each spot you stopped on downloaded several MB. If you set `network=yes` in thumbfast's own config for them, set it back to `no`, or hovering the timeline on a stream shows an empty box. Downloaded episodes keep their previews.
+
 ### Fixed
 
 - A message too long for the bottom line now ends in `…` instead of being cut off mid-word.
