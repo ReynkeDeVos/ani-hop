@@ -4,14 +4,16 @@
 
 A fast terminal UI for anime: find a show, then stream or download it through [ani-cli](https://github.com/pystardust/ani-cli).
 
-- **No scraper of its own.** Every source comes from `ani-cli`, which a large community keeps working on. When a site changes, updating `ani-cli` is enough. One small exception: if `ani-cli` finds no subtitles for an episode, ani-hop gets English fallback subtitles itself.
-- **Posters in the terminal.** In Ghostty and kitty, even inside tmux/herdr, though slower there.
-- **AniList built in.** Your lists, with watched episodes marked. The main menu's first row plays your next episode. After each episode it asks to save your progress, and "Watched up to…" sets it for many episodes at once, or back to none.
-- **Jump to related seasons and shows.** A show's page lists its seasons in story order, then its movies, OVAs and side stories.
-- **Find an episode by what happens in it.** The filter searches the titles and summaries of watched episodes. Unwatched ones stay blank, so nothing spoils.
-- **Downloads in the background.** Pause them or quit; unfinished ones come back after a restart.
-- **Sub or dub.** Japanese or English audio, with or without subtitles, for all shows or just one.
-- **Skips openings and endings.** With `ani-skip`, in streams and downloads alike.
+| Feature | What it does |
+| --- | --- |
+| **No scraper of its own** | Every source comes from `ani-cli`, which a large community keeps working on. When a site changes, updating `ani-cli` is enough. One small exception: if `ani-cli` finds no subtitles for an episode, ani-hop gets English fallback subtitles itself. |
+| **Posters in the terminal** | In Ghostty and kitty, even inside tmux/herdr, though slower there. |
+| **AniList built in** | Your lists, with watched episodes marked. The main menu's first row plays your next episode. After each episode it asks to save your progress, and "Watched up to…" sets it for many episodes at once, or back to none. |
+| **Jump to related seasons and shows** | A show's page lists its seasons in story order, then its movies, OVAs and side stories. |
+| **Find an episode by what happens in it** | The filter searches the titles and summaries of watched episodes. Unwatched ones stay blank, so nothing spoils. |
+| **Downloads in the background** | Pause them or quit; unfinished ones come back after a restart. |
+| **Sub or dub** | Japanese or English audio, with or without subtitles, for all shows or just one. |
+| **Skips openings and endings** | With `ani-skip`, in streams and downloads alike. |
 
 ## Install
 
@@ -29,7 +31,7 @@ Installs ani-hop, ani-cli, mpv and the rest. Run it again to update; ani-hop tel
 mise use -g github:ReynkeDeVos/ani-hop
 ```
 
-For Linux (x86-64 or ARM) and Apple silicon Macs. Installs only ani-hop. It checks for ani-cli, mpv and the rest at the start and offers to install what's missing. Update with `mise up github:ReynkeDeVos/ani-hop`. By default, mise only installs releases that are at least a day old.
+For Linux (x86-64 or ARM) and Apple silicon Macs. Installs only ani-hop. It checks for ani-cli, mpv and the rest at the start and offers to install what's missing.
 
 ### macOS (Apple silicon)
 
