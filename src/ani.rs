@@ -879,6 +879,29 @@ fn own_player() -> Option<String> {
     player.filter(|p| !p.is_empty() && p != "mpv")
 }
 
+/// What mpv gets when its config files don't say: by itself it decodes on the CPU, and stutters.
+const HWDEC: &str = "--hwdec=auto-safe";
+
+/// Whether mpv's config files leave hwdec out; `hwdec=no` is the user's choice. Asked once a run,
+/// in the background at the start or else when the first episode starts. No when mpv can't say.
+pub fn hwdec_unset() -> bool {
+    static UNSET: OnceLock<bool> = OnceLock::new();
+    *UNSET.get_or_init(|| {
+        let mut mpv = Command::new("mpv");
+        // without a file it reads its config files, says what they set and quits, also when
+        // they ask it to stay open
+        mpv.args(["-v", "--idle=no", "--force-window=no"])
+            .stdin(Stdio::null());
+        output_within(&mut mpv, Duration::from_secs(5))
+            .is_some_and(|o| o.status.success() && !sets_hwdec(&o.stdout))
+    })
+}
+
+/// From mpv's -v output.
+fn sets_hwdec(log: &[u8]) -> bool {
+    String::from_utf8_lossy(log).contains("Setting option 'hwdec' = ")
+}
+
 /// ani-cli set up to take episode `ep` of `src` to the player (with ani-skip), and the file
 /// the player will read subtitles from, if ani-cli finds none.
 fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, Option<PathBuf>) {
@@ -887,6 +910,10 @@ fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, O
     // an mpv flag, other players ani-cli knows (vlc, syncplay) don't start with it
     if player.contains("mpv") && !subs(audio) {
         flags.push_str(" --sub-visibility=no");
+    }
+    // the last flag wins, so not after the user's own. Another player has another config
+    if player == "mpv" && !flags.contains("--hwdec") && hwdec_unset() {
+        flags = format!("{flags} {HWDEC}");
     }
     let mut cli = ani_cli();
     let subs = subs_page(m, src, ep, dub(audio)).map(|page| {
@@ -1055,7 +1082,8 @@ pub fn play_held(held: &Held, mut up: impl FnMut()) -> Replayed {
 
 pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Result<(), String> {
     let mut mpv = Command::new("mpv");
-    mpv.arg(format!("--force-media-title={} Episode {ep}", m.name()));
+    mpv.arg(format!("--force-media-title={} Episode {ep}", m.name()))
+        .args(hwdec_unset().then_some(HWDEC));
     let vtt = file.with_extension("vtt");
     if vtt.exists() {
         mpv.arg(format!("--sub-file={}", vtt.display()));
@@ -1703,6 +1731,17 @@ fn left(secs: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn any_hwdec_in_mpvs_config_counts_as_set_and_a_look_alike_does_not() {
+        let set =
+            |o: &str, v: &str| format!("[cplayer] Setting option '{o}' = '{v}' (flags = 4)\n");
+        for v in ["auto", "auto-safe", "vaapi,auto", "no"] {
+            assert!(sets_hwdec(set("hwdec", v).as_bytes()), "{v}");
+        }
+        assert!(!sets_hwdec(set("hwdec-codecs", "all").as_bytes()));
+        assert!(!sets_hwdec(b"[cplayer] Reading config file /x/mpv.conf\n"));
+    }
 
     #[test]
     fn a_mise_install_updates_with_mise_and_keeps_its_ani_hop() {
