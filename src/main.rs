@@ -602,7 +602,7 @@ impl App {
         app.push("ani-hop", View::Main);
         let welcomed = ani::config_dir().join("welcomed");
         let first = !welcomed.exists();
-        if first || !app.missing.is_empty() || app.old_ani_cli().is_some() {
+        if first || !app.missing.is_empty() {
             let _ = fs::create_dir_all(ani::config_dir());
             let _ = fs::write(&welcomed, "");
             app.push(if first { "Welcome" } else { "Setup" }, View::Setup);
@@ -643,11 +643,6 @@ impl App {
         app
     }
 
-    /// The installed ani-cli's version, when it's older than ani::TESTED_ANI_CLI.
-    pub fn old_ani_cli(&self) -> Option<&str> {
-        (self.ani_cli.as_deref()).filter(|v| ani::older(v, ani::TESTED_ANI_CLI))
-    }
-
     /// Asks whether ani-cli has an update. Its tags, not its master: that's what packages ship,
     /// so a newer master would ask for an update they can't give.
     fn check_ani_cli(&self) {
@@ -666,16 +661,9 @@ impl App {
         self.ani_cli_newer = None;
         self.check_ani_cli();
         let names: Vec<&str> = self.missing.iter().map(|d| d.0).collect();
-        match (names.is_empty(), self.old_ani_cli()) {
-            (false, _) => self.toast(format!("Still missing: {}", names.join(", ")), true),
-            (true, Some(v)) => self.toast(
-                format!(
-                    "ani-cli is still {v}, ani-hop needs {}",
-                    ani::TESTED_ANI_CLI
-                ),
-                true,
-            ),
-            (true, None) => self.toast("All set: everything ani-hop needs is installed", false),
+        match names.is_empty() {
+            false => self.toast(format!("Still missing: {}", names.join(", ")), true),
+            true => self.toast("All set: everything ani-hop needs is installed", false),
         }
         self.refresh();
     }
@@ -1328,9 +1316,6 @@ impl App {
                 if let Some(cmd) = ani::install_command(&pkgs).filter(|_| !pkgs.is_empty()) {
                     v.push(Item::new("install", "Install missing packages", cmd));
                 }
-                if let Some(cmd) = ani::ani_cli_update().filter(|_| self.old_ani_cli().is_some()) {
-                    v.push(Item::new("update", "Update ani-cli", cmd));
-                }
                 if self.user.is_none() {
                     v.push(Item::new("login", "Log in to AniList…", ""));
                 }
@@ -1679,9 +1664,7 @@ impl App {
         match &screen.view {
             View::Main | View::Settings => self.main_action(&key, &label),
             View::Setup => match key.as_str() {
-                "install" | "update" => {
-                    self.external = screen.menu.current().map(|i| i.hint.clone())
-                }
+                "install" => self.external = screen.menu.current().map(|i| i.hint.clone()),
                 "login" => self.main_action("login", ""),
                 _ => self.pop(1),
             },
@@ -4494,8 +4477,12 @@ mod tests {
         assert_eq!(drawn.matches("is out").count(), 1, "{drawn}");
         // with less room what's out goes before the number does
         assert!(foot(&mut app, 60).starts_with(&format!(" ani-hop {me} ↑ (99.0.0 is out) ")));
-        assert!(foot(&mut app, 50).starts_with(&format!(" {me} ↑ (99.0.0 is out) ")));
-        assert!(foot(&mut app, 35).starts_with(&format!(" {me}    ")));
+        // just enough room for it, however long this version is
+        let room = 44 + me.len() as u16;
+        assert!(foot(&mut app, room).starts_with(&format!(" {me} ↑ (99.0.0 is out) ")));
+        let number_only = foot(&mut app, 35);
+        assert!(number_only.starts_with(&format!(" {me} ")), "{number_only}");
+        assert!(!number_only.contains('↑'), "{number_only}");
         assert!(!foot(&mut app, 28).contains(me));
         // one update fits at 80 columns with its words
         app.release = None;
@@ -4512,10 +4499,10 @@ mod tests {
             .collect();
         assert_eq!(bright, " ↑ ↑");
 
-        // an ani-cli too old for ani-hop too, without knowing of a release
+        // an old ani-cli gets no arrow without knowing of a release
         let mut app = with_versions();
         app.ani_cli = Some("5.0.2".into());
-        assert!(foot(&mut app, 80).contains("ani-cli 5.0.2 ↑ (5.1 is out)"));
+        assert!(!foot(&mut app, 80).contains("↑"));
 
         // an answer about the ani-cli from before an update doesn't bring the arrow back
         let newer = || Some("5.3".to_string());

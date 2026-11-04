@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.10.9 – 2026-11-04
+## 0.10.10 – 2026-11-04
 
 ### Added
 
@@ -10,6 +10,10 @@
 
 - The `ani-hop` tag is back on the main menu, so it's on every screen and no longer appears only once you leave the menu.
 - An empty prompt says what typing does on its screen: "type to filter" on every list and every row, "type to search AniList" on Search, and what to paste on the login's two prompts.
+
+### Removed
+
+- ani-hop no longer checks which ani-cli version you have. Below 5.1 it opened the setup screen on every start, but a version number can't tell whether ani-cli still works, as the sites it uses change. It still checks that ani-cli is installed, and the install script still adds its own copy when your system's ani-cli is older than 5.1. The bottom line still shows `↑` when ani-cli has a newer release, and not when yours is ahead of it.
 
 ## 0.10.8 – 2026-11-04
 

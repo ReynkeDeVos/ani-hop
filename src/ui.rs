@@ -218,9 +218,7 @@ fn versions(app: &App, room: usize) -> Line<'static> {
     let own_new = app.release.as_ref().map(|r| r.0.as_str());
     let number = env!("CARGO_PKG_VERSION");
     let (named, alone) = (format!(" ani-hop {number}"), format!(" {number}"));
-    // too old, and GitHub hasn't said what's newest: what ani-hop needs is out for sure
-    let needed = app.old_ani_cli().map(|_| ani::TESTED_ANI_CLI);
-    let ani_cli_new = app.ani_cli_newer.as_deref().or(needed);
+    let ani_cli_new = app.ani_cli_newer.as_deref();
     let ani_cli = app.ani_cli.as_ref().map(|v| format!("ani-cli {v}"));
     let both = |word: &str| {
         let ani_cli = part(ani_cli.as_ref()?, ani_cli_new, word);
@@ -788,28 +786,9 @@ fn setup(app: &App) -> Vec<Line<'static>> {
             v.push(Line::styled("xdg-open: xdg-utils from your distro", SOFT));
         }
     }
-    if let Some(old) = app.old_ani_cli() {
-        v.push("".into());
-        v.push(Line::styled(
-            format!(
-                "ani-cli {old} is too old, ani-hop needs {}",
-                ani::TESTED_ANI_CLI
-            ),
-            Color::Yellow,
-        ));
-        v.push(match ani::ani_cli_update() {
-            Some(cmd) => command(cmd),
-            None => Line::styled("Update it with your package manager", SOFT),
-        });
-    }
     v.extend(["".into(), Line::styled("Tools", Style::new().bold())]);
     for (bin, _, what) in ani::deps() {
-        let old = bin == "ani-cli" && app.old_ani_cli().is_some();
-        v.push(row(
-            !old && !app.missing.iter().any(|d| d.0 == bin),
-            bin,
-            what,
-        ));
+        v.push(row(!app.missing.iter().any(|d| d.0 == bin), bin, what));
     }
     v.push(row(
         kitty::supported(),
