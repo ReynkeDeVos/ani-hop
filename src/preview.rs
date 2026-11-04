@@ -18,6 +18,9 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
 const GLINT_MS: u128 = 450;
+/// How wide a page gets, for about 70 columns of text beside a full-size poster: wider gets
+/// too long to read, as on a very wide screen.
+const PAGE_MAX: u16 = 110;
 
 /// What App knows of the show on screen, and of the episode under the cursor on its episode
 /// list, for `page`.
@@ -131,17 +134,17 @@ pub fn page(s: &Shown) -> Page {
         lines.extend(line.map(|l| Line::styled(l, DIM)));
     }
     let mut about = String::new();
-    if let Some(ep) = ep
-        && let Some(i) = s.info
-    {
+    if let Some(ep) = ep {
         lines.push("".into());
-        let (title, summary) = i.told(s.progress.watched(ep));
+        let told = s.info.map(|i| i.told(s.progress.watched(ep)));
+        let (title, summary) = told.unwrap_or_default();
         let heading = match title {
             "" => format!("Episode {ep}"),
             title => format!("Episode {ep} · {title}"),
         };
         lines.push(Line::styled(heading, Style::new().bold()));
-        if let Some(d) = i.aired.as_deref().filter(|d| !d.is_empty()) {
+        let aired = s.info.and_then(|i| i.aired.as_deref());
+        if let Some(d) = aired.filter(|d| !d.is_empty()) {
             lines.push(Line::styled(format!("aired {}", day(d)), DIM));
         }
         about = summary.to_string();
@@ -272,6 +275,10 @@ impl Preview {
     /// The poster with the head beside it, and the text flowing around it; returns whether
     /// there's more (above, below).
     fn lay_out(&mut self, page: &Page, f: &mut Frame, area: Rect) -> (bool, bool) {
+        let area = Rect {
+            width: area.width.min(PAGE_MAX),
+            ..area
+        };
         let m = &page.media;
         let rows = (area.height * 3 / 5).clamp(6, 26).min(area.height);
         // font zoom changes the pixels per cell, so they're read every frame

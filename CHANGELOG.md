@@ -2,12 +2,19 @@
 
 ## 0.10.7 – 2026-11-04
 
+### Added
+
+- The Continue row shows its show beside the menu: the poster, your progress, the next episode and the description. Any other row shows the keys, as before. A notice about a new ani-hop shows above the poster too.
+
 ### Changed
 
-- The screen lines up. The `ani-hop` tag starts on the panel's border, and its name starts above the search prompt and the versions at the bottom. Your AniList name ends above the keys at the bottom right. What you type starts where the menu's rows do.
-- Both panels have the same padding, so the poster and the logo start on the search prompt's row, and a show's page has two more columns and two more rows for its text.
+- The Continue row stands out on the main menu, under a line of its own, and Quit steps back.
+- The screen lines up. The top and bottom lines start and end where the panels' text does, and what you type starts where the menu's rows do.
+- The `ani-hop` tag is gone from the main menu. On other screens it starts the way back, and it now starts on the panel's border.
+- Both panels have the same padding, so a poster starts on the search prompt's row, and a show's page has two more columns and two more rows for its text. The logo gets a blank row above it.
+- On a wide window the list stops at about 60 columns, so what a row says on its right stays close to its name, and the preview gets the rest. A show's page stops at 110 columns, so its text stays easy to read.
 - The key list starts under the logo instead of six columns in. The filter hint says `'exact` instead of `'word`, like the rest of that line, which names what each one does. `→` lists `^l` only, as the footer already says enter.
-- Prompts for your client ID, token, folder or an ani-cli search say so on the line under them, so typing starts in the same place on every prompt.
+- Prompts no longer have a label before `❯`, as the top line and the help say what they ask for. Typing starts in the same place on every prompt.
 - Clearer help on a few screens, such as "Empty resets to ~/Videos/Anime" instead of "Empty goes back to".
 
 ### Fixed

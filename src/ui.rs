@@ -23,6 +23,9 @@ const LOGO: [&str; 2] = ["▄▀█ █▄ █ █ ▄▄ █ █ █▀█ █�
 const SHADES: [&str; 4] = ["░", "▒", "▓", "█"];
 const BOOT_MS: u128 = 240;
 const POP_MS: u128 = 160;
+/// The menu's panel at most, for rows of about 60 columns: wider and what a row says on its
+/// right is too far from its name to read as one. The preview gets the rest.
+const MENU_MAX: u16 = 64;
 
 pub fn render(app: &mut App, f: &mut Frame) {
     let [head, body, foot] = Layout::vertical([
@@ -126,9 +129,13 @@ fn boot(app: &App, buf: &mut Buffer) {
     }
 }
 
+/// The logo, under a blank row: it's the heaviest thing on the screen, so it gets more room
+/// than the panel's inset gives text.
 fn logo() -> impl Iterator<Item = Line<'static>> {
-    LOGO.iter()
-        .map(|l| Line::styled(*l, Style::new().fg(ACCENT).bold()))
+    let logo = LOGO
+        .iter()
+        .map(|l| Line::styled(*l, Style::new().fg(ACCENT).bold()));
+    std::iter::once(Line::default()).chain(logo)
 }
 
 /// Short name for the breadcrumbs; questions are shown in full in the menu.
@@ -193,8 +200,9 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
         crumbs.push(Span::styled(" › ", DIM));
         crumbs.push(Span::raw(t));
     }
-    // the name whole or not at all
-    if crumbs_area.width as usize >= badge {
+    // the way back from any other screen, so the main menu doesn't need it; the name whole or
+    // not at all
+    if app.stack.len() > 1 && crumbs_area.width as usize >= badge {
         f.render_widget(Line::from(crumbs), crumbs_area);
     }
     f.render_widget(user, user_area);
@@ -269,8 +277,10 @@ fn widens(view: &View) -> bool {
 /// The menu's side of `body`, and the preview's: a question too long for its side takes the
 /// whole width, so what it changes reads in full before it's answered.
 fn split(body: Rect, asked: Option<(&str, usize)>) -> (Rect, Option<Rect>) {
-    let [left, right] =
+    let [left, _] =
         Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]).areas(body);
+    let menu = Constraint::Length(left.width.min(MENU_MAX));
+    let [left, right] = Layout::horizontal([menu, Constraint::Fill(1)]).areas(body);
     match asked {
         Some((q, answers)) if !question_rows(q, answers, panel_inner(left)).1 => (body, None),
         _ => (left, Some(right)),
@@ -327,21 +337,11 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         }
     }
 
-    // an input as a fixed menu: what it asks for on its rule, where a list has its count, and
-    // its help where rows would start
+    // an input as a fixed menu: its rule alone, and its help where rows would start. The top
+    // line and the help say what it asks for
     if let View::Input(input) = &screen.view {
-        let label = match input {
-            Input::Search => "",
-            Input::ClientId => "client ID ",
-            Input::Token => "token ",
-            Input::SourceQuery(_) => "ani-cli ",
-            Input::DownloadDir => "folder ",
-        };
-        let rule = "─".repeat((info_area.width as usize).saturating_sub(label.len()));
-        f.render_widget(
-            Line::from(vec![Span::styled(label, ACCENT), Span::styled(rule, DIM)]),
-            info_area,
-        );
+        let rule = "─".repeat(info_area.width as usize);
+        f.render_widget(Line::styled(rule, DIM), info_area);
         let [_, help_area] =
             Layout::horizontal([Constraint::Length(3), Constraint::Fill(1)]).areas(list_area);
         f.render_widget(
@@ -444,7 +444,13 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 _ => " ",
             };
             let mut spans = vec![Span::styled(mark, Color::Green), " ".into()];
-            let plain = if item.done { SOFT } else { Style::new() };
+            // on the main menu what it's for stands out, and what leaves it steps back
+            let main = matches!(screen.view, View::Main);
+            let hero = main && item.key.starts_with("continue:");
+            let plain = match item.done || main && item.key == "quit" {
+                true => SOFT,
+                false => Style::new(),
+            };
             // a title makes room for what's short and always worth seeing (a show's progress),
             // unless too little of the title would be left to tell which show it is
             let short = match item.short.as_str() {
@@ -458,6 +464,9 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                     _ => width - 2,
                 });
             spans.extend(row_label(&item.label, hits, plain, room));
+            if let Some(play) = spans.get_mut(2).filter(|_| hero) {
+                play.style = ACCENT.into();
+            }
             let mut used: usize = spans.iter().map(|s| s.width()).sum();
             // a title too long for the row ends in "…", like a cut hint
             if used > width {
@@ -472,6 +481,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
             let room = width.saturating_sub(used + 1);
             let (hint, color) = match &busy {
                 Some((key, text)) if *key == item.key => (text.clone(), ACCENT),
+                _ if hero => (item.hint.clone(), ACCENT),
                 _ => (item.hint.clone(), DIM),
             };
             let mut hint = hint;
@@ -599,6 +609,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
     let inner = panel_inner(area);
     f.render_widget(panel(), area);
     let screen = app.stack.last().unwrap();
+    let main = matches!(screen.view, View::Main);
     let media = match &screen.view {
         View::Shows(list) => screen
             .menu
@@ -616,6 +627,9 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             Some(m.clone())
         }
         View::Confirm(Pending::Progress(marks, _)) => marks.first().map(|k| k.entry.clone()),
+        View::Main => (screen.menu.current())
+            .and_then(|it| app.on_continue_row(&it.key))
+            .cloned(),
         _ => None,
     };
     // posters just below the cursor load ahead, so scrolling shows them instantly
@@ -640,6 +654,10 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         View::Episodes(..) => (screen.menu.current())
             .filter(|it| !it.action)
             .map(|it| it.key.clone()),
+        // the one the Continue row plays
+        View::Main => (media.as_ref())
+            .and_then(|m| app.progress(m).next_out())
+            .map(|ep| ep.to_string()),
         _ => None,
     };
     app.preview.read(media.as_ref().map(|m| (m.id, ep.clone())));
@@ -653,7 +671,17 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             on_disk: app.local.get(&m.id).map_or(0, Vec::len),
             info: ep.as_deref().and_then(|ep| app.ep_about(&m, ep)),
         });
-        return app.preview.draw(&page, &ahead, f, area, inner);
+        // the Continue row's page has the start panel's place, so its notice stays on screen
+        let mut pane = inner;
+        if let Some(notice) = release_notice(app).filter(|_| main) {
+            let notice = Paragraph::new(notice).wrap(Wrap { trim: false });
+            let rows = notice.line_count(inner.width) as u16 + 1; // and a blank one
+            let [top, rest] =
+                Layout::vertical([Constraint::Length(rows), Constraint::Fill(1)]).areas(inner);
+            f.render_widget(notice, top);
+            pane = rest;
+        }
+        return app.preview.draw(&page, &ahead, f, area, pane);
     }
     let lines: Vec<Line> = match &screen.view {
         View::Bulk(list) => list
@@ -789,6 +817,15 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v
 }
 
+/// That a newer ani-hop is out, and how to get it.
+fn release_notice(app: &App) -> Option<Line<'static>> {
+    let (new, cmd) = app.release.as_ref()?;
+    Some(Line::styled(
+        format!("↑ ani-hop {new} is out: {cmd}"),
+        ACCENT,
+    ))
+}
+
 /// The start panel in `area`: the logo only where everything else fits under it, as a short
 /// screen keeps an update notice (two or three rows at 80 columns) and every key instead.
 fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
@@ -805,13 +842,7 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
             Span::styled(also, DIM),
         ])
     };
-    let mut v = Vec::new();
-    if let Some((new, cmd)) = &app.release {
-        v.push(Line::styled(
-            format!("↑ ani-hop {new} is out: {cmd}"),
-            ACCENT,
-        ));
-    }
+    let mut v: Vec<Line> = release_notice(app).into_iter().collect();
     // on an input typing is the text itself; on an empty list only esc and ^c do something.
     // Only what nothing else says: the footer and the preview's border name the other keys
     // where they work
@@ -833,7 +864,7 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
         ]);
     }
     let below = Paragraph::new(v.clone()).wrap(Wrap { trim: false });
-    let logo_h = LOGO.len() + 1; // and the blank line under it
+    let logo_h = LOGO.len() + 2; // and the blank lines around it
     if below.line_count(area.width) + logo_h <= area.height as usize {
         v.splice(0..0, logo().chain(["".into()]));
     }
