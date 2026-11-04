@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.6 – 2026-11-04
+
+### Fixed
+
+- If you use mpv's thumbfast script, its previews on the timeline now work on streamed episodes too. Turn them on with `network=yes` in thumbfast's own config. Without thumbfast, nothing changes.
+
 ## 0.10.5 – 2026-11-04
 
 ### Added
