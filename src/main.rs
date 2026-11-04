@@ -4357,25 +4357,53 @@ mod tests {
     }
 
     #[test]
-    fn the_continue_row_says_typing_filters_where_the_keys_would() {
+    fn an_empty_prompt_says_what_typing_does_on_its_screen() {
+        // the prompt's row, as drawn
+        let prompt = |app: &mut App, w| screen(app, w, 30).lines().nth(2).unwrap().to_string();
+        let hint_at = |row: &str, text: &str| row.find(text).map(|at| row[..at].chars().count());
+        let filter = "type to filter";
+
+        // on every row of a list, starting where what's typed would, and gone with the first key
         let mut app = app_going_on(Some(show(50_413, 12, Some(3))), Vec::new());
-        let drawn = screen(&mut app, 120, 30);
-        let row = drawn.lines().nth(2).unwrap();
-        assert_eq!(
-            row.find("type to filter")
-                .map(|at| row[..at].chars().count()),
-            Some(5),
-            "{row}"
-        );
-        // gone with the first key
-        app.top().menu.edit(|q| *q = "s".into());
-        assert!(!screen(&mut app, 120, 30).contains("type to filter"));
-        app.top().menu.edit(|q| q.clear());
-        // and on the other rows, where the keys are
+        let row = prompt(&mut app, 120);
+        assert_eq!(hint_at(&row, filter), Some(5), "{row}");
         press(&mut app, KeyCode::Down);
-        let drawn = screen(&mut app, 120, 30);
-        assert!(!drawn.contains("type to filter"), "{drawn}");
-        assert!(drawn.contains("filter the list"), "{drawn}");
+        assert_eq!(hint_at(&prompt(&mut app, 120), filter), Some(5));
+        app.top().menu.edit(|q| *q = "s".into());
+        assert!(!prompt(&mut app, 120).contains(filter));
+        app.top().menu.edit(String::clear);
+        assert!(prompt(&mut app, 120).contains(filter));
+        // whole or not at all, and the cursor stays on its first letter
+        assert!(!prompt(&mut app, 20).contains("type"), "too narrow");
+        // and on the lists below it
+        app.push("Settings", View::Settings);
+        assert!(prompt(&mut app, 120).contains(filter));
+        app.push("Empty", View::Bulk(Vec::new()));
+        assert!(!prompt(&mut app, 120).contains(filter), "nothing to filter");
+        app.stack.pop();
+        app.stack.pop();
+
+        // where typing does something else it says that
+        let m = show(50_415, 12, None);
+        let says = [
+            (Input::Search, "type to search AniList"),
+            (Input::ClientId, "paste your client ID"),
+            (Input::Token, "paste the token"),
+            (Input::DownloadDir, ""),
+            (Input::SourceQuery(m), ""),
+        ];
+        for (input, text) in says {
+            app.push("Prompt", View::Input(input));
+            app.top().menu.edit(String::clear);
+            let row = prompt(&mut app, 120);
+            let left: String = row.chars().take(40).collect();
+            assert!(!left.contains(filter), "{row}");
+            match text {
+                "" => assert!(left.trim_end_matches([' ', '│']).ends_with('❯'), "{row}"),
+                text => assert_eq!(hint_at(&row, text), Some(5), "{row}"),
+            }
+            app.stack.pop();
+        }
     }
 
     #[test]

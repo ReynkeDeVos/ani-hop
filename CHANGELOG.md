@@ -9,6 +9,7 @@
 ### Changed
 
 - The `ani-hop` tag is back on the main menu, so it's on every screen and no longer appears only once you leave the menu.
+- An empty prompt says what typing does on its screen: "type to filter" on every list and every row, "type to search AniList" on Search, and what to paste on the login's two prompts.
 
 ## 0.10.8 – 2026-11-04
 

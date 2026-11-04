@@ -321,10 +321,18 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     ]);
     let cursor_x =
         (prompt_area.x + prompt.width() as u16).min(prompt_area.right().saturating_sub(1));
-    // on any other row the keys say so; this one has its show there instead
-    let on_continue = (screen.menu.current()).is_some_and(|it| it.key.starts_with("continue:"));
-    if screen.menu.query.is_empty() && matches!(screen.view, View::Main) && on_continue {
-        prompt.push_span(Span::styled("type to filter", SOFT));
+    // what typing does on this screen, where it's going to appear, and whole or not at all
+    let hint = match &screen.view {
+        View::Input(Input::Search) => "type to search AniList",
+        View::Input(Input::ClientId) => "paste your client ID",
+        View::Input(Input::Token) => "paste the token",
+        // these start with their text, and their help says what empty does
+        View::Input(_) => "",
+        _ if screen.menu.items.is_empty() => "",
+        _ => "type to filter",
+    };
+    if screen.menu.query.is_empty() && Span::raw(hint).width() <= room {
+        prompt.push_span(Span::styled(hint, SOFT));
     }
     match question {
         Some(q) => f.render_widget(
