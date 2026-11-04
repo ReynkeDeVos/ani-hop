@@ -95,7 +95,7 @@ Looking for alternatives? These are all worth a look:
 - [anitrack](https://github.com/MiguelRegueiro/anitrack-cli): a simple companion that remembers where you stopped in `ani-cli`.
 - [ani-gui](https://github.com/JoaoPucci/ani-gui): a full desktop app with a built-in player and watch parties.
 
-Like mal-tui and anitrack, ani-hop leaves finding streams to `ani-cli`, so when a site changes, updating `ani-cli` is enough. One thing I haven't found in any of them: searching episodes by what happens in them, without spoilers.
+Like mal-tui and anitrack, ani-hop leaves finding streams to `ani-cli`, so when a site changes, updating `ani-cli` is enough. One thing I haven't found in any of them: searching episodes by what happens in them.
 
 <sub>Curious how the code is structured? Here is the architecture diagram:</sub>
 
