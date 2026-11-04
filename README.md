@@ -13,7 +13,7 @@ A fast terminal UI for anime: find a show, then stream or download it through [a
 | **Find an episode by what happens in it** | The filter searches the titles and summaries of watched episodes. Unwatched ones stay blank, so nothing spoils. |
 | **Downloads in the background** | Pause them or quit; unfinished ones come back after a restart. |
 | **Sub or dub** | Japanese or English audio, with or without subtitles, for all shows or just one. |
-| **Skips openings and endings** | With `ani-skip`, in streams and downloads alike. |
+| **Skips openings and endings** | In streams and downloads alike. A show's last episode keeps its ending, as the story can go on after it. |
 
 ## Install
 
@@ -55,7 +55,7 @@ Restart, open Ubuntu and run the `curl` line above. For posters, run ani-hop in 
 <details>
 <summary>Other distros, Nix, or from source</summary>
 
-On other distros the script installs ani-hop, ani-cli and ani-skip, then lists the system packages to install yourself.
+On other distros the script installs ani-hop and ani-cli, then lists the system packages to install yourself.
 
 With Nix, on NixOS or another Linux:
 
@@ -75,7 +75,7 @@ environment.systemPackages = [ inputs.ani-hop.packages.${pkgs.stdenv.hostPlatfor
 
 Update with `nix flake update ani-hop` and a rebuild. Leave out `inputs.nixpkgs.follows` unless your nixpkgs is unstable: ani-hop needs ani-cli 5.1, and NixOS 26.05 has 5.0.
 
-From source: `cargo install --locked --git https://github.com/ReynkeDeVos/ani-hop` (Rust 1.89 or newer). It needs [ani-cli](https://github.com/pystardust/ani-cli) 5.1 or newer, [mpv](https://mpv.io), [yt-dlp](https://github.com/yt-dlp/yt-dlp), ffmpeg, curl, patch and xdg-utils; [ani-skip](https://github.com/synacktraa/ani-skip) is optional. ani-hop checks for them at the start and offers to install what's missing.
+From source: `cargo install --locked --git https://github.com/ReynkeDeVos/ani-hop` (Rust 1.89 or newer). It needs [ani-cli](https://github.com/pystardust/ani-cli) 5.1 or newer, [mpv](https://mpv.io), [yt-dlp](https://github.com/yt-dlp/yt-dlp), ffmpeg, curl, patch and xdg-utils. ani-hop checks for them at the start and offers to install what's missing.
 
 </details>
 

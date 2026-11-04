@@ -13,6 +13,7 @@ mod preview;
 mod progress;
 mod related;
 mod show_downloads;
+mod skip;
 mod source;
 mod ui;
 
@@ -282,6 +283,12 @@ fn main() -> std::io::Result<()> {
         }
         Some("-h" | "--help") => {
             println!("{usage}");
+            return Ok(());
+        }
+        // what ani-cli's stand-in for ani-skip runs, not one for people
+        Some("--skip-flags") => {
+            let arg = |n| std::env::args().nth(n).unwrap_or_default();
+            println!("{}", skip::flags_for_ani_cli(&arg(2), &arg(3)));
             return Ok(());
         }
         Some(arg) => {
@@ -589,8 +596,7 @@ impl App {
         app.push("ani-hop", View::Main);
         let welcomed = ani::config_dir().join("welcomed");
         let first = !welcomed.exists();
-        let needed = app.missing.iter().any(|d| !ani::optional(d.0));
-        if first || needed || app.old_ani_cli.is_some() {
+        if first || !app.missing.is_empty() || app.old_ani_cli.is_some() {
             let _ = fs::create_dir_all(ani::config_dir());
             let _ = fs::write(&welcomed, "");
             app.push(if first { "Welcome" } else { "Setup" }, View::Setup);
@@ -626,9 +632,7 @@ impl App {
     fn after_install(&mut self) {
         self.missing = ani::missing_deps();
         self.old_ani_cli = ani::old_ani_cli();
-        let names: Vec<&str> = (self.missing.iter().map(|d| d.0))
-            .filter(|&n| !ani::optional(n))
-            .collect();
+        let names: Vec<&str> = self.missing.iter().map(|d| d.0).collect();
         match (names.is_empty(), &self.old_ani_cli) {
             (false, _) => self.toast(format!("Still missing: {}", names.join(", ")), true),
             (true, Some(v)) => self.toast(

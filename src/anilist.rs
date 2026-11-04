@@ -187,6 +187,9 @@ impl Media {
     }
 }
 
+/// How long a request gets, unless it asks for less.
+const LIMIT: Duration = Duration::from_secs(20);
+
 /// One agent for everything: its connections stay open, so a poster after the first skips
 /// the TLS handshake (165 ms -> 46 ms measured here).
 fn agent() -> &'static ureq::Agent {
@@ -194,7 +197,7 @@ fn agent() -> &'static ureq::Agent {
     AGENT.get_or_init(|| {
         ureq::Agent::config_builder()
             .http_status_as_error(false)
-            .timeout_global(Some(Duration::from_secs(20)))
+            .timeout_global(Some(LIMIT))
             .user_agent("ani-hop")
             .build()
             .into()
@@ -217,7 +220,17 @@ pub fn location(url: &str) -> Result<String, String> {
 
 /// Plain GET, e.g. cover images (from AniList's CDN, which has no request limit).
 pub fn fetch(url: &str) -> Result<Vec<u8>, String> {
-    let mut res = agent().get(url).call().map_err(|e| e.to_string())?;
+    fetch_within(url, LIMIT)
+}
+
+/// `fetch` for what mustn't hold up anything for long.
+pub fn fetch_within(url: &str, limit: Duration) -> Result<Vec<u8>, String> {
+    let req = agent()
+        .get(url)
+        .config()
+        .timeout_global(Some(limit))
+        .build();
+    let mut res = req.call().map_err(|e| e.to_string())?;
     if !res.status().is_success() {
         return Err(format!("HTTP {}", res.status()));
     }
@@ -618,6 +631,17 @@ fn folded(query: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_server_that_never_answers_only_holds_up_a_fetch_for_its_limit() {
+        use std::time::{Duration, Instant};
+        // connects, and then there's silence
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/", silent.local_addr().unwrap());
+        let since = Instant::now();
+        assert!(super::fetch_within(&url, Duration::from_millis(200)).is_err());
+        assert!(since.elapsed() < Duration::from_secs(5));
+    }
+
     #[test]
     fn a_show_links_only_to_what_can_be_played_as_part_of_its_series() {
         let edge = |relation: &str, id: u64, kind: &str, format: &str, adult: bool| {
