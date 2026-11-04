@@ -23,6 +23,9 @@ const LOGO: [&str; 2] = ["▄▀█ █▄ █ █ ▄▄ █ █ █▀█ █�
 const SHADES: [&str; 4] = ["░", "▒", "▓", "█"];
 const BOOT_MS: u128 = 240;
 const POP_MS: u128 = 160;
+/// The menu's panel at most, for rows of about 60 columns: wider and what a row says on its
+/// right is too far from its name to read as one. The preview gets the rest.
+const MENU_MAX: u16 = 64;
 
 pub fn render(app: &mut App, f: &mut Frame) {
     let [head, body, foot] = Layout::vertical([
@@ -54,11 +57,7 @@ fn starting(app: &App, f: &mut Frame) {
     let Some((p, step)) = app.playback.now().and_then(|p| Some((p, p.step?))) else {
         return;
     };
-    // the cover color, unless it's too dark to see
-    let color = match p.color.as_deref().and_then(hex) {
-        Some(Color::Rgb(r, g, b)) if r as u16 + g as u16 + b as u16 > 180 => Color::Rgb(r, g, b),
-        _ => ACCENT,
-    };
+    let color = cover_color(p.color.as_deref());
     // grows out of the middle, fast at first
     let t = (p.since.elapsed().as_millis() as f32 / POP_MS as f32).min(1.0);
     let grow = 1.0 - (1.0 - t).powi(3);
@@ -126,9 +125,13 @@ fn boot(app: &App, buf: &mut Buffer) {
     }
 }
 
+/// The logo, under a blank row: it's the heaviest thing on the screen, so it gets more room
+/// than the panel's inset gives text.
 fn logo() -> impl Iterator<Item = Line<'static>> {
-    LOGO.iter()
-        .map(|l| Line::styled(*l, Style::new().fg(ACCENT).bold()))
+    let logo = LOGO
+        .iter()
+        .map(|l| Line::styled(*l, Style::new().fg(ACCENT).bold()));
+    std::iter::once(Line::default()).chain(logo)
 }
 
 /// Short name for the breadcrumbs; questions are shown in full in the menu.
@@ -154,9 +157,9 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
         Some((_, name)) => Line::from(vec![
             Span::styled("● ", Color::Green),
             Span::raw(name.as_str()),
-            " ".into(),
+            "  ".into(),
         ]),
-        None => Line::from(Span::styled("○ not logged in to AniList ", DIM)),
+        None => Line::from(Span::styled("○ not logged in to AniList  ", DIM)),
     };
     let [crumbs_area, user_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(user.width() as u16)])
@@ -165,7 +168,7 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
     // newest crumbs first; whatever doesn't fit folds into "…", and the current one is cut
     // in the middle, keeping a season's or part's name
     let crumbs: Vec<&str> = app.stack.iter().skip(1).rev().map(crumb).collect();
-    let mut room = (crumbs_area.width as usize).saturating_sub(10);
+    let mut room = (crumbs_area.width as usize).saturating_sub(12);
     let mut shown: Vec<String> = Vec::new();
     for (i, t) in crumbs.iter().enumerate() {
         // room for " › …" while older ones follow
@@ -181,16 +184,21 @@ fn header(app: &App, f: &mut Frame, area: Rect) {
         room = room.saturating_sub(Span::raw(t.as_str()).width() + 3);
         shown.push(t);
     }
-    let mut crumbs = vec![Span::styled(
-        " ani-hop ",
-        Style::new().fg(Color::Black).bg(ACCENT).bold(),
-    )];
+    // half blocks start its fill on the border's line, which runs through the middle of a
+    // column, and its name where the prompt starts
+    let mut crumbs = vec![
+        Span::styled("▐", ACCENT),
+        Span::styled(" ani-hop ", Style::new().fg(Color::Black).bg(ACCENT).bold()),
+        Span::styled("▌", ACCENT),
+    ];
+    let badge = Line::from(crumbs.clone()).width();
     for t in shown.into_iter().rev() {
         crumbs.push(Span::styled(" › ", DIM));
         crumbs.push(Span::raw(t));
     }
-    // the name whole or not at all
-    if crumbs_area.width as usize >= crumbs[0].width() {
+    // the way back from any other screen, so the main menu doesn't need it; the name whole or
+    // not at all
+    if app.stack.len() > 1 && crumbs_area.width as usize >= badge {
         f.render_widget(Line::from(crumbs), crumbs_area);
     }
     f.render_widget(user, user_area);
@@ -238,8 +246,9 @@ fn question(screen: &crate::Screen) -> Option<(&str, usize)> {
     asks.then_some((screen.title.as_str(), screen.menu.items.len()))
 }
 
-/// Where the menu's rows go in its panel at `area`.
-fn menu_inner(area: Rect) -> Rect {
+/// Where a panel's content goes: two columns in from its outer edge, where the top and bottom
+/// lines' text starts and ends too, so the whole screen shares its edges.
+fn panel_inner(area: Rect) -> Rect {
     panel().inner(area).inner(Margin::new(1, 0))
 }
 
@@ -264,10 +273,12 @@ fn widens(view: &View) -> bool {
 /// The menu's side of `body`, and the preview's: a question too long for its side takes the
 /// whole width, so what it changes reads in full before it's answered.
 fn split(body: Rect, asked: Option<(&str, usize)>) -> (Rect, Option<Rect>) {
-    let [left, right] =
+    let [left, _] =
         Layout::horizontal([Constraint::Percentage(42), Constraint::Fill(1)]).areas(body);
+    let menu = Constraint::Length(left.width.min(MENU_MAX));
+    let [left, right] = Layout::horizontal([menu, Constraint::Fill(1)]).areas(body);
     match asked {
-        Some((q, answers)) if !question_rows(q, answers, menu_inner(left)).1 => (body, None),
+        Some((q, answers)) if !question_rows(q, answers, panel_inner(left)).1 => (body, None),
         _ => (left, Some(right)),
     }
 }
@@ -289,7 +300,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     };
     let screen = app.stack.last_mut().unwrap();
     let block = panel();
-    let inner = menu_inner(area);
+    let inner = panel_inner(area);
     f.render_widget(block, area);
     // a confirmation shows its question where the filter prompt would be, wrapped
     let asked = question(screen);
@@ -302,18 +313,11 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     ])
     .areas(inner);
 
-    let label = match &screen.view {
-        View::Input(Input::ClientId) => "client id ",
-        View::Input(Input::Token) => "token ",
-        View::Input(Input::SourceQuery(_)) => "ani-cli ",
-        View::Input(Input::DownloadDir) => "folder ",
-        _ => "",
-    };
-    // a long text keeps its end in view, where typing goes, with the cursor after it
-    let room = (prompt_area.width as usize).saturating_sub(Span::raw(label).width() + 3);
+    // what's typed starts where the rows' labels do; a long text keeps its end in view, where
+    // typing goes, with the cursor after it
+    let room = (prompt_area.width as usize).saturating_sub(4);
     let prompt = Line::from(vec![
-        Span::styled(label, ACCENT),
-        Span::styled("❯ ", Style::new().fg(ACCENT).bold()),
+        Span::styled("❯  ", Style::new().fg(ACCENT).bold()),
         Span::raw(fit_start(&screen.menu.query, room)),
     ]);
     let cursor_x =
@@ -329,7 +333,8 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         }
     }
 
-    // an input as a fixed menu: its rule alone, and its help where rows would start
+    // an input as a fixed menu: its rule alone, and its help where rows would start. The top
+    // line and the help say what it asks for
     if let View::Input(input) = &screen.view {
         let rule = "─".repeat(info_area.width as usize);
         f.render_widget(Line::styled(rule, DIM), info_area);
@@ -435,7 +440,13 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 _ => " ",
             };
             let mut spans = vec![Span::styled(mark, Color::Green), " ".into()];
-            let plain = if item.done { SOFT } else { Style::new() };
+            // on the main menu what it's for stands out, and what leaves it steps back
+            let main = matches!(screen.view, View::Main);
+            let hero = main && item.key.starts_with("continue:");
+            let plain = match item.done || main && item.key == "quit" {
+                true => SOFT,
+                false => Style::new(),
+            };
             // a title makes room for what's short and always worth seeing (a show's progress),
             // unless too little of the title would be left to tell which show it is
             let short = match item.short.as_str() {
@@ -449,6 +460,10 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                     _ => width - 2,
                 });
             spans.extend(row_label(&item.label, hits, plain, room));
+            // only under the cursor: elsewhere it would pass for one
+            if let Some(play) = spans.get_mut(2).filter(|_| hero && selected == Some(k)) {
+                play.style = ACCENT.into();
+            }
             let mut used: usize = spans.iter().map(|s| s.width()).sum();
             // a title too long for the row ends in "…", like a cut hint
             if used > width {
@@ -463,6 +478,7 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
             let room = width.saturating_sub(used + 1);
             let (hint, color) = match &busy {
                 Some((key, text)) if *key == item.key => (text.clone(), ACCENT),
+                _ if hero => (item.hint.clone(), ACCENT),
                 _ => (item.hint.clone(), DIM),
             };
             let mut hint = hint;
@@ -545,7 +561,7 @@ fn input_help(input: &Input) -> Text<'static> {
             vec![
                 "A show's English or Japanese name, or a nickname like aot.".into(),
                 "".into(),
-                "Filter the shows it finds:".into(),
+                "Then filter the list:".into(),
                 row("'titan", "exact match"),
                 row("^attack", "starts with"),
                 row("titan$", "ends with"),
@@ -571,14 +587,14 @@ fn input_help(input: &Input) -> Text<'static> {
                 Style::new().italic(),
             ),
             "".into(),
-            "Wrong client ID? Press enter with this empty.".into(),
+            "Wrong client ID? Leave this empty and press enter to change it.".into(),
         ],
         Input::SourceQuery(_) => vec![
             "Search ani-cli with this text, then pick the right source. ani-hop keeps it.".into(),
         ],
         Input::DownloadDir => vec![
             "Downloads go here. ~ works.".into(),
-            format!("Empty goes back to {}.", ani::tilde(&ani::default_root())).into(),
+            format!("Empty resets to {}.", ani::tilde(&ani::default_root())).into(),
             "".into(),
             "Shows downloaded before keep their folder, also for new episodes.".into(),
         ],
@@ -587,9 +603,8 @@ fn input_help(input: &Input) -> Text<'static> {
 }
 
 fn preview(app: &mut App, f: &mut Frame, area: Rect) {
-    let block = panel();
-    let inner = block.inner(area).inner(Margin::new(2, 1));
-    f.render_widget(block, area);
+    let inner = panel_inner(area);
+    f.render_widget(panel(), area);
     let screen = app.stack.last().unwrap();
     let media = match &screen.view {
         View::Shows(list) => screen
@@ -608,6 +623,9 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             Some(m.clone())
         }
         View::Confirm(Pending::Progress(marks, _)) => marks.first().map(|k| k.entry.clone()),
+        View::Main => (screen.menu.current())
+            .and_then(|it| app.on_continue_row(&it.key))
+            .cloned(),
         _ => None,
     };
     // posters just below the cursor load ahead, so scrolling shows them instantly
@@ -632,6 +650,10 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         View::Episodes(..) => (screen.menu.current())
             .filter(|it| !it.action)
             .map(|it| it.key.clone()),
+        // the one the Continue row plays
+        View::Main => (media.as_ref())
+            .and_then(|m| app.progress(m).next_out())
+            .map(|ep| ep.to_string()),
         _ => None,
     };
     app.preview.read(media.as_ref().map(|m| (m.id, ep.clone())));
@@ -644,6 +666,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             source: app.sources.get(m.id),
             on_disk: app.local.get(&m.id).map_or(0, Vec::len),
             info: ep.as_deref().and_then(|ep| app.ep_about(&m, ep)),
+            next: matches!(screen.view, View::Main),
         });
         return app.preview.draw(&page, &ahead, f, area, inner);
     }
@@ -765,7 +788,7 @@ fn setup(app: &App) -> Vec<Line<'static>> {
     v.push(row(
         kitty::supported(),
         "graphics",
-        "posters: Ghostty or kitty",
+        "posters in Ghostty or kitty",
     ));
     v.extend(["".into(), Line::styled("AniList", Style::new().bold())]);
     match &app.user {
@@ -774,8 +797,8 @@ fn setup(app: &App) -> Vec<Line<'static>> {
             format!("logged in as {name}").into(),
         ])),
         None => v.extend([
-            Line::styled("  Log in to get Watching/Planning first", DIM),
-            Line::styled("  and progress saved after each episode.", DIM),
+            Line::styled("  Log in to see your lists", DIM),
+            Line::styled("  and save progress after each episode.", DIM),
         ]),
     }
     v
@@ -786,13 +809,13 @@ fn setup(app: &App) -> Vec<Line<'static>> {
 fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
     // a key, what it does, and the other keys that do the same
     let key = |k: &'static str, what: &'static str, also: &'static str| {
-        // padded only beside other keys: trailing spaces would wrap at 80 columns
+        // padded only beside other keys: trailing spaces would wrap in a narrow preview
         let (what, also) = match also {
             "" => (what.to_string(), String::new()),
-            _ => (format!("{what:<18}"), format!("{also:>8}")),
+            _ => (format!("{what:<21}"), format!("{also:>8}")),
         };
         Line::from(vec![
-            Span::styled(format!("{k:>10}  "), ACCENT),
+            Span::styled(format!("{k:>4}  "), ACCENT),
             Span::raw(what),
             Span::styled(also, DIM),
         ])
@@ -815,17 +838,17 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
         }
         v.extend([
             key("↑ ↓", "move", "^k ^j"),
-            key("→", "select", "enter ^l"),
+            key("→", "select", "^l"),
             key("←", "back", "^h"),
             "".into(),
             key("type", "filter the list", ""),
-            // 40 columns, all 80 leave the preview
-            Line::styled(format!("{:12}'word ^start end$ !not a | b", ""), DIM),
+            // 35 columns, of the 42 that 80 leave the preview
+            Line::styled(format!("{:6}'exact ^start end$ !not a | b", ""), DIM),
             key("esc", "clear the filter, then back", ""),
         ]);
     }
     let below = Paragraph::new(v.clone()).wrap(Wrap { trim: false });
-    let logo_h = LOGO.len() + 1; // and the blank line under it
+    let logo_h = LOGO.len() + 2; // and the blank lines around it
     if below.line_count(area.width) + logo_h <= area.height as usize {
         v.splice(0..0, logo().chain(["".into()]));
     }
@@ -833,6 +856,12 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
 }
 
 fn footer(app: &App, f: &mut Frame, area: Rect) {
+    // what it says starts where the prompt does: a column in, and one from each text below
+    let area = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(1),
+        ..area
+    };
     let screen = app.stack.last().unwrap();
     let enter = app.enter_verb();
     // esc empties a typed filter (or a prefilled input) before it goes back
@@ -878,7 +907,7 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         // shortcut: what's still underway is told apart by its "…"; give toasts a kind once a
         // finished one can end in "…"
         (Some((text, err, _)), _) => Line::styled(
-            format!(" {text}"),
+            fit(format!(" {text}"), (area.width as usize).saturating_sub(2)),
             match (*err, text.ends_with('…')) {
                 (true, _) => Color::Red,
                 (false, true) => ACCENT,
@@ -917,17 +946,19 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
         }
         _ => Line::default(),
     };
-    // a toast that doesn't fit beside the hints gets the line until it fades
-    // and the column between them
+    // a toast that doesn't fit beside the hints gets their place until it fades, up to the edge
+    // they end at
     let crowded = toast.is_some() && status.width() + hints.width() + 1 > area.width as usize;
-    let hints_width = if crowded { 0 } else { hints.width() as u16 };
+    let hints_width = if crowded { 1 } else { hints.width() as u16 };
     // a column between them, so a cut status line doesn't run into the keys
     let [status_area, hints_area] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Length(hints_width)])
             .spacing(1)
             .areas(area);
     f.render_widget(status, status_area);
-    f.render_widget(hints, hints_area);
+    if !crowded {
+        f.render_widget(hints, hints_area);
+    }
 }
 
 /// A row's label, a span per grapheme as drawn (joined emoji stay whole), with the filter's
@@ -1040,6 +1071,14 @@ fn fit_start(s: &str, room: usize) -> String {
     format!("…{}", graphemes[start..].concat())
 }
 
+/// A show's cover color (`#rrggbb`), unless it's too dark to see.
+pub fn cover_color(color: Option<&str>) -> Color {
+    match color.and_then(hex) {
+        Some(Color::Rgb(r, g, b)) if r as u16 + g as u16 + b as u16 > 180 => Color::Rgb(r, g, b),
+        _ => ACCENT,
+    }
+}
+
 pub fn hex(s: &str) -> Option<Color> {
     let v = u32::from_str_radix(s.strip_prefix('#')?, 16).ok()?;
     Some(Color::Rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
@@ -1058,10 +1097,10 @@ mod tests {
         // too long beside the preview in a small terminal: it takes the whole width
         let (menu, preview) = split(body(40, 12), Some((q, 2)));
         assert_eq!((menu, preview), (body(40, 12), None));
-        assert_eq!(question_rows(q, 2, menu_inner(menu)), (4, true));
+        assert_eq!(question_rows(q, 2, panel_inner(menu)), (4, true));
         // beside the preview where it fits
         let (menu, preview) = split(body(80, 24), Some((q, 2)));
-        assert!(preview.is_some() && question_rows(q, 2, menu_inner(menu)).1);
+        assert!(preview.is_some() && question_rows(q, 2, panel_inner(menu)).1);
         assert!(
             split(body(40, 12), None).1.is_some(),
             "other screens keep it"

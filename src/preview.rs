@@ -11,13 +11,16 @@ use crate::kitty::{self, Posters};
 use crate::list_label;
 use crate::progress::Progress;
 use crate::source::Source;
-use crate::ui::{ACCENT, DIM, MATCH, SOFT, hex, swept};
+use crate::ui::{ACCENT, DIM, MATCH, SOFT, cover_color, swept};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Instant;
 
 const GLINT_MS: u128 = 450;
+/// How wide a page gets, for about 70 columns of text beside a full-size poster: wider gets
+/// too long to read, as on a very wide screen.
+const PAGE_MAX: u16 = 110;
 
 /// What App knows of the show on screen, and of the episode under the cursor on its episode
 /// list, for `page`.
@@ -31,6 +34,8 @@ pub struct Shown<'a> {
     pub on_disk: usize,
     /// what the episode is called and about, as ani.zip has it
     pub info: Option<&'a EpInfo>,
+    /// `ep` is the one to watch next, not one the cursor is on
+    pub next: bool,
 }
 
 /// What the Preview says, before it's laid out.
@@ -85,6 +90,10 @@ pub fn page(s: &Shown) -> Page {
         Some(Line::styled(line, Color::Green))
     };
     lines.extend(status(m));
+    // right under how far it got, as a heading over the description would read as its summary
+    if let Some(ep) = ep.filter(|_| s.next) {
+        lines.push(Line::styled(format!("▶ Next: episode {ep}"), ACCENT));
+    }
     // the provider's episodes past the show's own count toward a sequel on AniList; an
     // episode list says so with a rule between them (ui::menu)
     let parts = if ep.is_none() {
@@ -131,7 +140,7 @@ pub fn page(s: &Shown) -> Page {
         lines.extend(line.map(|l| Line::styled(l, DIM)));
     }
     let mut about = String::new();
-    if let Some(ep) = ep
+    if let Some(ep) = ep.filter(|_| !s.next)
         && let Some(i) = s.info
     {
         lines.push("".into());
@@ -159,9 +168,7 @@ pub fn page(s: &Shown) -> Page {
 
 /// The cover's dominant color, for the title and while the poster loads.
 fn accent(m: &Media) -> Color {
-    (m.cover_image.color.as_deref())
-        .and_then(hex)
-        .unwrap_or(ACCENT)
+    cover_color(m.cover_image.color.as_deref())
 }
 
 pub struct Preview {
@@ -249,7 +256,7 @@ impl Preview {
             ),
         ];
         for (_, y, key, what) in hints.into_iter().filter(|h| h.0) {
-            let row = Rect::new(area.x, y, area.width, 1).inner(Margin::new(2, 0));
+            let row = Rect::new(area.x, y, area.width, 1).inner(Margin::new(1, 0));
             // a narrow border drops the words, then "shift"
             let arrow = key["shift".len()..].trim_start();
             let hint = [(key, what), (key, " "), (arrow, " ")]
@@ -272,6 +279,10 @@ impl Preview {
     /// The poster with the head beside it, and the text flowing around it; returns whether
     /// there's more (above, below).
     fn lay_out(&mut self, page: &Page, f: &mut Frame, area: Rect) -> (bool, bool) {
+        let area = Rect {
+            width: area.width.min(PAGE_MAX),
+            ..area
+        };
         let m = &page.media;
         let rows = (area.height * 3 / 5).clamp(6, 26).min(area.height);
         // font zoom changes the pixels per cell, so they're read every frame
@@ -576,6 +587,7 @@ mod tests {
                 source: None,
                 on_disk: 0,
                 info: Some(&info),
+                next: false,
             });
             let head: Vec<String> = p.head.iter().map(Line::to_string).collect();
             (head, p.about)
