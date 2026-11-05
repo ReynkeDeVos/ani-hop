@@ -309,6 +309,14 @@ fn main() -> std::io::Result<()> {
     }
     kitty::init();
     let mut terminal = ratatui::init();
+    // ratatui's hook leaves the cursor hidden after an empty prompt, and a panic on another thread
+    // doesn't drop the terminal. shortcut: a screen still animating hides it again on its next
+    // frame, stop the main loop on a panic if that ever matters
+    let restore = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), ratatui::crossterm::cursor::Show);
+        restore(info);
+    }));
     execute!(std::io::stdout(), EnableBracketedPaste)?;
     // Kitty graphics only (Kitty and Ghostty); the query is just for font size and o=z support.
 
