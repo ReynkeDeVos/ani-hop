@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.10.11 – 2026-11-05
+
+### Changed
+
+- You can move the cursor inside what you typed in the search bar and other prompts. Typing, pasting and deleting happen where the cursor is. The keys follow bash and fzf:
+  - Move by a character: ← and →, or `^b` and `^f`.
+  - Move by a word: Ctrl or Alt with ← and →, or Alt+B and Alt+F.
+  - Go to the start or the end: Home and End, or `^a` and `^e`.
+  - Delete a character: Backspace, Delete or `^d`.
+  - Delete the word before the cursor: Ctrl+Backspace, Alt+Backspace or `^w`.
+  - Delete the word after the cursor: Alt+D, Ctrl+Delete or Alt+Delete.
+  - Delete everything before the cursor with `^u`, and everything after it with `^k`.
+- Ghostty's default Mac keys should work too: Cmd or Option with ← and →, and Cmd or Option with Backspace. They haven't been tried on a Mac yet.
+- Ctrl+← no longer deletes a word. It moves back one word.
+- `^w` deletes back to a space, so a whole folder path goes at once, as in bash. The other word keys stop at anything that isn't a letter or digit.
+- A prompt shows its cursor once there's text in it. An empty one only shows its hint.
+- While there's text in a prompt, ← and → only move the cursor. To select, press enter or `^l`. To go back, press esc to clear the text, then esc or ←.
+- While there's text in a prompt, Home and End go to its start and end, not to the first and last row.
+- Mark all is now `^t`, because `^a` goes to the start of the text.
+- `^k` still moves up when the cursor is at the end of the text, as there's nothing after it to delete.
+- `^f` still loads more shows on rankings and search results. Everywhere else it moves the cursor.
+- Pasted text keeps its spaces, and line breaks in it become spaces.
+- The install script only installs ani-cli if you don't have it at all. It no longer looks at the version, as ani-hop already tells you when there's a newer one. Running the script again leaves your ani-cli alone, and `ani-cli -U` updates it.
+- When the script does install ani-cli, it takes the latest release instead of `master`. On Arch with yay or paru it still comes from the AUR. It no longer tries Debian's or Fedora's own package.
+
 ## 0.10.10 – 2026-11-04
 
 ### Added

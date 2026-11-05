@@ -23,7 +23,7 @@ A fast terminal UI for anime: find a show, then stream or download it through [a
 curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh
 ```
 
-Installs ani-hop, ani-cli, mpv and the rest. Run it again to update; ani-hop tells you when there's a new version.
+Installs ani-hop, ani-cli, mpv and the rest. Run it again to update ani-hop; ani-hop tells you when there's a new version. If you already have ani-cli, the script leaves it alone.
 
 ### mise
 
