@@ -360,6 +360,8 @@ fn main() -> std::io::Result<()> {
             dirty |= shown || off;
             if let Some(cmd) = app.external.take() {
                 execute!(std::io::stdout(), DisableBracketedPaste)?;
+                // an empty prompt hid it, and the command may have questions
+                terminal.show_cursor()?;
                 ratatui::restore();
                 run_in_terminal(&cmd);
                 terminal = ratatui::init();
