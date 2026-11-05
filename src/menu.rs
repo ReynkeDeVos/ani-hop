@@ -70,10 +70,39 @@ fn haystack<'a>(s: &'a str, kind: AtomKind, buf: &'a mut Vec<char>) -> Utf32Str<
 /// What ends a char haystack for ' and !: a noncharacter, taken out of every query.
 const END: char = '\u{FFFF}';
 
-/// Takes the last word off `q`: back to a space, or to a `/`, so a path doesn't go all at once.
-fn drop_word(q: &mut String) {
-    let word = q.trim_end().trim_end_matches('/');
-    q.truncate(word.rfind([' ', '/']).map_or(0, |p| p + 1));
+/// Where the cursor can be in `q`: where each grapheme starts, as a row draws them, and its end.
+fn stops(q: &str) -> Vec<usize> {
+    let span = Span::raw(q);
+    let starts = span.styled_graphemes(Style::new());
+    let starts = starts.map(|g| g.symbol.as_ptr() as usize - q.as_ptr() as usize);
+    starts.chain([q.len()]).collect()
+}
+
+/// A word to ^w, as in readline: back to a space. The other word keys go by letters and digits.
+fn spaced(c: char) -> bool {
+    !c.is_whitespace()
+}
+
+/// Where the word before `at` starts: back over what's between words, then over the word.
+fn word_before(q: &str, at: usize, word: fn(char) -> bool) -> usize {
+    let stops = stops(q);
+    let is_word = |s: &&usize| q[**s..].chars().next().is_some_and(word);
+    let back = stops.iter().filter(|s| **s < at).rev();
+    let start = back.skip_while(|s| !is_word(s)).take_while(is_word).last();
+    start.map_or(0, |s| *s)
+}
+
+fn word_start(q: &str, at: usize) -> usize {
+    word_before(q, at, char::is_alphanumeric)
+}
+
+/// Where the word at or after `at` ends.
+fn word_end(q: &str, at: usize) -> usize {
+    let stops = stops(q);
+    let is_word = |s: &&usize| q[**s..].chars().next().is_some_and(char::is_alphanumeric);
+    let on = stops.iter().filter(|s| **s >= at);
+    let end = on.skip_while(|s| !is_word(s)).find(|s| !is_word(s));
+    end.map_or(q.len(), |s| *s)
 }
 
 pub enum Act {
@@ -84,10 +113,14 @@ pub enum Act {
 pub struct Menu {
     pub items: Vec<Item>,
     pub query: String,
+    /// where typing goes in `query`, in bytes
+    pub at: usize,
     /// (item index, matched char positions), best match first
     pub matches: Vec<(usize, Vec<u32>)>,
     pub marked: BTreeSet<usize>,
     pub multi: bool,
+    /// a question has no prompt: what's typed is out of sight, so no key acts on it
+    pub hidden: bool,
     pub state: ListState,
     matcher: Matcher,
 }
@@ -97,9 +130,11 @@ impl Menu {
         let mut m = Menu {
             items: Vec::new(),
             query: String::new(),
+            at: 0,
             matches: Vec::new(),
             marked: BTreeSet::new(),
             multi,
+            hidden: false,
             state: ListState::default(),
             matcher: Matcher::new(Config::DEFAULT),
         };
@@ -248,27 +283,57 @@ impl Menu {
         }
     }
 
+    fn back_one(&self) -> usize {
+        let stops = stops(&self.query);
+        stops.into_iter().rfind(|&s| s < self.at).unwrap_or(0)
+    }
+
+    fn on_one(&self) -> usize {
+        let stops = stops(&self.query);
+        let next = stops.into_iter().find(|&s| s > self.at);
+        next.unwrap_or(self.query.len())
+    }
+
+    /// Whether there's text on screen for the keys to edit.
+    pub fn typed(&self) -> bool {
+        !self.hidden && !self.query.is_empty()
+    }
+
     pub fn key(&mut self, k: KeyEvent) -> Option<Act> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
+        let (at, end, typed) = (self.at, self.query.len(), self.typed());
+        // The word keys as readline and fzf have them. While there's text the keys a list uses
+        // too only edit it, so holding one down can't run into the list. Ghostty on a Mac sends
+        // cmd+← → ⌫ as ^a ^e ^u and option+← → as alt+b alt+f, and everywhere ctrl+⌫ as ^h
         match k.code {
-            KeyCode::Enter | KeyCode::Right => return Some(Act::Accept),
+            KeyCode::Enter => return Some(Act::Accept),
             KeyCode::Char('l') if ctrl => return Some(Act::Accept),
-            // most terminals send ctrl+backspace as ^h, so it deletes while there's text
-            KeyCode::Char('h') | KeyCode::Left if ctrl && !self.query.is_empty() => {
-                self.edit(drop_word)
-            }
-            KeyCode::Left => return Some(Act::Back),
+            KeyCode::Char('h') if ctrl && typed => self.cut(word_start(&self.query, at), at),
             KeyCode::Char('h') if ctrl => return Some(Act::Back),
-            KeyCode::Esc if !self.query.is_empty() => self.edit(String::clear),
+            KeyCode::Left if !typed => return Some(Act::Back),
+            KeyCode::Left if ctrl || alt => self.at = word_start(&self.query, at),
+            KeyCode::Char('b') if alt => self.at = word_start(&self.query, at),
+            KeyCode::Left => self.at = self.back_one(),
+            KeyCode::Char('b') if ctrl => self.at = self.back_one(),
+            KeyCode::Right if !typed => return Some(Act::Accept),
+            KeyCode::Right if ctrl || alt => self.at = word_end(&self.query, at),
+            KeyCode::Char('f') if alt => self.at = word_end(&self.query, at),
+            KeyCode::Right => self.at = self.on_one(),
+            KeyCode::Char('f') if ctrl => self.at = self.on_one(),
+            KeyCode::Esc if end > 0 => self.edit(String::clear),
             KeyCode::Esc => return Some(Act::Back),
             KeyCode::Up => self.step(-1),
             KeyCode::Down => self.step(1),
+            // at the end of the text a shell's ^k has nothing to do, so it stays fzf's up
+            KeyCode::Char('k') if ctrl && at < end => self.cut(at, end),
             KeyCode::Char('p' | 'k') if ctrl => self.step(-1),
             KeyCode::Char('n' | 'j') if ctrl => self.step(1),
             KeyCode::PageUp => self.step(-10),
             KeyCode::PageDown => self.step(10),
+            KeyCode::Home if typed => self.at = 0,
             KeyCode::Home => self.state.select(Some(0)),
+            KeyCode::End if typed => self.at = end,
             KeyCode::End => self.step(isize::MAX / 2),
             KeyCode::Tab => {
                 self.toggle();
@@ -278,7 +343,9 @@ impl Menu {
                 self.toggle();
                 self.step(-1);
             }
-            KeyCode::Char('a') if ctrl && self.multi => {
+            KeyCode::Char('a') if ctrl => self.at = 0,
+            KeyCode::Char('e') if ctrl => self.at = end,
+            KeyCode::Char('t') if ctrl && self.multi => {
                 let visible: Vec<usize> = (self.matches.iter().map(|m| m.0))
                     .filter(|&i| !self.items[i].action)
                     .collect();
@@ -288,22 +355,58 @@ impl Menu {
                     self.marked.extend(visible);
                 }
             }
-            KeyCode::Char('u') if ctrl => self.edit(String::clear),
-            KeyCode::Char('w') if ctrl => self.edit(drop_word),
-            KeyCode::Backspace if ctrl || alt => self.edit(drop_word),
-            KeyCode::Backspace => self.edit(|q| _ = q.pop()),
-            KeyCode::Char(c) if !ctrl => self.edit(|q| q.push(c)),
+            KeyCode::Char('u') if ctrl => self.cut(0, at),
+            KeyCode::Char('w') if ctrl => self.cut(word_before(&self.query, at, spaced), at),
+            KeyCode::Backspace if ctrl || alt => self.cut(word_start(&self.query, at), at),
+            KeyCode::Backspace => self.cut(self.back_one(), at),
+            KeyCode::Delete if ctrl || alt => self.cut(at, word_end(&self.query, at)),
+            KeyCode::Char('d') if alt => self.cut(at, word_end(&self.query, at)),
+            KeyCode::Delete => self.cut(at, self.on_one()),
+            KeyCode::Char('d') if ctrl => self.cut(at, self.on_one()),
+            KeyCode::Char(c) if !ctrl => self.put(c.encode_utf8(&mut [0; 4])),
             _ => {}
+        }
+        // a cursor nobody can see stays after what's typed
+        if self.hidden {
+            self.at = self.query.len();
         }
         None
     }
 
+    /// On one line, as a prompt is. Its spaces stay, and what's submitted gets trimmed.
     pub fn paste(&mut self, text: &str) {
-        self.edit(|q| q.push_str(text.trim()));
+        self.put(&text.replace(char::is_control, " "));
     }
 
+    /// Replaces the text, with the cursor after it.
     pub fn edit(&mut self, f: impl FnOnce(&mut String)) {
         f(&mut self.query);
+        self.at = self.query.len();
+        self.filter();
+    }
+
+    /// `text` where the cursor is, with the cursor after it.
+    fn put(&mut self, text: &str) {
+        self.query.insert_str(self.at, text);
+        self.changed(self.at + text.len());
+    }
+
+    /// Takes `from..to` out of the text. Nothing to take leaves the list where it is too.
+    fn cut(&mut self, from: usize, to: usize) {
+        if from < to {
+            self.query.replace_range(from..to, "");
+            self.changed(from);
+        }
+    }
+
+    /// The text changed, with the cursor at `at`, or after what that's now inside of: two
+    /// halves of a flag join into one.
+    fn changed(&mut self, at: usize) {
+        let stops = stops(&self.query);
+        self.at = stops
+            .into_iter()
+            .find(|&s| s >= at)
+            .unwrap_or(self.query.len());
         self.filter();
     }
 }
@@ -331,7 +434,7 @@ mod tests {
     fn marks_follow_items_and_skip_actions() {
         let mut m = menu();
         m.items[3].action = true;
-        m.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        m.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(m.selection(), [0, 1, 2], "the action isn't marked");
         // a new item in front: the marks move along with theirs
         let mut items = vec![Item::new("new", "New", "")];
@@ -466,7 +569,7 @@ mod tests {
         press(&mut m, KeyCode::Down);
         press(&mut m, KeyCode::Tab);
         assert_eq!(m.selection(), [0, 2]);
-        m.key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        m.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL));
         assert_eq!(m.selection(), [0, 1, 2, 3]);
         press(&mut m, KeyCode::Up);
         press(&mut m, KeyCode::Up);
@@ -508,7 +611,6 @@ mod tests {
             (KeyCode::Char('h'), ctrl), // how most terminals send ctrl+backspace
             (KeyCode::Backspace, ctrl),
             (KeyCode::Backspace, alt),
-            (KeyCode::Left, ctrl),
         ];
         for (code, mods) in keys {
             let mut m = Menu::new(Vec::new(), false);
@@ -518,28 +620,263 @@ mod tests {
             m.key(KeyEvent::new(code, mods));
             assert_eq!(m.query, "attack ", "{code:?}");
         }
-        // a path goes a folder at a time, down to nothing
-        let mut m = Menu::new(Vec::new(), false);
-        m.edit(|q| *q = "~/Videos/Anime".into());
-        for left in ["~/Videos/", "~/", ""] {
-            m.key(KeyEvent::new(KeyCode::Char('h'), ctrl));
-            assert_eq!(m.query, left);
+        // a path goes a folder at a time, down to nothing, and all at once with ^w
+        for (code, mods) in &keys[1..] {
+            let mut m = typed("~/Videos/Anime");
+            for left in ["~/Videos/", "~/", ""] {
+                m.key(KeyEvent::new(*code, *mods));
+                assert_eq!(m.query, left, "{code:?}");
+            }
         }
+        let mut m = typed("~/Videos/Anime");
+        m.key(KeyEvent::new(KeyCode::Char('w'), ctrl));
+        assert_eq!(m.query, "");
+        // ^w goes back to a space, the others stop at anything that isn't a letter
+        let mut m = Menu::new(Vec::new(), false);
+        m.edit(|q| *q = "kaguya-sama".into());
+        m.key(KeyEvent::new(KeyCode::Backspace, alt));
+        assert_eq!(m.query, "kaguya-");
+        m.edit(|q| *q = "kaguya-sama".into());
+        m.key(KeyEvent::new(KeyCode::Char('w'), ctrl));
+        assert_eq!(m.query, "");
         // text that isn't ASCII is cut between characters
         m.edit(|q| *q = "葬送の フリーレン".into());
         m.key(KeyEvent::new(KeyCode::Char('h'), ctrl));
         assert_eq!(m.query, "葬送の ");
-        // with nothing typed they still go back, and a plain ← always does
+        // with nothing typed there's no word to delete, and they go back
         m.edit(String::clear);
-        for code in [KeyCode::Char('h'), KeyCode::Left] {
-            let act = m.key(KeyEvent::new(code, ctrl));
+        for (code, mods) in [
+            (KeyCode::Char('h'), ctrl),
+            (KeyCode::Left, ctrl),
+            (KeyCode::Left, KeyModifiers::NONE),
+        ] {
+            let act = m.key(KeyEvent::new(code, mods));
             assert!(matches!(act, Some(Act::Back)), "{code:?}");
         }
-        m.edit(|q| *q = "frieren".into());
+    }
+
+    /// `text` with `|` where the cursor is.
+    fn at(m: &Menu) -> String {
+        format!("{}|{}", &m.query[..m.at], &m.query[m.at..])
+    }
+
+    fn typed(text: &str) -> Menu {
+        let mut m = Menu::new(Vec::new(), false);
+        m.edit(|q| *q = text.into());
+        m
+    }
+
+    /// The keys a shell's prompt has, as the terminal sends them: each moves or deletes from
+    /// the middle of the text and nothing else on the screen happens.
+    #[test]
+    fn a_prompt_edits_text_as_a_shell_does() {
+        let (none, ctrl, alt) = (KeyModifiers::NONE, KeyModifiers::CONTROL, KeyModifiers::ALT);
+        let keys: &[(KeyCode, KeyModifiers, &str)] = &[
+            // moving a character
+            (KeyCode::Left, none, "attack o|n titan"),
+            (KeyCode::Char('b'), ctrl, "attack o|n titan"),
+            (KeyCode::Right, none, "attack on |titan"),
+            (KeyCode::Char('f'), ctrl, "attack on |titan"),
+            // moving a word: ctrl+arrows on Linux, option+arrows on a Mac, which is alt+b, alt+f
+            (KeyCode::Left, ctrl, "attack |on titan"),
+            (KeyCode::Left, alt, "attack |on titan"),
+            (KeyCode::Char('b'), alt, "attack |on titan"),
+            (KeyCode::Right, ctrl, "attack on titan|"),
+            (KeyCode::Right, alt, "attack on titan|"),
+            (KeyCode::Char('f'), alt, "attack on titan|"),
+            // to either end: cmd+arrows on a Mac are ^a, ^e
+            (KeyCode::Home, none, "|attack on titan"),
+            (KeyCode::Char('a'), ctrl, "|attack on titan"),
+            (KeyCode::End, none, "attack on titan|"),
+            (KeyCode::Char('e'), ctrl, "attack on titan|"),
+            // deleting a character
+            (KeyCode::Backspace, none, "attack o| titan"),
+            (KeyCode::Delete, none, "attack on|titan"),
+            (KeyCode::Char('d'), ctrl, "attack on|titan"),
+            // deleting a word
+            (KeyCode::Char('w'), ctrl, "attack | titan"),
+            (KeyCode::Backspace, alt, "attack | titan"),
+            (KeyCode::Char('h'), ctrl, "attack | titan"),
+            (KeyCode::Char('d'), alt, "attack on|"),
+            (KeyCode::Delete, ctrl, "attack on|"),
+            (KeyCode::Delete, alt, "attack on|"),
+            // deleting to either end: cmd+backspace on a Mac is ^u
+            (KeyCode::Char('u'), ctrl, "| titan"),
+            (KeyCode::Char('k'), ctrl, "attack on|"),
+        ];
+        for (code, mods, want) in keys {
+            let mut m = typed("attack on titan");
+            m.at = "attack on".len();
+            let act = m.key(KeyEvent::new(*code, *mods));
+            assert!(act.is_none(), "{code:?} {mods:?} left the prompt");
+            assert_eq!(at(&m), *want, "{code:?} {mods:?}");
+        }
+        // typing and pasting go where the cursor is
+        let mut m = typed("attack titan");
+        m.at = "attack ".len();
+        press(&mut m, KeyCode::Char('o'));
+        m.paste("n ");
+        assert_eq!(at(&m), "attack on |titan");
+        // on one line, with its spaces
+        let mut m = typed("ab");
+        m.at = 1;
+        m.paste(" x\ny ");
+        assert_eq!(at(&m), "a x y |b");
+        // a whole grapheme at a time, and no further than the text goes
+        let mut m = typed("e\u{301}葬");
+        press(&mut m, KeyCode::Left);
+        assert_eq!(at(&m), "e\u{301}|葬");
+        press(&mut m, KeyCode::Left);
+        assert_eq!(at(&m), "|e\u{301}葬");
+        press(&mut m, KeyCode::Delete);
+        assert_eq!(at(&m), "|葬");
+        m.key(KeyEvent::new(KeyCode::Char('b'), ctrl));
+        assert_eq!(at(&m), "|葬");
+        // what joins up around the cursor leaves it after the whole of it
+        let mut m = typed("🇷");
+        press(&mut m, KeyCode::Home);
+        m.paste("🇫");
+        assert_eq!(at(&m), "🇫🇷|");
+        let mut m = typed("🇫x🇷");
+        m.at = "🇫x".len();
+        press(&mut m, KeyCode::Backspace);
+        assert_eq!(at(&m), "🇫🇷|");
+    }
+
+    #[test]
+    fn while_theres_text_the_keys_a_list_uses_too_only_edit_it() {
+        let (ctrl, alt) = (KeyModifiers::CONTROL, KeyModifiers::ALT);
+        let mut m = menu();
+        m.edit(|q| *q = "fr".into());
+        press(&mut m, KeyCode::Down);
+        let row = m.state.selected();
+        assert_eq!(row, Some(1));
+        // held down they stop at the text's ends, and the list stays where it is
+        for code in [KeyCode::Right, KeyCode::End, KeyCode::Delete] {
+            for mods in [KeyModifiers::NONE, ctrl, alt] {
+                for _ in 0..3 {
+                    assert!(m.key(KeyEvent::new(code, mods)).is_none(), "{code:?}");
+                    assert_eq!(at(&m), "fr|", "{code:?}");
+                    assert_eq!(m.state.selected(), row, "{code:?}");
+                }
+            }
+        }
+        m.key(KeyEvent::new(KeyCode::Char('f'), ctrl));
+        assert_eq!(at(&m), "fr|");
+        for code in [KeyCode::Left, KeyCode::Home, KeyCode::Backspace] {
+            for mods in [KeyModifiers::NONE, ctrl, alt] {
+                m.at = 0;
+                for _ in 0..3 {
+                    assert!(m.key(KeyEvent::new(code, mods)).is_none(), "{code:?}");
+                    assert_eq!(at(&m), "|fr", "{code:?}");
+                    assert_eq!(m.state.selected(), row, "{code:?}");
+                }
+            }
+        }
+        // ^a only moves, so it can't mark what a cmd+← didn't mean to, or lose marks made by hand
+        press(&mut m, KeyCode::Tab);
+        assert_eq!(m.marked.len(), 1);
+        for _ in 0..3 {
+            m.key(KeyEvent::new(KeyCode::Char('a'), ctrl));
+            assert_eq!((at(&m).as_str(), m.marked.len()), ("|fr", 1));
+        }
+        // ^t marks what the filter left, whatever the cursor is doing, and again unmarks it
+        m.key(KeyEvent::new(KeyCode::Char('t'), ctrl));
+        assert_eq!(m.marked.len(), m.matches.len());
+        m.key(KeyEvent::new(KeyCode::Char('t'), ctrl));
+        assert!(m.marked.is_empty());
+        // ^k deletes what's after the cursor, and with nothing after it it's up, as in fzf
+        m.at = 1;
+        m.state.select(Some(1));
+        m.key(KeyEvent::new(KeyCode::Char('k'), ctrl));
+        assert_eq!(at(&m), "f|");
+        m.state.select(Some(1));
+        m.key(KeyEvent::new(KeyCode::Char('k'), ctrl));
+        assert_eq!((at(&m).as_str(), m.state.selected()), ("f|", Some(0)));
+        // enter and ^l select from anywhere in it
+        m.at = 0;
         assert!(matches!(
-            m.key(KeyEvent::from(KeyCode::Left)),
-            Some(Act::Back)
+            m.key(KeyEvent::from(KeyCode::Enter)),
+            Some(Act::Accept)
         ));
-        assert_eq!(m.query, "frieren");
+        assert!(matches!(
+            m.key(KeyEvent::new(KeyCode::Char('l'), ctrl)),
+            Some(Act::Accept)
+        ));
+    }
+
+    #[test]
+    fn with_no_text_on_screen_the_keys_act_on_the_list() {
+        let ctrl = KeyModifiers::CONTROL;
+        for hidden in [false, true] {
+            let mut m = menu();
+            m.hidden = hidden;
+            if hidden {
+                // what a question has typed is out of sight, wherever its cursor is
+                m.edit(|q| *q = "f".into());
+                m.at = 0;
+            }
+            let last = Some(m.matches.len() - 1);
+            press(&mut m, KeyCode::End);
+            assert_eq!(m.state.selected(), last, "{hidden}");
+            press(&mut m, KeyCode::Home);
+            assert_eq!(m.state.selected(), Some(0), "{hidden}");
+            let keys = [
+                (KeyCode::Left, KeyModifiers::NONE, false),
+                (KeyCode::Left, ctrl, false),
+                (KeyCode::Char('h'), ctrl, false),
+                (KeyCode::Right, KeyModifiers::NONE, true),
+                (KeyCode::Right, ctrl, true),
+            ];
+            for (code, mods, accepts) in keys {
+                match m.key(KeyEvent::new(code, mods)) {
+                    Some(Act::Accept) => assert!(accepts, "{code:?}"),
+                    Some(Act::Back) => assert!(!accepts, "{code:?}"),
+                    None => panic!("{code:?} did nothing with {hidden}"),
+                }
+            }
+        }
+    }
+
+    /// Whatever's pressed in whatever order, the cursor stays between graphemes.
+    #[test]
+    fn no_key_leaves_the_cursor_inside_a_grapheme() {
+        let (none, ctrl, alt) = (KeyModifiers::NONE, KeyModifiers::CONTROL, KeyModifiers::ALT);
+        let mut keys = Vec::new();
+        for mods in [none, ctrl, alt] {
+            let codes = [
+                KeyCode::Left,
+                KeyCode::Right,
+                KeyCode::Home,
+                KeyCode::End,
+                KeyCode::Backspace,
+                KeyCode::Delete,
+                KeyCode::Char('a'),
+                KeyCode::Char('b'),
+                KeyCode::Char('d'),
+                KeyCode::Char('e'),
+                KeyCode::Char('f'),
+                KeyCode::Char('h'),
+                KeyCode::Char('k'),
+                KeyCode::Char('u'),
+                KeyCode::Char('w'),
+                KeyCode::Char('é'),
+            ];
+            keys.extend(codes.map(|code| KeyEvent::new(code, mods)));
+        }
+        // a mark on its own, an emoji of several chars, flags
+        let text = "\u{301}葬 e\u{301}/ab 👨‍👩‍👧 🇩🇪🇫🇷";
+        for start in [0, text.find('/').unwrap(), text.len()] {
+            for first in &keys {
+                for second in &keys {
+                    let mut m = typed(text);
+                    m.at = start;
+                    for k in [first, second] {
+                        m.key(*k);
+                        assert!(stops(&m.query).contains(&m.at), "{k:?} in {:?}", m.query);
+                    }
+                }
+            }
+        }
     }
 }

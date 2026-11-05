@@ -3,17 +3,18 @@
 #
 #   curl -fsSL https://raw.githubusercontent.com/ReynkeDeVos/ani-hop/main/install.sh | sh
 #
-# System packages come from the distro, with sudo, and so does ani-cli where it has one new
-# enough (on Arch the AUR, through yay or paru). Otherwise it, ani-hop and, where the distro's is
-# too old (Debian, Ubuntu), yt-dlp go into ~/.local/bin, so `ani-cli -U` needs no sudo.
-# Run it again to update them. ANI_HOP_RELEASE_URL picks another release, for example
+# System packages come from the distro, with sudo. ani-cli is only installed if there's none at
+# all, whatever its version, as ani-hop says when there's a newer one: on Arch from the AUR,
+# through yay or paru, otherwise its latest release. That, ani-hop and, where the distro's is too
+# old (Debian, Ubuntu), yt-dlp go into ~/.local/bin, so `ani-cli -U` needs no sudo.
+# Run it again to update ani-hop and yt-dlp. ANI_HOP_RELEASE_URL picks another release, for example
 # https://github.com/ReynkeDeVos/ani-hop/releases/download/v0.6.0
 # ANI_HOP_KEEP=1 leaves ani-hop alone, for one installed another way, such as with mise.
 set -eu
 
 BIN=$HOME/.local/bin
 RELEASE=${ANI_HOP_RELEASE_URL:-https://github.com/ReynkeDeVos/ani-hop/releases/latest/download}
-ANI_CLI=https://raw.githubusercontent.com/pystardust/ani-cli/master/ani-cli
+ANI_CLI=https://github.com/pystardust/ani-cli/releases/latest/download/ani-cli
 YT_DLP=https://github.com/yt-dlp/yt-dlp/releases/latest/download
 
 say() { printf '==> %s\n' "$*"; }
@@ -49,25 +50,10 @@ arch_install() {
 
 get() { curl -fsSL --retry 3 -o "$tmp/$2" "$1" || die "could not download $1"; }
 
-# Whether version $1 is at least 5.1, which ani-hop needs.
-new_enough() {
-	[ -n "$1" ] && [ "$(printf '%s\n5.1\n' "$1" | sort -V 2>/dev/null | head -n 1)" = 5.1 ]
-}
-
-# What the system provides, however it got there: an ani-cli ani-hop can use.
-packaged() {
-	pkg_cli=$(new_enough "$(/usr/bin/ani-cli -V 2>/dev/null || true)" && echo 1 || true)
-}
-
 drop() {
 	[ -e "$1" ] || return 0
 	rm -f "$1"
 	say "Removed $1, the system's copy is used instead"
-}
-
-# Removes an earlier run's copy the system's now replaces: ours would come first on PATH.
-drop_copies() {
-	[ -z "$pkg_cli" ] || drop "$BIN/ani-cli"
 }
 
 # The last step is a rename inside the target dir, so a failed download never leaves half
@@ -120,8 +106,7 @@ main() {
 	[ ! -e /run/ostree-booted ] || os=other
 
 	# ani-hop-bin brings ani-cli and the rest, which update with the system. The steps below
-	# still run, to fill in what the packages leave out (an ani-cli too old); only the release
-	# download is skipped.
+	# still run, to fill in what the packages leave out; only the release download is skipped.
 	hop=$BIN/ani-hop
 	if [ -n "${ANI_HOP_KEEP-}" ]; then
 		hop=$(command -v ani-hop) || die "ANI_HOP_KEEP is set, but there's no ani-hop on your PATH"
@@ -186,35 +171,22 @@ main() {
 		place yt-dlp "$BIN/yt-dlp" 755
 	fi
 
-	# ani-cli: the system's package where it's new enough, as that updates with the system; the
-	# AUR only has it installed if it's missing, without a system upgrade.
-	case $os in
-	arch)
-		for helper in yay paru; do
-			have "$helper" || continue
-			pacman -T ani-cli >/dev/null && break
-			say "Installing ani-cli from the AUR with $helper"
-			arch_install "$helper" -S --needed ani-cli || warn "the AUR install failed, so upstream's copy is used"
-			break
-		done
-		;;
-	debian)
-		v=$(LC_ALL=C apt-cache policy ani-cli 2>/dev/null | sed -n 's/^ *Candidate: //p')
-		v=${v#*:}
-		if new_enough "${v%%-*}"; then as_root apt-get install -y ani-cli || true; fi
-		;;
-	fedora)
-		v=$(dnf -q repoquery --latest-limit=1 --qf '%{version}\n' ani-cli 2>/dev/null || true)
-		if new_enough "$v"; then as_root dnf install -y ani-cli || true; fi
-		;;
-	esac
-	# what's really there decides, also a package installed by hand
-	packaged
-	drop_copies
-	if [ -z "$pkg_cli" ]; then
-		say "Installing ani-cli into $BIN"
-		get "$ANI_CLI" ani-cli
-		place ani-cli "$BIN/ani-cli" 755
+	# ani-cli: only if there's none at all. The AUR's updates with the system, and without a
+	# system upgrade here.
+	if ! { have ani-cli || [ -x "$BIN/ani-cli" ]; }; then
+		if [ "$os" = arch ]; then
+			for helper in yay paru; do
+				have "$helper" || continue
+				say "Installing ani-cli from the AUR with $helper"
+				arch_install "$helper" -S --needed ani-cli || warn "the AUR install failed, so upstream's copy is used"
+				break
+			done
+		fi
+		if ! have ani-cli; then
+			say "Installing ani-cli's latest release into $BIN"
+			get "$ANI_CLI" ani-cli
+			place ani-cli "$BIN/ani-cli" 755
+		fi
 	fi
 
 	if [ "$hop" = "$BIN/ani-hop" ] && [ -z "${ANI_HOP_KEEP-}" ]; then
@@ -252,8 +224,7 @@ main() {
 	esac
 
 	version=$("$hop" --version) || die "$hop was installed but does not run"
-	cli=$BIN/ani-cli
-	[ -z "$pkg_cli" ] || cli=/usr/bin/ani-cli
+	cli=$(command -v ani-cli || echo "$BIN/ani-cli")
 	say "Done: $version, ani-cli $("$cli" -V 2>/dev/null || echo '(not working yet)')"
 }
 

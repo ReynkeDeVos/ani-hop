@@ -310,15 +310,20 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     ])
     .areas(inner);
 
-    // what's typed starts where the rows' labels do; a long text keeps its end in view, where
-    // typing goes, with the cursor after it
+    // what's typed starts where the rows' labels do; a long text keeps in view where typing
+    // goes, with a column free after it for the cursor, and some of what follows the cursor
     let room = (prompt_area.width as usize).saturating_sub(4);
+    let (before, after) = screen.menu.query.split_at(screen.menu.at);
+    let follows = Span::raw(after).width().min(room / 3);
+    let before = fit_start(before, room - follows);
+    let left = room + 1 - Span::raw(&before).width();
     let mut prompt = Line::from(vec![
         Span::styled("❯  ", Style::new().fg(ACCENT).bold()),
-        Span::raw(fit_start(&screen.menu.query, room)),
+        Span::raw(before),
     ]);
     let cursor_x =
         (prompt_area.x + prompt.width() as u16).min(prompt_area.right().saturating_sub(1));
+    prompt.push_span(Span::raw(fit(after.to_string(), left)));
     // what typing does on this screen, where it's going to appear, and whole or not at all
     let hint = match &screen.view {
         View::Input(Input::Search) => "type to search AniList",
@@ -339,7 +344,10 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         ),
         None => {
             f.render_widget(prompt, prompt_area);
-            f.set_cursor_position((cursor_x, prompt_area.y));
+            // none until there's text to be in
+            if !screen.menu.query.is_empty() {
+                f.set_cursor_position((cursor_x, prompt_area.y));
+            }
         }
     }
 
@@ -848,14 +856,25 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
             v.push("".into());
         }
         v.extend([
-            key("↑ ↓", "move", "^k ^j"),
-            key("→", "select", "^l"),
-            // with text typed ^h deletes a word of it instead
+            // ^k deletes what's after the cursor
             key(
-                "←",
-                "back",
-                if top.menu.query.is_empty() { "^h" } else { "" },
+                "↑ ↓",
+                "move",
+                if top.menu.at < top.menu.query.len() {
+                    "^j"
+                } else {
+                    "^k ^j"
+                },
             ),
+            // while there's text they edit it
+            match top.menu.typed() {
+                true => key("← →", "move in the text", ""),
+                false => key("→", "select", "^l"),
+            },
+            match top.menu.typed() {
+                true => key("^l", "select", ""),
+                false => key("←", "back", "^h"),
+            },
             "".into(),
             key("type", "filter the list", ""),
             // 35 columns, of the 42 that 80 leave the preview
@@ -894,7 +913,7 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
     }
     // not while a filter hides every row: there's nothing to mark
     if screen.menu.multi && !screen.menu.matches.is_empty() {
-        keys.splice(0..0, [("tab", "mark"), ("^a", "all")]);
+        keys.splice(0..0, [("tab", "mark"), ("^t", "all")]);
     }
     if matches!(&screen.view, View::Shows(list) if list.more_page().is_some()) {
         let at = keys

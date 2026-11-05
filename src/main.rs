@@ -1033,7 +1033,8 @@ impl App {
         }
         let multi = matches!(view, View::Shows(..) | View::Episodes(_, EpMode::Download));
         self.scan_local();
-        let menu = Menu::new(self.items(&view), multi);
+        let mut menu = Menu::new(self.items(&view), multi);
+        menu.hidden = matches!(view, View::Confirm(_));
         self.next_id += 1;
         self.stack.push(Screen {
             id: self.next_id,
@@ -1584,7 +1585,10 @@ impl App {
             return self.request_quit();
         }
         // the next page of a ranking from anywhere in it, not just on "More…" at its end
-        if ctrl && k.code == KeyCode::Char('f') {
+        if ctrl
+            && k.code == KeyCode::Char('f')
+            && matches!(&self.top().view, View::Shows(list) if list.paged())
+        {
             return self.more();
         }
         // fzf's preview keys page through a preview that doesn't fit; Menu::key would take
@@ -1594,16 +1598,8 @@ impl App {
         {
             return self.preview.scroll(k.code == KeyCode::Down);
         }
-        // a question has no prompt, so any filter it has is out of sight: these keep going back
-        let asked = matches!(self.top().view, View::Confirm(_));
-        if asked && ctrl && matches!(k.code, KeyCode::Char('h') | KeyCode::Left) {
-            return self.pop(1);
-        }
-        // typing is the text itself on an input: ← doesn't throw it away, esc clears it first
-        let typed = matches!(self.top().view, View::Input(_)) && !self.top().menu.query.is_empty();
         match self.top().menu.key(k) {
             Some(Act::Accept) => self.accept(),
-            Some(Act::Back) if typed => {}
             Some(Act::Back) => self.pop(1),
             None => {}
         }
@@ -4091,17 +4087,46 @@ mod tests {
     #[test]
     fn a_question_has_no_prompt_so_its_back_keys_still_go_back() {
         let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
-        for code in [KeyCode::Char('h'), KeyCode::Left] {
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        for key in [
+            ctrl(KeyCode::Char('h')),
+            ctrl(KeyCode::Left),
+            plain(KeyCode::Left),
+        ] {
             let mut app = app();
             app.push("Quit?", View::Confirm(Pending::Quit));
             // typing still filters its answers, out of sight
             press(&mut app, KeyCode::Char('q'));
             assert_eq!(app.top().menu.query, "q");
-            app.on_key(ctrl(code));
-            assert_eq!(app.stack.len(), 1, "{code:?}");
+            app.on_key(key);
+            assert_eq!(app.stack.len(), 1, "{key:?}");
         }
+        // its cursor stays after what's typed, so ^k is up there too and deletes nothing
+        let mut app = self::app();
+        app.push("Quit?", View::Confirm(Pending::Quit));
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Down);
+        app.on_key(ctrl(KeyCode::Char('a')));
+        app.on_key(ctrl(KeyCode::Char('k')));
+        assert_eq!(app.top().menu.query, "t");
+        assert_eq!(app.top().menu.current().unwrap().label, "Stay");
+        // and a paste goes after what's typed, as typing does
+        app.top().menu.paste("q");
+        assert_eq!(app.top().menu.query, "tq");
+        // and → answers
+        let mut app = self::app();
+        app.push("Quit?", View::Confirm(Pending::Quit));
+        press(&mut app, KeyCode::Char('t'));
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.top().menu.current().unwrap().label, "Quit");
+        // home goes to its first answer, not to the start of what's out of sight
+        press(&mut app, KeyCode::Home);
+        assert_eq!(app.top().menu.current().unwrap().label, "Stay");
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.stack.len(), 1, "that's Stay, so the question goes");
+        assert!(!app.quit);
         // where the text is on screen they delete a word of it instead
-        let mut app = app();
+        let mut app = self::app();
         app.push("Search", View::Input(Input::Search));
         app.top().menu.edit(|q| *q = "attack on".into());
         app.on_key(ctrl(KeyCode::Char('h')));
@@ -4109,6 +4134,137 @@ mod tests {
             (app.stack.len(), app.top().menu.query.as_str()),
             (2, "attack ")
         );
+    }
+
+    /// The prompt's row, the cursor's column on it and what's in that cell.
+    fn prompt_and_cursor(app: &mut App, w: u16, h: u16) -> (String, u16, String) {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| ui::render(app, f)).unwrap();
+        let at = term.get_cursor_position().unwrap();
+        let buf = term.backend().buffer().clone();
+        let row = (0..w).map(|x| buf[(x, at.y)].symbol().to_string());
+        (row.collect(), at.x, buf[(at.x, at.y)].symbol().to_string())
+    }
+
+    #[test]
+    fn the_cursor_is_where_typing_goes_however_long_the_text() {
+        let mut app = app();
+        app.push("Search", View::Input(Input::Search));
+        // none until there's text
+        let shows = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+            term.draw(|f| ui::render(app, f)).unwrap();
+            term.backend().cursor_visible()
+        };
+        assert!(!shows(&mut app));
+        press(&mut app, KeyCode::Char('a'));
+        assert!(shows(&mut app));
+        press(&mut app, KeyCode::Backspace);
+        assert!(!shows(&mut app));
+        // measured as drawn: 葬 takes two columns
+        app.top().menu.edit(|q| *q = "葬送 frieren".into());
+        let (_, end, on) = prompt_and_cursor(&mut app, 120, 30);
+        assert_eq!(on, " ", "after the text");
+        for _ in 0.."frieren".len() {
+            press(&mut app, KeyCode::Left);
+        }
+        let (row, x, on) = prompt_and_cursor(&mut app, 120, 30);
+        assert_eq!(on, "f");
+        assert_eq!(end - x, 7);
+        assert!(row.contains("frieren"), "{row}");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Left);
+        assert_eq!(prompt_and_cursor(&mut app, 120, 30).2, "送");
+        // too long for its row, it's in view from one end to the other, and stays on the row
+        let long: String = (0..60).map(|i| format!("w{i} ")).collect();
+        let long = long.trim_end();
+        for (w, h) in [(80, 24), (120, 30), (40, 12)] {
+            app.top().menu.edit(|q| *q = long.into());
+            let (_, right, _) = prompt_and_cursor(&mut app, w, h);
+            while app.top().menu.at > 0 {
+                press(&mut app, KeyCode::Left);
+                let at = app.top().menu.at;
+                let (row, x, on) = prompt_and_cursor(&mut app, w, h);
+                assert_eq!(on, long[at..at + 1], "{row}");
+                assert!(x <= right, "{row}");
+                // what follows it shows too, and the panel's border stays where it was
+                assert!(at + 1 == long.len() || row.contains("…"), "{row}");
+                let edge = row.chars().nth(right as usize + 1);
+                assert!(edge.is_some_and(|c| c == ' ' || c == '│'), "{w}: {row}");
+            }
+            // at its start it starts as it does when it's short
+            let (row, _, _) = prompt_and_cursor(&mut app, w, h);
+            assert!(row.contains("❯  w0 "), "{row}");
+        }
+    }
+
+    #[test]
+    fn inside_the_text_keys_edit_it_and_dont_act_on_the_screen() {
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        // ← on a filter or an input moves, and esc is what clears it and then goes back
+        let m = show(50_416, 12, None);
+        for view in [View::Input(Input::Search), View::Episodes(m, EpMode::Play)] {
+            let mut app = app();
+            app.push("Screen", view);
+            app.top().menu.edit(|q| *q = "ab".into());
+            for _ in 0..4 {
+                press(&mut app, KeyCode::Left);
+            }
+            assert_eq!(app.stack.len(), 2, "it stays");
+            assert_eq!(app.top().menu.at, 0);
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(app.top().menu.query, "");
+            assert_eq!(app.stack.len(), 2, "that cleared it");
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.stack.len(), 1, "and now ← goes back");
+        }
+        // → stays in the text too, however often it's pressed, as a search it runs into would
+        // go off, and enter is what submits it
+        let mut app = app();
+        app.push("Search", View::Input(Input::Search));
+        app.top().menu.edit(|q| *q = "ab".into());
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Right);
+        }
+        assert_eq!(app.stack.len(), 2);
+        // ^f moves the cursor, but on a list that has pages it's only ever the next one
+        press(&mut app, KeyCode::Home);
+        app.on_key(ctrl(KeyCode::Char('f')));
+        assert_eq!(app.top().menu.at, 1);
+        let feed = Feed::Pages("TRENDING_DESC".into(), None, None, false);
+        let (list, _) = List::open(feed, None, std::time::SystemTime::now());
+        app.push("Trending", View::Shows(list));
+        app.top().menu.edit(|q| *q = "ab".into());
+        press(&mut app, KeyCode::Home);
+        app.on_key(ctrl(KeyCode::Char('f')));
+        assert_eq!(app.top().menu.at, 0);
+        assert_eq!(app.toast.as_ref().unwrap().0, "No more shows");
+        // the footer and the help say what's so with the text as it is
+        let says = |app: &mut App| screen(app, 120, 30);
+        let m = show(50_417, 12, None);
+        let mut app = self::app();
+        app.push("Shows", View::Shows(List::local(Some(vec![m]))));
+        assert!(says(&mut app).contains("^t all"));
+        let first = app.top().menu.items[0].label.chars().next().unwrap();
+        app.top().menu.edit(|q| q.push(first));
+        assert!(says(&mut app).contains("^t all"));
+        let mut app = self::app();
+        let drawn = says(&mut app);
+        assert!(
+            drawn.contains("←  back") && drawn.contains("→  select"),
+            "{drawn}"
+        );
+        app.top().menu.edit(|q| *q = "s".into());
+        let drawn = says(&mut app);
+        assert!(drawn.contains("← →  move in the text"), "{drawn}");
+        assert!(
+            drawn.contains("^l  select") && drawn.contains("^k ^j"),
+            "{drawn}"
+        );
+        assert!(!drawn.contains("←  back"), "{drawn}");
+        press(&mut app, KeyCode::Home);
+        let drawn = says(&mut app);
+        assert!(!drawn.contains("^k ^j") && drawn.contains("^j"), "{drawn}");
     }
 
     #[test]
@@ -4356,7 +4512,7 @@ mod tests {
         assert!(!prompt(&mut app, 120).contains(filter));
         app.top().menu.edit(String::clear);
         assert!(prompt(&mut app, 120).contains(filter));
-        // whole or not at all, and the cursor stays on its first letter
+        // whole or not at all
         assert!(!prompt(&mut app, 20).contains("type"), "too narrow");
         // and on the lists below it
         app.push("Settings", View::Settings);
