@@ -259,16 +259,22 @@ pub fn ask_later(mal: u64, ep: &str, dub: bool, last: bool) -> Option<String> {
     ))
 }
 
+/// Whether ani-hop's mpv script asks for the times itself: only ani-hop's own mpv stand-in loads it
+/// for that, and only one that says so with `later`. The stand-ins of an ani-hop started before an
+/// update don't, and get the times before mpv starts.
+fn asks_later(player: &str, later: bool) -> bool {
+    later && player == "mpv"
+}
+
 /// What ani-cli's stand-in for ani-skip prints, for ani-cli to hand to mpv.
-pub fn flags_for_ani_cli(mal: &str, ep: &str) -> String {
+pub fn flags_for_ani_cli(mal: &str, ep: &str, later: bool) -> String {
     let Ok(mal) = mal.parse() else {
         return String::new();
     };
     let dub = std::env::var("ANI_CLI_MODE").is_ok_and(|m| m == "dub");
     let last = std::env::var_os(LAST_EPISODE).is_some();
     let player = std::env::var("ANI_CLI_PLAYER").unwrap_or_default();
-    // ani-hop's mpv stand-in, which loads the script
-    if player == "mpv" {
+    if asks_later(&player, later) {
         return ask_later(mal, ep, dub, last).unwrap_or_default();
     }
     let mut flags = flags(&times(mal, ep, dub), ani::skip_on(), last);
@@ -612,6 +618,16 @@ mod tests {
         );
         let none = read(json_for_script("x", "1", false, false, true));
         assert_eq!(none, serde_json::json!({ "chapters": [], "skip": {} }));
+    }
+
+    #[test]
+    fn only_a_stand_in_that_loads_the_script_has_it_ask_later() {
+        assert!(asks_later("mpv", true));
+        // an older ani-hop's stand-ins, still running after an update
+        assert!(!asks_later("mpv", false));
+        // a player of the user's own
+        assert!(!asks_later("/usr/bin/mpv", true));
+        assert!(!asks_later("syncplay", true));
     }
 
     #[test]

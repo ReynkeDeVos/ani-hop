@@ -90,9 +90,11 @@ while [ $# -gt 1 ]; do
 	case $1 in -i) id=$2 ;; -e) ep=$2 ;; esac
 	shift
 done
-# an update can take away the ani-hop that started this, and the one on PATH is the new one
+# an update can take away the ani-hop that started this, and the one on PATH is the new one.
+# later: this mpv stand-in loads the script that asks for the times once mpv started, and an
+# older one doesn't, so an ani-hop started before an update gets the times before mpv starts
 [ -x "$ANIHOP_EXE" ] || ANIHOP_EXE=ani-hop
-exec "$ANIHOP_EXE" --skip-flags "$id" "$ep"
+exec "$ANIHOP_EXE" --skip-flags "$id" "$ep" later
 "#;
 
 /// The mpv script that jumps over what skip::flags names, once each, so seeking back shows it.
@@ -2387,6 +2389,38 @@ mod tests {
     }
 
     #[test]
+    fn a_fake_mpv_loads_the_skip_script_for_either_way_of_giving_the_times() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-script-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("mpv");
+        write_helper(&fake, FAKE_MPV).unwrap();
+        let held = dir.join("held");
+        let script = format!("--script={}", dir.join("ani-hop-skip.lua").display());
+        let first = |opts: &str| {
+            let out = (Command::new("sh").arg(&fake).args([opts, "https://x/y"]))
+                .env("ANIHOP_HOLD", &held)
+                .env_remove("ANIHOP_SUBS_PAGE")
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let args = fs::read(&held).unwrap();
+            String::from_utf8(args.split(|b| *b == 0).next().unwrap().to_vec()).unwrap()
+        };
+        // this ani-hop asks later; an older one, still running after an update, gives the times
+        assert_eq!(first("--script-opts=ani-hop-mal=1,ani-hop-ep=2"), script);
+        assert_eq!(
+            first("--script-opts=skip-op_start=1,skip-op_end=90"),
+            script
+        );
+        // chapters alone, from an older ani-hop with skipping off: nothing to jump over
+        assert_eq!(
+            first("--chapters-file=hex://00"),
+            "--chapters-file=hex://00"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn remakes_started_at_once_take_a_folder_each() {
         let root = std::env::temp_dir().join(format!("ani-hop-remakes-{}", std::process::id()));
         let starts: Vec<_> = (0..8u64)
@@ -2757,9 +2791,12 @@ mod tests {
                 .unwrap();
             String::from_utf8(o.stdout).unwrap()
         };
-        assert_eq!(said(&["-i", "52991", "-e", "12"]), "--skip-flags,52991,12,");
+        assert_eq!(
+            said(&["-i", "52991", "-e", "12"]),
+            "--skip-flags,52991,12,later,"
+        );
         // ani-cli found no id: asked anyway, ani-hop answers with nothing
-        assert_eq!(said(&["-i", "", "-e", "12"]), "--skip-flags,,12,");
+        assert_eq!(said(&["-i", "", "-e", "12"]), "--skip-flags,,12,later,");
         // an update took away the ani-hop that's running: the one on PATH answers
         let gone = Command::new(&helper)
             .args(["-i", "1", "-e", "2"])
@@ -2770,7 +2807,7 @@ mod tests {
             )
             .output()
             .unwrap();
-        assert_eq!(gone.stdout, b"--skip-flags,1,2,");
+        assert_eq!(gone.stdout, b"--skip-flags,1,2,later,");
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -292,7 +292,10 @@ fn main() -> std::io::Result<()> {
         // what ani-cli's stand-in for ani-skip runs, not one for people
         Some("--skip-flags") => {
             let arg = |n| std::env::args().nth(n).unwrap_or_default();
-            println!("{}", skip::flags_for_ani_cli(&arg(2), &arg(3)));
+            println!(
+                "{}",
+                skip::flags_for_ani_cli(&arg(2), &arg(3), arg(4) == "later")
+            );
             return Ok(());
         }
         // what ani-hop's mpv script runs: mal, episode, then yes or no for dub, last and jump
