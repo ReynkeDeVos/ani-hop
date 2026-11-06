@@ -164,45 +164,99 @@ pub fn times(mal: u64, ep: &str, dub: bool) -> Times {
     merged(provider, aniskip)
 }
 
-/// The flags that tell mpv about `times`: the chapters mark them on its timeline whether or not it
-/// skips, and with `jump` ani-hop's mpv script reads the script-opts and jumps over them. Not over
-/// the ending of a show's `last` episode, as the story can go on after the credits there. No
-/// spaces, as ani-cli splits them on those, and inline, so there's no file to clean up.
-pub fn flags(times: &Times, jump: bool, last: bool) -> Vec<String> {
-    if *times == Times::default() {
-        return Vec::new();
-    }
-    let chapter = |start: f64, end: f64, title: &str| {
-        let (start, end) = (start * 1000.0, end * 1000.0);
-        format!("[CHAPTER]\nTIMEBASE=1/1000\nSTART={start:.0}\nEND={end:.0}\nTITLE={title}\n")
-    };
-    let mut chapters = String::from(";FFMETADATA1\n");
-    let mut opts = Vec::new();
+/// A chapter on mpv's timeline: start, end, title.
+type Chapter = (f64, f64, &'static str);
+
+/// Where `times` put mpv's chapters, and the parts to jump over: with `jump`, all but the ending of
+/// a show's `last` episode, as the story can go on after the credits there.
+fn plan(times: &Times, jump: bool, last: bool) -> (Vec<Chapter>, Vec<(&'static str, Span)>) {
+    let (mut chapters, mut skips) = (Vec::new(), Vec::new());
     let mut story = 0.0;
     let parts = [
-        (times.op, "Opening", "skip-op", jump),
-        (times.ed, "Ending", "skip-ed", jump && !last),
+        (times.op, "Opening", "op", jump),
+        (times.ed, "Ending", "ed", jump && !last),
     ];
-    for (span, title, opt, skipped) in parts {
+    for (span, title, part, skipped) in parts {
         let Some(span) = span else { continue };
         if story < span.start {
-            chapters += &chapter(story, span.start, "Episode");
+            chapters.push((story, span.start, "Episode"));
         }
-        chapters += &chapter(span.start, span.end, title);
+        chapters.push((span.start, span.end, title));
         if skipped {
-            opts.push(format!("{opt}_start={},{opt}_end={}", span.start, span.end));
+            skips.push((part, span));
         }
         story = span.end;
     }
     // mpv ignores a chapter's END, so without this one what follows the last part would count as
     // that part, like a scene after the ending. The episode's length isn't known here.
-    chapters += &chapter(story, story, "Episode");
-    let hex: String = chapters.bytes().map(|b| format!("{b:02x}")).collect();
+    if !chapters.is_empty() {
+        chapters.push((story, story, "Episode"));
+    }
+    (chapters, skips)
+}
+
+/// The flags that tell mpv about `times` before it starts, for a player of the user's own: the
+/// chapters mark them on its timeline whether or not it skips, and ani-hop's mpv script reads the
+/// script-opts and jumps over them. No spaces, as ani-cli splits them on those, and inline, so
+/// there's no file to clean up.
+pub fn flags(times: &Times, jump: bool, last: bool) -> Vec<String> {
+    let (chapters, skips) = plan(times, jump, last);
+    if chapters.is_empty() {
+        return Vec::new();
+    }
+    let mut text = String::from(";FFMETADATA1\n");
+    for (start, end, title) in chapters {
+        let (start, end) = (start * 1000.0, end * 1000.0);
+        text +=
+            &format!("[CHAPTER]\nTIMEBASE=1/1000\nSTART={start:.0}\nEND={end:.0}\nTITLE={title}\n");
+    }
+    let hex: String = text.bytes().map(|b| format!("{b:02x}")).collect();
     let mut flags = vec![format!("--chapters-file=hex://{hex}")];
-    if !opts.is_empty() {
+    if !skips.is_empty() {
+        let opts: Vec<String> = (skips.iter())
+            .map(|(part, s)| format!("skip-{part}_start={},skip-{part}_end={}", s.start, s.end))
+            .collect();
         flags.push(format!("--script-opts={}", opts.join(",")));
     }
     flags
+}
+
+/// What ani-hop's mpv script hears when it asks for `times` once mpv has started: the chapters and
+/// the parts to jump over.
+fn json(times: &Times, jump: bool, last: bool) -> String {
+    let (chapters, skips) = plan(times, jump, last);
+    let chapters: Vec<_> = (chapters.iter())
+        .map(|(time, _, title)| serde_json::json!({ "time": time, "title": title }))
+        .collect();
+    let mut skip = serde_json::Map::new();
+    for (part, s) in skips {
+        skip.insert(format!("{part}_start"), s.start.into());
+        skip.insert(format!("{part}_end"), s.end.into());
+    }
+    serde_json::json!({ "chapters": chapters, "skip": skip }).to_string()
+}
+
+/// `ani-hop --skip-json`, which ani-hop's mpv script runs in the background.
+pub fn json_for_script(mal: &str, ep: &str, dub: bool, last: bool, jump: bool) -> String {
+    match mal.parse() {
+        Ok(mal) => json(&times(mal, ep, dub), jump, last),
+        Err(_) => json(&Times::default(), false, false),
+    }
+}
+
+/// The flag that has ani-hop's mpv script ask for the times itself, so mpv starts without waiting
+/// for them: the chapters arrive a moment later, and the jumps with them. Whether to jump is
+/// decided now, so an episode fetched ahead keeps what it was fetched with.
+pub fn ask_later(mal: u64, ep: &str, dub: bool, last: bool) -> Option<String> {
+    // a comma would end the option, and it goes into URLs
+    if ep.is_empty() || !ep.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+        return None;
+    }
+    let yes = |on: bool| if on { "yes" } else { "no" };
+    let (dub, last, jump) = (yes(dub), yes(last), yes(ani::skip_on()));
+    Some(format!(
+        "--script-opts=ani-hop-mal={mal},ani-hop-ep={ep},ani-hop-dub={dub},ani-hop-last={last},ani-hop-jump={jump}"
+    ))
 }
 
 /// What ani-cli's stand-in for ani-skip prints, for ani-cli to hand to mpv.
@@ -212,8 +266,12 @@ pub fn flags_for_ani_cli(mal: &str, ep: &str) -> String {
     };
     let dub = std::env::var("ANI_CLI_MODE").is_ok_and(|m| m == "dub");
     let last = std::env::var_os(LAST_EPISODE).is_some();
-    let mut flags = flags(&times(mal, ep, dub), ani::skip_on(), last);
     let player = std::env::var("ANI_CLI_PLAYER").unwrap_or_default();
+    // ani-hop's mpv stand-in, which loads the script
+    if player == "mpv" {
+        return ask_later(mal, ep, dub, last).unwrap_or_default();
+    }
+    let mut flags = flags(&times(mal, ep, dub), ani::skip_on(), last);
     let jumps = flags.iter().any(|f| f.starts_with("--script-opts="));
     if jumps && let Some(script) = script_flag(&player, &ani::skip_script()) {
         flags.push(script);
@@ -519,6 +577,51 @@ mod tests {
             false,
         );
         assert_eq!(chapters(&f[0]).matches("TITLE=Episode").count(), 1);
+    }
+
+    #[test]
+    fn the_script_hears_the_chapters_and_only_what_to_jump_over() {
+        let both = Times {
+            op: span(10.0, 100.0),
+            ed: span(1300.0, 1390.0),
+        };
+        let read = |text: String| serde_json::from_str::<serde_json::Value>(&text).unwrap();
+        let on = read(json(&both, true, false));
+        let titles: Vec<_> = on["chapters"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["title"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            titles,
+            ["Episode", "Opening", "Episode", "Ending", "Episode"]
+        );
+        assert_eq!(on["chapters"][3]["time"], 1300.0);
+        assert_eq!(
+            on["skip"],
+            serde_json::json!({ "op_start": 10.0, "op_end": 100.0, "ed_start": 1300.0, "ed_end": 1390.0 })
+        );
+        let off = read(json(&both, false, false));
+        assert_eq!(off["chapters"], on["chapters"]);
+        assert_eq!(off["skip"], serde_json::json!({}));
+        let last = read(json(&both, true, true));
+        assert_eq!(
+            last["skip"],
+            serde_json::json!({ "op_start": 10.0, "op_end": 100.0 })
+        );
+        let none = read(json_for_script("x", "1", false, false, true));
+        assert_eq!(none, serde_json::json!({ "chapters": [], "skip": {} }));
+    }
+
+    #[test]
+    fn asking_later_says_the_episode_in_one_option() {
+        let flag = ask_later(59978, "1", true, false).unwrap();
+        assert!(flag.starts_with("--script-opts=ani-hop-mal=59978,ani-hop-ep=1,ani-hop-dub=yes,ani-hop-last=no,ani-hop-jump="), "{flag}");
+        assert!(!flag.contains(char::is_whitespace));
+        for ep in ["", "1,ani-hop-jump=yes", "12 3"] {
+            assert_eq!(ask_later(1, ep, false, false), None, "{ep}");
+        }
     }
 
     #[test]

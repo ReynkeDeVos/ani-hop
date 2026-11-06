@@ -295,6 +295,16 @@ fn main() -> std::io::Result<()> {
             println!("{}", skip::flags_for_ani_cli(&arg(2), &arg(3)));
             return Ok(());
         }
+        // what ani-hop's mpv script runs: mal, episode, then yes or no for dub, last and jump
+        Some("--skip-json") => {
+            let arg = |n| std::env::args().nth(n).unwrap_or_default();
+            let yes = |n| arg(n) == "yes";
+            println!(
+                "{}",
+                skip::json_for_script(&arg(2), &arg(3), yes(4), yes(5), yes(6))
+            );
+            return Ok(());
+        }
         Some(arg) => {
             eprintln!("ani-hop: unknown option {arg}\n{usage}");
             std::process::exit(2);

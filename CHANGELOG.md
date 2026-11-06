@@ -7,7 +7,8 @@
 - mpv's timeline marks the opening and the ending whether skipping is on or off. Before, the marks only came with skipping on.
 - A show's last episode marks its ending too. It still doesn't skip it.
 - Skipping starts off on a new install. If you already use ani-hop, your setting stays as it is.
-- With skipping off, an episode now waits for the opening and ending times before mpv starts, as it already did with skipping on. That took 0.1 to 0.3 seconds in a test, and it gives up after 5 seconds on a network that hangs.
+- mpv no longer waits for the opening and ending times. It starts at once, and the marks and skips follow: about 0.15 seconds into a downloaded episode, and as soon as a stream has loaded. Before, a stream waited 0.1 to 0.3 seconds for them, and a downloaded episode up to 5 seconds on a network that hangs. On a downloaded episode whose opening starts right away, you may see its first moment before the skip.
+- A player you set in `ANI_CLI_PLAYER` still gets the times before it starts, as it may not be able to load ani-hop's mpv script.
 
 ### Fixed
 

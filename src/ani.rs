@@ -68,10 +68,10 @@ case " $* " in
 *" --sub-file="*) ;;
 *) [ -n "$ANIHOP_SUBS_PAGE" ] && ani-hop-subs "$ANIHOP_SUBS_PAGE" "$ANIHOP_SUBS_FILE" && set -- --sub-file="$ANIHOP_SUBS_FILE" "$@" ;;
 esac
-# ani-skip's stand-in named the times, this is what jumps over them. Here as it can't say a path
-# with spaces: ani-cli splits what it says on those
+# ani-skip's stand-in named the episode, this is what marks and jumps over its opening and ending.
+# Here as it can't say a path with spaces: ani-cli splits what it says on those
 case " $* " in
-*" --script-opts=skip-"*) set -- --script="${0%/*}/ani-hop-skip.lua" "$@" ;;
+*" --script-opts=ani-hop-"* | *" --script-opts=skip-"*) set -- --script="${0%/*}/ani-hop-skip.lua" "$@" ;;
 esac
 # fetched ahead: what mpv would start with goes in a file, for when the episode is wanted
 if [ -n "$ANIHOP_HOLD" ]; then
@@ -96,10 +96,50 @@ exec "$ANIHOP_EXE" --skip-flags "$id" "$ep"
 "#;
 
 /// The mpv script that jumps over what skip::flags names, once each, so seeking back shows it.
-/// It reads the options ani-skip's own script reads: one a user keeps loaded does the same.
-const SKIP_SCRIPT: &str = r#"-- ani-hop: jumps over an episode's opening and ending
+/// It reads the options ani-skip's own script reads: one a user keeps loaded does the same. Or it
+/// asks ani-hop for the times once mpv has started (skip::ask_later), and sets the chapters too.
+const SKIP_SCRIPT: &str = r#"-- ani-hop: marks an episode's opening and ending, and jumps over them
 local times = { op_start = 0, op_end = 0, ed_start = 0, ed_end = 0 }
 require("mp.options").read_options(times, "skip")
+
+local later = { mal = "", ep = "", dub = "no", last = "no", jump = "no" }
+require("mp.options").read_options(later, "ani-hop")
+-- a file that loads after they came brings its own chapters, so they wait for it
+local loaded, chapters = false, nil
+local function mark()
+    if loaded and chapters and #chapters > 0 then
+        mp.set_property_native("chapter-list", chapters)
+    end
+end
+mp.register_event("file-loaded", function()
+    loaded = true
+    mark()
+end)
+
+if later.mal ~= "" then
+    local utils = require("mp.utils")
+    -- an update can take away the ani-hop that started this, and the one on PATH is the new one
+    local exe = os.getenv("ANIHOP_EXE")
+    if not exe or not utils.file_info(exe) then
+        exe = "ani-hop"
+    end
+    mp.command_native_async({
+        name = "subprocess",
+        args = { exe, "--skip-json", later.mal, later.ep, later.dub, later.last, later.jump },
+        capture_stdout = true,
+        playback_only = false,
+    }, function(ok, res)
+        local found = ok and res.status == 0 and utils.parse_json(res.stdout)
+        if not found then
+            return
+        end
+        chapters = found.chapters
+        mark()
+        for k, v in pairs(found.skip) do
+            times[k] = v
+        end
+    end)
+end
 
 local done = {}
 local function jump(part, now, from, to)
@@ -1139,6 +1179,8 @@ pub fn hold_stream(m: &Media, src: &Source, ep: &str, audio: &str) -> Result<Hel
 /// Starts mpv with what `hold_stream` kept.
 pub fn play_held(held: &Held, mut up: impl FnMut()) -> Replayed {
     let child = (Command::new("mpv").args(&held.args))
+        // for the skip script, which asks ani-hop for the times
+        .env("ANIHOP_EXE", exe())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1174,9 +1216,10 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
         }
     }
     if let Some(mal) = m.id_mal {
-        let (jump, last) = (skip_on(), skip::last_episode(m, &[], ep));
-        mpv.args(jump.then(|| format!("--script={}", skip_script().display())))
-            .args(skip::flags(&skip::times(mal, ep, is_dub(file)), jump, last));
+        let last = skip::last_episode(m, &[], ep);
+        mpv.arg(format!("--script={}", skip_script().display()))
+            .args(skip::ask_later(mal, ep, is_dub(file), last))
+            .env("ANIHOP_EXE", exe());
     }
     let child = mpv
         .arg(file)
