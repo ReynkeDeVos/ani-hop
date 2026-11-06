@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.12 – 2026-11-06
+
+### Changed
+
+- mpv's timeline marks the opening and the ending whether skipping is on or off. Before, the marks only came with skipping on.
+- A show's last episode marks its ending too. It still doesn't skip it.
+- Skipping starts off on a new install. If you already use ani-hop, your setting stays as it is.
+- With skipping off, a stream now waits for the opening and ending times before mpv starts, as it already did with skipping on. That's 0.1 to 0.3 seconds.
+
 ## 0.10.11 – 2026-11-05
 
 ### Changed

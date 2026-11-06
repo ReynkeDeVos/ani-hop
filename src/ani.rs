@@ -762,7 +762,7 @@ fn stream_step(line: &str, step: &dyn Fn(Option<&'static str>)) {
     }
 }
 
-/// Whether mpv jumps over openings and endings (switched in the main menu).
+/// Whether mpv jumps over openings and endings (Settings). Its chapters mark them either way.
 pub fn skip_on() -> bool {
     !config_dir().join("no-skip").exists()
 }
@@ -1009,8 +1009,10 @@ fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, O
     cli.env("ANI_CLI_PLAYER", player)
         .env("ANI_CLI_MODE", mode(dub(audio)))
         .env("ANI_CLI_PLAYER_FLAGS", flags)
-        .args(skip_on().then_some("--skip"))
         .args([
+            // asks ani-hop's stand-in for ani-skip, whose answer has the chapters even with
+            // skipping off
+            "--skip",
             "--exit-after-play",
             "-S",
             &src.index.to_string(),
@@ -1171,10 +1173,10 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
             mpv.arg("--sub-visibility=no");
         }
     }
-    if let Some(mal) = m.id_mal.filter(|_| skip_on()) {
-        let last = skip::last_episode(m, &[], ep);
-        mpv.arg(format!("--script={}", skip_script().display()))
-            .args(skip::flags(&skip::times(mal, ep, is_dub(file), last)));
+    if let Some(mal) = m.id_mal {
+        let (jump, last) = (skip_on(), skip::last_episode(m, &[], ep));
+        mpv.args(jump.then(|| format!("--script={}", skip_script().display())))
+            .args(skip::flags(&skip::times(mal, ep, is_dub(file)), jump, last));
     }
     let child = mpv
         .arg(file)

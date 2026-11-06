@@ -615,6 +615,10 @@ impl App {
         if first || !app.missing.is_empty() {
             let _ = fs::create_dir_all(ani::config_dir());
             let _ = fs::write(&welcomed, "");
+            // skipping starts off; an install from before this keeps what it had
+            if first {
+                let _ = ani::set_skip(false);
+            }
             app.push(if first { "Welcome" } else { "Setup" }, View::Setup);
         }
         // on top, so it's answered before anything can log in and reset the screens

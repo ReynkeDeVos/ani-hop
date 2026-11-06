@@ -13,7 +13,7 @@ A fast terminal UI for anime: find a show, then stream or download it through [a
 | **Find an episode by what happens in it** | The filter searches the titles and summaries of watched episodes. Unwatched ones stay blank, so nothing spoils. |
 | **Downloads in the background** | Pause them or quit; unfinished ones come back after a restart. |
 | **Sub or dub** | Japanese or English audio, with or without subtitles, for all shows or just one. |
-| **Skips openings and endings** | In streams and downloads alike. A show's last episode keeps its ending, as the story can go on after it. |
+| **Openings and endings** | mpv's timeline marks them, in streams and downloads alike. To jump over them, turn on skipping in Settings. A show's last episode keeps its ending, as the story can go on after it. |
 
 ## Install
 
