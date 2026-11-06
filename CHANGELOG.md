@@ -9,6 +9,10 @@
 - Skipping starts off on a new install. If you already use ani-hop, your setting stays as it is.
 - With skipping off, a stream now waits for the opening and ending times before mpv starts, as it already did with skipping on. That's 0.1 to 0.3 seconds.
 
+### Fixed
+
+- Posters show in herdr. ani-hop didn't recognize herdr's panes, as they don't say they're in Ghostty.
+
 ## 0.10.11 – 2026-11-05
 
 ### Changed
