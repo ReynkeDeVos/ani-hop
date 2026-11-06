@@ -1864,6 +1864,79 @@ fn left(secs: f64) -> String {
 mod tests {
     use super::*;
 
+    /// mpv's side of SKIP_SCRIPT, for running it outside mpv: options, the times' answer and
+    /// file-loaded come as the arguments say, and what it sets is printed, a line each.
+    const MPV_STAND_IN: &str = r#"
+local script, first, jump = ...
+local events, watch, answer = {}, {}, nil
+local function said(name, v)
+    print(name, type(v) == "table" and #v or v)
+end
+mp = {
+    register_event = function(name, f) events[name] = f end,
+    command_native_async = function(_, f) answer = f end,
+    set_property_native = said,
+    set_property_number = said,
+    observe_property = function(name, _, f) watch[name] = f end,
+}
+local opts = { ["ani-hop"] = { mal = "52991", ep = "3", dub = "no", last = "no", jump = jump } }
+package.preload["mp.options"] = function()
+    return { read_options = function(t, prefix)
+        for k, v in pairs(opts[prefix] or {}) do t[k] = v end
+    end }
+end
+-- ani-hop's answer: the chapters always, the times to jump over only with skipping on
+local found = { chapters = { { title = "Opening", time = 10 }, { title = "Episode", time = 100 } } }
+found.skip = jump == "yes" and { op_start = 10, op_end = 100 } or {}
+package.preload["mp.utils"] = function()
+    return { file_info = function() return nil end, parse_json = function() return found end }
+end
+dofile(script)
+local function times() answer(true, { status = 0, stdout = "" }) end
+local function loaded() print("file-loaded") events["file-loaded"]() end
+if first == "times" then times() loaded() else loaded() times() end
+watch["time-pos"](nil, 20)
+watch["time-pos"](nil, 30)
+"#;
+
+    #[test]
+    fn the_mpv_script_marks_the_chapters_whether_the_times_or_the_file_come_first() {
+        // mpv runs it with LuaJIT or Lua 5.1, and CI's macOS has neither
+        let Some(lua) = ["luajit", "lua5.1"].into_iter().find(|l| have(l)) else {
+            return;
+        };
+        let dir = std::env::temp_dir().join(format!("ani-hop-lua-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let (script, stand_in) = (dir.join("ani-hop-skip.lua"), dir.join("mpv.lua"));
+        fs::write(&script, SKIP_SCRIPT).unwrap();
+        fs::write(&stand_in, MPV_STAND_IN).unwrap();
+        let run = |first: &str, jump: &str| {
+            let out = Command::new(lua)
+                .args([&stand_in, &script])
+                .args([first, jump])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap()
+        };
+        for first in ["times", "file"] {
+            // its chapters once the file has loaded, as a file brings its own
+            let off = run(first, "no");
+            assert_eq!(off, "file-loaded\nchapter-list\t2\n", "{first} first");
+            // and with skipping on, a jump over the opening, once
+            let on = run(first, "yes");
+            assert_eq!(
+                on, "file-loaded\nchapter-list\t2\ntime-pos\t100\n",
+                "{first} first"
+            );
+        }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn profile_names_are_read_with_and_without_vs_prefix() {
         let plain = "Available profiles:\n\tfirst\t\n\tmy profile\tdescribed\n\nlast line\n";

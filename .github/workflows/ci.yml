@@ -17,6 +17,9 @@ jobs:
           persist-credentials: false
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
+      # mpv runs ani-hop's script with LuaJIT, and a test runs it the same way outside mpv
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y luajit
       - run: cargo test --locked
 
   # The release archives ship THIRD-PARTY-LICENSES.md, so it has to match Cargo.lock.

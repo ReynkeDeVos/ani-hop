@@ -4490,6 +4490,38 @@ mod tests {
     }
 
     #[test]
+    fn the_previews_border_says_how_to_read_on_and_back_up_as_far_as_it_fits() {
+        let mut m = show(50_416, 12, None);
+        m.description = Some("word ".repeat(400));
+        let mut app = app();
+        app.open_show(m);
+        // the Preview's top and bottom border, as drawn `w` wide
+        let edges = |app: &mut App, w| {
+            let drawn = screen(app, w, 20);
+            let rows: Vec<&str> = drawn.lines().map(str::trim_end).collect();
+            let top = rows.iter().find(|r| r.ends_with('╮')).unwrap().to_string();
+            let bottom = rows
+                .iter()
+                .rev()
+                .find(|r| r.ends_with('╯'))
+                .unwrap()
+                .to_string();
+            (top, bottom)
+        };
+        // right-aligned a column in from the corner; a narrow one drops the words, then "shift"
+        for (w, hint) in [(80, " shift ↓ read on "), (31, " shift ↓ "), (18, " ↓ ")] {
+            let (top, bottom) = edges(&mut app, w);
+            assert!(bottom.ends_with(&format!("─{hint}╯")), "{bottom}");
+            assert!(top.ends_with("──╮"), "nothing above yet: {top}");
+        }
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT));
+        for (w, hint) in [(80, " shift ↑ back up "), (31, " shift ↑ "), (18, " ↑ ")] {
+            let (top, _) = edges(&mut app, w);
+            assert!(top.ends_with(&format!("─{hint}╮")), "{top}");
+        }
+    }
+
+    #[test]
     fn a_description_keeps_one_left_edge() {
         // the column each row of it starts at, in the preview
         let columns = |drawn: &str| -> Vec<usize> {
