@@ -310,20 +310,16 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
     ])
     .areas(inner);
 
-    // what's typed starts where the rows' labels do; a long text keeps in view where typing
-    // goes, with a column free after it for the cursor, and some of what follows the cursor
+    // what's typed starts where the rows' labels do, with a column free for the cursor
     let room = (prompt_area.width as usize).saturating_sub(4);
-    let (before, after) = screen.menu.query.split_at(screen.menu.at);
-    let follows = Span::raw(after).width().min(room / 3);
-    let before = fit_start(before, room - follows);
-    let left = room + 1 - Span::raw(&before).width();
+    let (before, after) = screen.menu.prompt(room);
     let mut prompt = Line::from(vec![
         Span::styled("❯  ", Style::new().fg(ACCENT).bold()),
         Span::raw(before),
     ]);
     let cursor_x =
         (prompt_area.x + prompt.width() as u16).min(prompt_area.right().saturating_sub(1));
-    prompt.push_span(Span::raw(fit(after.to_string(), left)));
+    prompt.push_span(Span::raw(after));
     // what typing does on this screen, where it's going to appear, and whole or not at all
     let hint = match &screen.view {
         View::Input(Input::Search) => "type to search AniList",
@@ -860,7 +856,7 @@ fn banner(app: &App, area: Rect) -> Vec<Line<'static>> {
             key(
                 "↑ ↓",
                 "move",
-                if top.menu.at < top.menu.query.len() {
+                if top.menu.text_after_cursor() {
                     "^j"
                 } else {
                     "^k ^j"
@@ -1064,7 +1060,7 @@ fn fit_middle(label: &str, room: usize) -> String {
 }
 
 /// `s` cut to `room` columns with "…", measured as drawn: CJK characters take two.
-fn fit(s: String, room: usize) -> String {
+pub fn fit(s: String, room: usize) -> String {
     let width = |s: &str| Span::raw(s).width();
     if width(&s) <= room {
         return s;
@@ -1082,28 +1078,6 @@ fn fit(s: String, room: usize) -> String {
         cut.push_str(g);
     }
     cut + "…"
-}
-
-/// `s` cut to `room` columns as `fit` cuts it, but at its start: "…the end".
-fn fit_start(s: &str, room: usize) -> String {
-    let width = |s: &str| Span::raw(s).width();
-    if width(s) <= room {
-        return s.to_string();
-    }
-    // the cursor's column stays free, even of the "…"
-    if room == 0 {
-        return String::new();
-    }
-    let span = Span::raw(s);
-    let graphemes: Vec<&str> = (span.styled_graphemes(Style::new()))
-        .map(|g| g.symbol)
-        .collect();
-    let (mut start, mut used) = (graphemes.len(), 1); // the "…"
-    while start > 0 && used + width(graphemes[start - 1]) <= room {
-        start -= 1;
-        used += width(graphemes[start]);
-    }
-    format!("…{}", graphemes[start..].concat())
 }
 
 /// A show's cover color (`#rrggbb`), unless it's too dark to see.
@@ -1143,16 +1117,6 @@ mod tests {
         // and questions whose preview lists what they act on
         assert!(!widens(&View::Confirm(Pending::Delete(Vec::new()))));
         assert!(widens(&View::Confirm(Pending::Remove(Media::default()))));
-    }
-
-    #[test]
-    fn a_long_prompt_keeps_its_end() {
-        assert_eq!(fit_start("frieren", 7), "frieren");
-        assert_eq!(fit_start("Fate/stay night", 6), "…night");
-        // two columns a character: never half of one
-        assert_eq!(fit_start("葬送のフリーレン", 6), "…レン");
-        assert_eq!(fit_start("frieren", 1), "…");
-        assert_eq!(fit_start("frieren", 0), "");
     }
 
     #[test]

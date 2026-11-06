@@ -4208,9 +4208,8 @@ mod tests {
         for (w, h) in [(80, 24), (120, 30), (40, 12)] {
             app.top().menu.edit(|q| *q = long.into());
             let (_, right, _) = prompt_and_cursor(&mut app, w, h);
-            while app.top().menu.at > 0 {
+            for at in (0..long.len()).rev() {
                 press(&mut app, KeyCode::Left);
-                let at = app.top().menu.at;
                 let (row, x, on) = prompt_and_cursor(&mut app, w, h);
                 assert_eq!(on, long[at..at + 1], "{row}");
                 assert!(x <= right, "{row}");
@@ -4238,7 +4237,7 @@ mod tests {
                 press(&mut app, KeyCode::Left);
             }
             assert_eq!(app.stack.len(), 2, "it stays");
-            assert_eq!(app.top().menu.at, 0);
+            assert_eq!(prompt_and_cursor(&mut app, 120, 30).2, "a", "at the start");
             press(&mut app, KeyCode::Esc);
             assert_eq!(app.top().menu.query, "");
             assert_eq!(app.stack.len(), 2, "that cleared it");
@@ -4257,14 +4256,18 @@ mod tests {
         // ^f moves the cursor, but on a list that has pages it's only ever the next one
         press(&mut app, KeyCode::Home);
         app.on_key(ctrl(KeyCode::Char('f')));
-        assert_eq!(app.top().menu.at, 1);
+        assert_eq!(prompt_and_cursor(&mut app, 120, 30).2, "b");
         let feed = Feed::Pages("TRENDING_DESC".into(), None, None, false);
         let (list, _) = List::open(feed, None, std::time::SystemTime::now());
         app.push("Trending", View::Shows(list));
         app.top().menu.edit(|q| *q = "ab".into());
         press(&mut app, KeyCode::Home);
         app.on_key(ctrl(KeyCode::Char('f')));
-        assert_eq!(app.top().menu.at, 0);
+        assert_eq!(
+            prompt_and_cursor(&mut app, 120, 30).2,
+            "a",
+            "it didn't move"
+        );
         assert_eq!(app.toast.as_ref().unwrap().0, "No more shows");
         // the footer and the help say what's so with the text as it is
         let says = |app: &mut App| screen(app, 120, 30);

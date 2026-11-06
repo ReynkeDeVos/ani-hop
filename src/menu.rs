@@ -1,5 +1,6 @@
 //! fzf-style list: type to filter (fzf syntax via nucleo), tab to mark, enter to accept.
 
+use crate::ui::fit;
 use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -113,9 +114,9 @@ pub enum Act {
 pub struct Menu {
     pub items: Vec<Item>,
     pub query: String,
-    /// where typing goes in `query`, in bytes
-    pub at: usize,
-    /// (item index, matched char positions), best match first
+    /// where typing goes in `query`, in bytes, on a grapheme's start
+    at: usize,
+    /// (item index, matched grapheme positions), best match first
     pub matches: Vec<(usize, Vec<u32>)>,
     pub marked: BTreeSet<usize>,
     pub multi: bool,
@@ -299,6 +300,22 @@ impl Menu {
         !self.hidden && !self.query.is_empty()
     }
 
+    /// There's text after the cursor, which ^k deletes: at its end ^k moves up, as in fzf.
+    pub fn text_after_cursor(&self) -> bool {
+        self.at < self.query.len()
+    }
+
+    /// What the prompt shows of the text in `room` columns, before the cursor and after it.
+    /// A long text keeps in view where typing goes, and some of what follows, a third of the
+    /// room at most; the column after `room` stays free for the cursor at the end.
+    pub fn prompt(&self, room: usize) -> (String, String) {
+        let (before, after) = self.query.split_at(self.at);
+        let follows = Span::raw(after).width().min(room / 3);
+        let before = fit_start(before, room - follows);
+        let left = room + 1 - Span::raw(&before).width();
+        (before, fit(after.to_string(), left))
+    }
+
     pub fn key(&mut self, k: KeyEvent) -> Option<Act> {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let alt = k.modifiers.contains(KeyModifiers::ALT);
@@ -326,7 +343,7 @@ impl Menu {
             KeyCode::Up => self.step(-1),
             KeyCode::Down => self.step(1),
             // at the end of the text a shell's ^k has nothing to do, so it stays fzf's up
-            KeyCode::Char('k') if ctrl && at < end => self.cut(at, end),
+            KeyCode::Char('k') if ctrl && self.text_after_cursor() => self.cut(at, end),
             KeyCode::Char('p' | 'k') if ctrl => self.step(-1),
             KeyCode::Char('n' | 'j') if ctrl => self.step(1),
             KeyCode::PageUp => self.step(-10),
@@ -411,10 +428,59 @@ impl Menu {
     }
 }
 
+/// `s` cut to `room` columns as `fit` cuts it, but at its start: "…the end".
+fn fit_start(s: &str, room: usize) -> String {
+    let width = |s: &str| Span::raw(s).width();
+    if width(s) <= room {
+        return s.to_string();
+    }
+    // the cursor's column stays free, even of the "…"
+    if room == 0 {
+        return String::new();
+    }
+    let span = Span::raw(s);
+    let graphemes: Vec<&str> = (span.styled_graphemes(Style::new()))
+        .map(|g| g.symbol)
+        .collect();
+    let (mut start, mut used) = (graphemes.len(), 1); // the "…"
+    while start > 0 && used + width(graphemes[start - 1]) <= room {
+        start -= 1;
+        used += width(graphemes[start]);
+    }
+    format!("…{}", graphemes[start..].concat())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use ratatui::crossterm::event::KeyEvent;
+
+    #[test]
+    fn the_prompt_keeps_in_view_where_typing_goes() {
+        let mut m = Menu::new(Vec::new(), false);
+        m.edit(|q| *q = "葬送 frieren".into());
+        assert_eq!(m.prompt(40), ("葬送 frieren".into(), String::new()));
+        assert!(!m.text_after_cursor(), "^k moves up there");
+        for _ in 0.."frieren".len() {
+            m.key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        }
+        assert!(m.text_after_cursor());
+        assert_eq!(m.prompt(40), ("葬送 ".into(), "frieren".into()));
+        // narrow: what follows keeps a third of the room, and the start goes before it does,
+        // a whole character at a time: 葬 and 送 take two columns
+        assert_eq!(m.prompt(9), ("葬送 ".into(), "frie…".into()));
+        assert_eq!(m.prompt(6), ("…送 ".into(), "fr…".into()));
+    }
+
+    #[test]
+    fn a_long_prompt_keeps_its_end() {
+        assert_eq!(fit_start("frieren", 7), "frieren");
+        assert_eq!(fit_start("Fate/stay night", 6), "…night");
+        // two columns a character: never half of one
+        assert_eq!(fit_start("葬送のフリーレン", 6), "…レン");
+        assert_eq!(fit_start("frieren", 1), "…");
+        assert_eq!(fit_start("frieren", 0), "");
+    }
 
     fn menu() -> Menu {
         let items = [
