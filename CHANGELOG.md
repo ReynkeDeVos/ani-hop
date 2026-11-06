@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.13 – 2026-11-06
+
+### Fixed
+
+- Logging out and back in could stop ani-hop from asking to mark an episode watched. An answer meant for the earlier login said "Not saved" instead. Now only the new login's answers count.
+
 ## 0.10.12 – 2026-11-06
 
 ### Changed

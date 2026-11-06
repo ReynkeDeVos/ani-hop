@@ -7,6 +7,7 @@ mod entries;
 mod kitty;
 mod lists;
 mod menu;
+mod parts;
 mod playback;
 mod preload;
 mod preview;
@@ -22,6 +23,7 @@ use downloads::{AniCli, Job, Queue};
 use entries::{Change, Entries, Stamp, Work};
 use lists::{Feed, List};
 use menu::{Act, Item, Menu};
+use parts::{Answer, PartKnowledge};
 use playback::{Playback, Start};
 use preview::Preview;
 use progress::{Mark, Parts, Progress};
@@ -167,8 +169,8 @@ enum Msg {
     /// who's logged in, asked with this token
     Viewer(Option<String>, Result<(u64, String, bool), String>),
     EpInfo(u64, HashMap<String, EpInfo>),
-    /// sequels of a show, looked up for its episode counts (App::parts_key)
-    Parts(u64, (u32, u32), Stamp, Result<Parts, String>),
+    /// sequels of a show, with the lookup's ticket (PartKnowledge::want)
+    Parts(u64, u64, Stamp, Result<Parts, String>),
     /// whether AniList links a show to another
     Linked(u64, Result<bool, String>),
     /// a show's series as AniList has it
@@ -209,10 +211,9 @@ pub struct App {
     pub entries: Entries,
     /// episode titles and summaries per show (empty while loading or when there are none)
     pub ep_info: HashMap<u64, HashMap<String, EpInfo>>,
-    /// AniList sequels per show that its provider entry runs on into, each with the episodes
-    /// before it (none yet while AniList hasn't answered), and the episode counts they were
-    /// looked up for
-    parts: HashMap<u64, ((u32, u32), Option<Parts>)>,
+    /// AniList sequels per show that its provider entry runs on into, and the played episode
+    /// whose Mark waits for them
+    parts: PartKnowledge,
     /// what AniList links each show opened this session to
     related: HashMap<u64, Related>,
     pub sources: Sources,
@@ -244,8 +245,6 @@ pub struct App {
     external: Option<String>,
     /// asked for on a show's page while ani-cli searched, waiting to get back to that page
     parked: Option<(Media, Want)>,
-    /// an episode that was played, whose question waits for AniList to say which part it's in
-    marking: Option<(Media, String)>,
     /// the show played last on this login, which the Continue row goes on with
     last_played: Option<Media>,
     /// Watching as last read, which it goes on with otherwise (none while logged out)
@@ -564,7 +563,7 @@ impl App {
             preview: Preview::new(kitty::Posters::new(kitty::Tty, seams.posters)),
             entries: Entries::new(seams.anilist),
             ep_info: HashMap::new(),
-            parts: HashMap::new(),
+            parts: PartKnowledge::default(),
             related: HashMap::new(),
             sources: Sources::load(),
             local: HashMap::new(),
@@ -583,7 +582,6 @@ impl App {
             ani_cli_newer: None,
             external: None,
             parked: None,
-            marking: None,
             last_played: None,
             watching: None,
             reading_watching: false,
@@ -712,9 +710,8 @@ impl App {
         (self.client.token, self.user) = (None, None);
         self.entries.login(Arc::new(self.client.clone()));
         // they carry this login's progress
-        self.parts.clear();
+        self.parts.forget();
         self.related.clear();
-        self.marking = None;
         self.forget_continue();
     }
 
@@ -848,10 +845,7 @@ impl App {
             return;
         };
         // what's next may change with these answers
-        if !self.reading_watching
-            && !matches!(self.parts.get(&m.id), Some((_, None)))
-            && !self.saving_progress(&m)
-        {
+        if !self.reading_watching && !self.parts.looking(m.id) && !self.saving_progress(&m) {
             self.continue_now(m);
         }
     }
@@ -1197,39 +1191,18 @@ impl App {
     /// Looks up the sequels the provider runs on into when it lists more episodes than
     /// AniList, again once it has another, which may change what adds up.
     fn want_parts(&mut self, m: &Media) {
-        let Some(key) = self.parts_key(m) else {
-            self.parts.remove(&m.id);
-            return;
-        };
-        if self.parts.get(&m.id).is_none_or(|p| p.0 != key) {
-            self.parts.insert(m.id, (key, None));
+        if let Some(ask) = self.parts.want(m, self.sources.get(m.id)) {
             let (m, c, stamp) = (m.clone(), self.client.clone(), self.entries.stamp());
             self.spawn(move || {
-                let parts = c.parts(&m, key.0);
-                Msg::Parts(m.id, key, stamp, parts)
+                let parts = c.parts(&m, ask.last);
+                Msg::Parts(m.id, ask.ticket, stamp, parts)
             });
         }
     }
 
-    /// The provider's last whole episode and AniList's count, when the provider has more.
-    fn parts_key(&self, m: &Media) -> Option<(u32, u32)> {
-        let src = self.sources.get(m.id)?;
-        let last = src.episodes.iter().filter_map(|e| e.parse().ok()).max()?;
-        m.episodes.filter(|own| last > *own).map(|own| (last, own))
-    }
-
     /// The show's sequels, while it has the episode counts they were looked up for.
     pub fn parts(&self, m: &Media) -> &[(u32, Media)] {
-        match self.parts.get(&m.id) {
-            Some((key, Some(parts))) if Some(*key) == self.parts_key(m) => parts,
-            _ => &[],
-        }
-    }
-
-    /// Whether `parts` is all of `m`'s: there are none to look for, or AniList has answered.
-    fn parts_known(&self, m: &Media) -> bool {
-        let answered = |key| matches!(self.parts.get(&m.id), Some((k, Some(_))) if *k == key);
-        self.parts_key(m).is_none_or(answered)
+        self.parts.of(m, self.sources.get(m.id))
     }
 
     /// `m`'s episodes as AniList counts them, with the parts known so far.
@@ -1773,7 +1746,7 @@ impl App {
                 if let Err(e) = self.sources.choose(m.id, &q, &hits, i) {
                     return self.toast(e.to_string(), true);
                 }
-                self.parts.remove(&m.id);
+                self.parts.forget_show(m.id);
                 self.toast(format!("Source set to {}", hits[i]), false);
                 self.pop(2);
                 self.resolve(&m, None);
@@ -2105,7 +2078,7 @@ impl App {
                 }
                 self.client.token = Some(token);
                 self.entries.login(Arc::new(self.client.clone()));
-                self.parts.clear();
+                self.parts.forget();
                 self.related.clear();
                 self.forget_continue();
                 let c = self.client.clone();
@@ -2297,7 +2270,7 @@ impl App {
     /// Whether AniList's count for episode `ep` of `m` is known: past the show's own episodes
     /// it counts toward a part, if there is one, which takes AniList's answer.
     fn counted(&self, m: &Media, ep: &str) -> bool {
-        self.parts_known(m) || m.episodes.is_some_and(|own| ani::ep_num(ep) <= own as f64)
+        self.parts.counted(m, self.sources.get(m.id), ep)
     }
 
     /// Says a question has to wait for `m`'s parts, and looks them up if nothing does.
@@ -2315,8 +2288,7 @@ impl App {
     fn ask_watched(&mut self, m: Media, ep: String) {
         if !self.counted(&m, &ep) {
             self.want_parts(&m);
-            self.marking = Some((m, ep));
-            return;
+            return self.parts.hold(m, ep);
         }
         let mark = self.progress(&m).unwatched(&ep);
         if mark.is_some() {
@@ -2345,7 +2317,7 @@ impl App {
     /// Asks before taking `m` back to no episodes watched. It unmarks at least one that was, so
     /// Don't save goes first. Not before its parts are known, or theirs would stay marked.
     fn ask_none(&mut self, m: &Media) {
-        if !self.parts_known(m) {
+        if !self.parts.known(m, self.sources.get(m.id)) {
             return self.still_checking(m);
         }
         let marks = self.progress(m).none();
@@ -2574,37 +2546,36 @@ impl App {
                 }
             }
             // without them, the provider's episodes stay the show's own
-            Msg::Parts(id, key, stamp, parts) => {
-                // looked up for other episode counts, or an earlier login
-                if !self.parts.get(&id).is_some_and(|p| p.0 == key) {
-                    return;
+            Msg::Parts(id, ticket, stamp, mut parts) => {
+                // the shows carry the newest Entries; an earlier login's answer is stale anyway
+                if let Ok(parts) = &mut parts {
+                    self.entries
+                        .observe(stamp, parts.iter_mut().map(|p| &mut p.1));
                 }
-                // asked again when the show or its episodes open
-                let Ok(mut parts) = parts else {
-                    self.parts.remove(&id);
-                    let waiting = self.marking.take_if(|(m, _)| m.id == id);
-                    if let Some((_, ep)) = waiting {
-                        let text = format!(
-                            "Not saved · AniList didn't say what episode {ep} counts toward, \
-                             Watched up to… can save it"
-                        );
-                        self.toast(text, true);
+                match self.parts.answer(id, ticket, parts) {
+                    Answer::Stale => {}
+                    Answer::Failed(waiting) => {
+                        if let Some((_, ep)) = waiting {
+                            let text = format!(
+                                "Not saved · AniList didn't say what episode {ep} counts toward, \
+                                 Watched up to… can save it"
+                            );
+                            self.toast(text, true);
+                        }
+                        self.continue_play();
                     }
-                    return self.continue_play();
-                };
-                if !(self.entries).observe(stamp, parts.iter_mut().map(|p| &mut p.1)) {
-                    return;
+                    Answer::Known(parts, waiting) => {
+                        for p in &parts {
+                            self.want_episodes(p);
+                        }
+                        self.refresh();
+                        if let Some((m, ep)) = waiting {
+                            self.ask_watched(m, ep);
+                        }
+                        self.continue_play();
+                        self.preload_next();
+                    }
                 }
-                for (_, p) in &parts {
-                    self.want_episodes(p);
-                }
-                self.parts.insert(id, (key, Some(parts)));
-                self.refresh();
-                if let Some((m, ep)) = self.marking.take_if(|(m, _)| m.id == id) {
-                    self.ask_watched(m, ep);
-                }
-                self.continue_play();
-                self.preload_next();
             }
             Msg::Linked(id, res) => {
                 // none of it after another login's clean slate; a failed one's asked again
@@ -3129,7 +3100,7 @@ mod tests {
             "it would save the show's own 12/12"
         );
         let parts = vec![(12, part.clone())];
-        app.on_msg(Msg::Parts(m.id, (22, 12), stamp, Ok(parts)));
+        app.on_msg(Msg::Parts(m.id, app.parts.asked(m.id), stamp, Ok(parts)));
         let View::Confirm(Pending::Progress(marks, _)) = &app.top().view else {
             panic!("asks now");
         };
@@ -3147,10 +3118,29 @@ mod tests {
             Ok(()),
         ));
         let failed = Err("Can't reach AniList".to_string());
-        app.on_msg(Msg::Parts(m.id, (22, 12), stamp, failed));
+        app.on_msg(Msg::Parts(m.id, app.parts.asked(m.id), stamp, failed));
         assert!(!matches!(app.top().view, View::Confirm(_)));
         let (text, error) = toast(&app).unwrap();
         assert!(error && text.contains("episode 13"), "{text}");
+    }
+
+    #[test]
+    fn an_earlier_logins_failed_parts_lookup_leaves_this_logins_question_alone() {
+        let (mut app, m, part, old) = split_season(50_025);
+        let first = app.parts.asked(m.id);
+        // logged out and in again while the first lookup still runs
+        app.forget_login();
+        app.user = Some((1, "Tester".into()));
+        app.open_show(m.clone());
+        let (now, stamp) = (app.parts.asked(m.id), app.entries.stamp());
+        app.on_msg(Msg::Played(1, stamp, m.clone(), "13".into(), Ok(())));
+        app.on_msg(Msg::Parts(m.id, first, old, Err("offline".into())));
+        assert!(toast(&app).is_none(), "{:?}", toast(&app));
+        app.on_msg(Msg::Parts(m.id, now, stamp, Ok(vec![(12, part.clone())])));
+        let View::Confirm(Pending::Progress(marks, _)) = &app.top().view else {
+            panic!("asks once this login's answer is in");
+        };
+        assert_eq!((marks[0].entry.id, marks[0].to), (part.id, 1));
     }
 
     #[test]
@@ -3676,7 +3666,12 @@ mod tests {
         let mut part = show(50_271, 10, Some(3));
         part.status = Some("FINISHED".into());
         let stamp = app.entries.stamp();
-        app.on_msg(Msg::Parts(m.id, (22, 12), stamp, Ok(vec![(12, part)])));
+        app.on_msg(Msg::Parts(
+            m.id,
+            app.parts.asked(m.id),
+            stamp,
+            Ok(vec![(12, part)]),
+        ));
         assert_eq!(app.playback.now().unwrap().ep, "16");
     }
 
@@ -3689,7 +3684,7 @@ mod tests {
         let stamp = app.entries.stamp();
         app.on_msg(Msg::Parts(
             m.id,
-            (22, 12),
+            app.parts.asked(m.id),
             stamp,
             Err("AniList is down".into()),
         ));
@@ -3703,7 +3698,12 @@ mod tests {
         enter(&mut app);
         press(&mut app, KeyCode::Down);
         let stamp = app.entries.stamp();
-        app.on_msg(Msg::Parts(m.id, (22, 12), stamp, Ok(Vec::new())));
+        app.on_msg(Msg::Parts(
+            m.id,
+            app.parts.asked(m.id),
+            stamp,
+            Ok(Vec::new()),
+        ));
         assert!(app.playback.now().is_none(), "the cursor went elsewhere");
         assert!(matches!(app.top().view, View::Show(_)));
     }
@@ -3715,7 +3715,12 @@ mod tests {
         enter(&mut app);
         app.push("Audio", View::Audio(Some(m.clone())));
         let stamp = app.entries.stamp();
-        app.on_msg(Msg::Parts(m.id, (22, 12), stamp, Ok(Vec::new())));
+        app.on_msg(Msg::Parts(
+            m.id,
+            app.parts.asked(m.id),
+            stamp,
+            Ok(Vec::new()),
+        ));
         assert!(app.playback.now().is_none());
         assert_eq!(app.continuing, None);
     }
