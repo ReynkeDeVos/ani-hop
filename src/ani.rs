@@ -68,10 +68,10 @@ case " $* " in
 *" --sub-file="*) ;;
 *) [ -n "$ANIHOP_SUBS_PAGE" ] && ani-hop-subs "$ANIHOP_SUBS_PAGE" "$ANIHOP_SUBS_FILE" && set -- --sub-file="$ANIHOP_SUBS_FILE" "$@" ;;
 esac
-# ani-skip's stand-in named the times, this is what jumps over them. Here as it can't say a path
-# with spaces: ani-cli splits what it says on those
+# ani-skip's stand-in named the episode, this is what marks and jumps over its opening and ending.
+# Here as it can't say a path with spaces: ani-cli splits what it says on those
 case " $* " in
-*" --script-opts=skip-"*) set -- --script="${0%/*}/ani-hop-skip.lua" "$@" ;;
+*" --script-opts=ani-hop-"* | *" --script-opts=skip-"*) set -- --script="${0%/*}/ani-hop-skip.lua" "$@" ;;
 esac
 # fetched ahead: what mpv would start with goes in a file, for when the episode is wanted
 if [ -n "$ANIHOP_HOLD" ]; then
@@ -90,16 +90,58 @@ while [ $# -gt 1 ]; do
 	case $1 in -i) id=$2 ;; -e) ep=$2 ;; esac
 	shift
 done
-# an update can take away the ani-hop that started this, and the one on PATH is the new one
+# an update can take away the ani-hop that started this, and the one on PATH is the new one.
+# later: this mpv stand-in loads the script that asks for the times once mpv started, and an
+# older one doesn't, so an ani-hop started before an update gets the times before mpv starts
 [ -x "$ANIHOP_EXE" ] || ANIHOP_EXE=ani-hop
-exec "$ANIHOP_EXE" --skip-flags "$id" "$ep"
+exec "$ANIHOP_EXE" --skip-flags "$id" "$ep" later
 "#;
 
 /// The mpv script that jumps over what skip::flags names, once each, so seeking back shows it.
-/// It reads the options ani-skip's own script reads: one a user keeps loaded does the same.
-const SKIP_SCRIPT: &str = r#"-- ani-hop: jumps over an episode's opening and ending
+/// It reads the options ani-skip's own script reads: one a user keeps loaded does the same. Or it
+/// asks ani-hop for the times once mpv has started (skip::ask_later), and sets the chapters too.
+const SKIP_SCRIPT: &str = r#"-- ani-hop: marks an episode's opening and ending, and jumps over them
 local times = { op_start = 0, op_end = 0, ed_start = 0, ed_end = 0 }
 require("mp.options").read_options(times, "skip")
+
+local later = { mal = "", ep = "", dub = "no", last = "no", jump = "no" }
+require("mp.options").read_options(later, "ani-hop")
+-- a file that loads after they came brings its own chapters, so they wait for it
+local loaded, chapters = false, nil
+local function mark()
+    if loaded and chapters and #chapters > 0 then
+        mp.set_property_native("chapter-list", chapters)
+    end
+end
+mp.register_event("file-loaded", function()
+    loaded = true
+    mark()
+end)
+
+if later.mal ~= "" then
+    local utils = require("mp.utils")
+    -- an update can take away the ani-hop that started this, and the one on PATH is the new one
+    local exe = os.getenv("ANIHOP_EXE")
+    if not exe or not utils.file_info(exe) then
+        exe = "ani-hop"
+    end
+    mp.command_native_async({
+        name = "subprocess",
+        args = { exe, "--skip-json", later.mal, later.ep, later.dub, later.last, later.jump },
+        capture_stdout = true,
+        playback_only = false,
+    }, function(ok, res)
+        local found = ok and res.status == 0 and utils.parse_json(res.stdout)
+        if not found then
+            return
+        end
+        chapters = found.chapters
+        mark()
+        for k, v in pairs(found.skip) do
+            times[k] = v
+        end
+    end)
+end
 
 local done = {}
 local function jump(part, now, from, to)
@@ -762,7 +804,7 @@ fn stream_step(line: &str, step: &dyn Fn(Option<&'static str>)) {
     }
 }
 
-/// Whether mpv jumps over openings and endings (switched in the main menu).
+/// Whether mpv jumps over openings and endings (Settings). Its chapters mark them either way.
 pub fn skip_on() -> bool {
     !config_dir().join("no-skip").exists()
 }
@@ -1009,8 +1051,10 @@ fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, O
     cli.env("ANI_CLI_PLAYER", player)
         .env("ANI_CLI_MODE", mode(dub(audio)))
         .env("ANI_CLI_PLAYER_FLAGS", flags)
-        .args(skip_on().then_some("--skip"))
         .args([
+            // asks ani-hop's stand-in for ani-skip, whose answer has the chapters even with
+            // skipping off
+            "--skip",
             "--exit-after-play",
             "-S",
             &src.index.to_string(),
@@ -1137,6 +1181,8 @@ pub fn hold_stream(m: &Media, src: &Source, ep: &str, audio: &str) -> Result<Hel
 /// Starts mpv with what `hold_stream` kept.
 pub fn play_held(held: &Held, mut up: impl FnMut()) -> Replayed {
     let child = (Command::new("mpv").args(&held.args))
+        // for the skip script, which asks ani-hop for the times
+        .env("ANIHOP_EXE", exe())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1171,10 +1217,11 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
             mpv.arg("--sub-visibility=no");
         }
     }
-    if let Some(mal) = m.id_mal.filter(|_| skip_on()) {
+    if let Some(mal) = m.id_mal {
         let last = skip::last_episode(m, &[], ep);
         mpv.arg(format!("--script={}", skip_script().display()))
-            .args(skip::flags(&skip::times(mal, ep, is_dub(file), last)));
+            .args(skip::ask_later(mal, ep, is_dub(file), last))
+            .env("ANIHOP_EXE", exe());
     }
     let child = mpv
         .arg(file)
@@ -2342,6 +2389,38 @@ mod tests {
     }
 
     #[test]
+    fn a_fake_mpv_loads_the_skip_script_for_either_way_of_giving_the_times() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-script-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("mpv");
+        write_helper(&fake, FAKE_MPV).unwrap();
+        let held = dir.join("held");
+        let script = format!("--script={}", dir.join("ani-hop-skip.lua").display());
+        let first = |opts: &str| {
+            let out = (Command::new("sh").arg(&fake).args([opts, "https://x/y"]))
+                .env("ANIHOP_HOLD", &held)
+                .env_remove("ANIHOP_SUBS_PAGE")
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let args = fs::read(&held).unwrap();
+            String::from_utf8(args.split(|b| *b == 0).next().unwrap().to_vec()).unwrap()
+        };
+        // this ani-hop asks later; an older one, still running after an update, gives the times
+        assert_eq!(first("--script-opts=ani-hop-mal=1,ani-hop-ep=2"), script);
+        assert_eq!(
+            first("--script-opts=skip-op_start=1,skip-op_end=90"),
+            script
+        );
+        // chapters alone, from an older ani-hop with skipping off: nothing to jump over
+        assert_eq!(
+            first("--chapters-file=hex://00"),
+            "--chapters-file=hex://00"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn remakes_started_at_once_take_a_folder_each() {
         let root = std::env::temp_dir().join(format!("ani-hop-remakes-{}", std::process::id()));
         let starts: Vec<_> = (0..8u64)
@@ -2712,9 +2791,12 @@ mod tests {
                 .unwrap();
             String::from_utf8(o.stdout).unwrap()
         };
-        assert_eq!(said(&["-i", "52991", "-e", "12"]), "--skip-flags,52991,12,");
+        assert_eq!(
+            said(&["-i", "52991", "-e", "12"]),
+            "--skip-flags,52991,12,later,"
+        );
         // ani-cli found no id: asked anyway, ani-hop answers with nothing
-        assert_eq!(said(&["-i", "", "-e", "12"]), "--skip-flags,,12,");
+        assert_eq!(said(&["-i", "", "-e", "12"]), "--skip-flags,,12,later,");
         // an update took away the ani-hop that's running: the one on PATH answers
         let gone = Command::new(&helper)
             .args(["-i", "1", "-e", "2"])
@@ -2725,7 +2807,7 @@ mod tests {
             )
             .output()
             .unwrap();
-        assert_eq!(gone.stdout, b"--skip-flags,1,2,");
+        assert_eq!(gone.stdout, b"--skip-flags,1,2,later,");
         let _ = fs::remove_dir_all(&dir);
     }
 

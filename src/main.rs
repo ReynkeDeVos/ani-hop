@@ -292,7 +292,20 @@ fn main() -> std::io::Result<()> {
         // what ani-cli's stand-in for ani-skip runs, not one for people
         Some("--skip-flags") => {
             let arg = |n| std::env::args().nth(n).unwrap_or_default();
-            println!("{}", skip::flags_for_ani_cli(&arg(2), &arg(3)));
+            println!(
+                "{}",
+                skip::flags_for_ani_cli(&arg(2), &arg(3), arg(4) == "later")
+            );
+            return Ok(());
+        }
+        // what ani-hop's mpv script runs: mal, episode, then yes or no for dub, last and jump
+        Some("--skip-json") => {
+            let arg = |n| std::env::args().nth(n).unwrap_or_default();
+            let yes = |n| arg(n) == "yes";
+            println!(
+                "{}",
+                skip::json_for_script(&arg(2), &arg(3), yes(4), yes(5), yes(6))
+            );
             return Ok(());
         }
         Some(arg) => {
@@ -614,7 +627,11 @@ impl App {
         let first = !welcomed.exists();
         if first || !app.missing.is_empty() {
             let _ = fs::create_dir_all(ani::config_dir());
-            let _ = fs::write(&welcomed, "");
+            // skipping starts off; an install from before this keeps what it had. Saved first, so
+            // a start that couldn't save it is still the first next time
+            if !first || ani::set_skip(false).is_ok() {
+                let _ = fs::write(&welcomed, "");
+            }
             app.push(if first { "Welcome" } else { "Setup" }, View::Setup);
         }
         // on top, so it's answered before anything can log in and reset the screens

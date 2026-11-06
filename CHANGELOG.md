@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.10.12 – 2026-11-06
+
+### Changed
+
+- mpv's timeline marks the opening and the ending whether skipping is on or off. Before, the marks only came with skipping on.
+- A show's last episode marks its ending too. It still doesn't skip it.
+- Skipping starts off on a new install. If you already use ani-hop, your setting stays as it is.
+- mpv no longer waits for the opening and ending times. It starts at once, and the marks and skips follow: about 0.15 seconds into a downloaded episode, and as soon as a stream has loaded. Before, a stream waited 0.1 to 0.3 seconds for them, and a downloaded episode up to 5 seconds on a network that hangs. On a downloaded episode whose opening starts right away, you may see its first moment before the skip.
+- A player you set in `ANI_CLI_PLAYER` still gets the times before it starts, as it may not be able to load ani-hop's mpv script.
+
+### Fixed
+
+- Posters show in herdr. ani-hop didn't recognize herdr's panes, as they don't say they're in Ghostty.
+
 ## 0.10.11 – 2026-11-05
 
 ### Changed

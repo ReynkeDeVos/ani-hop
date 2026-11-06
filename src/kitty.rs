@@ -261,6 +261,9 @@ pub fn supported() -> bool {
     let env = |k: &str| std::env::var(k).unwrap_or_default();
     std::env::var_os("KITTY_WINDOW_ID").is_some()
         || std::env::var_os("GHOSTTY_RESOURCES_DIR").is_some() // also set inside tmux
+        // herdr shows Kitty images itself. shortcut: it reads the file whatever terminal it runs
+        // in, so in one without Kitty images the poster stays empty; untested, ask herdr if needed
+        || env("HERDR_ENV") == "1"
         || env("TERM_PROGRAM") == "ghostty"
         || env("TERM").contains("kitty")
         || env("TERM").contains("ghostty")
