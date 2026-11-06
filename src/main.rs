@@ -614,10 +614,10 @@ impl App {
         let first = !welcomed.exists();
         if first || !app.missing.is_empty() {
             let _ = fs::create_dir_all(ani::config_dir());
-            let _ = fs::write(&welcomed, "");
-            // skipping starts off; an install from before this keeps what it had
-            if first {
-                let _ = ani::set_skip(false);
+            // skipping starts off; an install from before this keeps what it had. Saved first, so
+            // a start that couldn't save it is still the first next time
+            if !first || ani::set_skip(false).is_ok() {
+                let _ = fs::write(&welcomed, "");
             }
             app.push(if first { "Welcome" } else { "Setup" }, View::Setup);
         }
