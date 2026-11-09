@@ -1164,25 +1164,22 @@ mod tests {
             nth: 1,
             episodes: Vec::new(),
         };
-        let mut all = Sources {
-            known: HashMap::new(),
-            checked: HashMap::new(),
-            asked: HashMap::new(),
-            tickets: 0,
-            picked: HashSet::new(),
-        };
-        let old = all.ask(7).unwrap();
-        assert_eq!(all.ask(7), None, "one runs already");
-        // what choose does besides saving the pick
-        all.asked.remove(&7);
-        let new = all.ask(7).unwrap();
-        assert!(!all.answer(7, old, &Ok(src("Old"))));
-        assert!(all.get(7).is_none());
-        assert!(all.answer(7, new, &Err("offline".into())));
-        let again = all.ask(7).unwrap();
-        assert!(all.answer(7, again, &Ok(src("New"))));
-        assert!(matches!(all.lookup(7), Lookup::Ready(s) if s.title == "New"));
-        assert_eq!(all.ask(7), None, "checked this session");
+        // an id no other test uses: the pick goes in the file they share
+        let id = 51_100;
+        let mut all = Sources::knowing(HashMap::from([(id, src("Old"))]));
+        let old = all.ask(id).unwrap();
+        assert_eq!(all.ask(id), None, "one runs already");
+        let hits = ["Old".to_string(), "New".to_string()];
+        all.choose(id, "q", &hits, 1).unwrap();
+        assert!(all.picked(id) && by_hand(id));
+        let new = all.ask(id).unwrap();
+        assert!(!all.answer(id, old, &Ok(src("Old"))));
+        assert!(all.get(id).is_none(), "the old source went with the pick");
+        assert!(all.answer(id, new, &Err("offline".into())));
+        let again = all.ask(id).unwrap();
+        assert!(all.answer(id, again, &Ok(src("New"))));
+        assert!(matches!(all.lookup(id), Lookup::Ready(s) if s.title == "New"));
+        assert_eq!(all.ask(id), None, "checked this session");
     }
 
     #[test]
