@@ -646,12 +646,10 @@ impl Queue {
             st.now = Some(now("starting", true));
             st.preparing = Some((m.id, ep.to_string()));
         }
-        // it comes held, so stopping another episode can't drop the folder; also for an episode
-        // already there, so a folder found through ani-cli gets the AniList show
-        let (dir, hold) = self.0.fetch.prepare(m)?;
-        // another ani-hop may have queued it too before either saw the other's queue
-        let mut held = (self.claim(&dir, ep)?).ok_or("another ani-hop is downloading it")?;
-        held.folder = Some(hold);
+        // also for an episode already there, so a folder found through ani-cli gets the AniList
+        // show
+        let held = self.acquire(m, ep)?;
+        let dir = held.dir.clone();
         *claim = Some(held);
         if ani::local_episodes(&dir).iter().any(|(e, _)| e == ep) {
             return Ok(()); // yt-dlp wouldn't replace it, so it stays the audio it was
@@ -701,6 +699,16 @@ impl Queue {
             false if killed => Err(STOPPED.into()),
             false => Err(ani::last_error(&stderr)),
         }
+    }
+
+    /// Episode `ep` of `m` for this ani-hop to download into: its Show folder, made and held
+    /// so stopping another episode can't drop it, and the episode claimed in it.
+    fn acquire(&self, m: &Media, ep: &str) -> Result<EpisodeLock, String> {
+        let (dir, hold) = self.0.fetch.prepare(m)?;
+        // another ani-hop may have queued it too before either saw the other's queue
+        let mut held = (self.claim(&dir, ep)?).ok_or("another ani-hop is downloading it")?;
+        held.folder = Some(hold);
+        Ok(held)
     }
 
     /// Holds episode `ep` of the show in `dir` for this ani-hop: while it downloads it, and
@@ -1086,12 +1094,12 @@ mod tests {
     fn a_stopped_episode_is_cleaned_up_while_it_is_still_held() {
         let dir = temp("held");
         let (q, _) = queue(&dir, "a", QUICK);
-        let (folder, hold) = ani::prepare_in(&dir.join("dl"), &show()).unwrap();
+        let claim = q.acquire(&show(), "1").unwrap();
+        let folder = claim.dir.clone();
         let part = folder.join("Show Episode 1.mp4.part");
         fs::write(&part, "x").unwrap();
-        let mut claim = q.claim(&folder, "1").unwrap().unwrap();
-        claim.folder = Some(hold);
         assert!(q.claim(&folder, "1").unwrap().is_none(), "held");
+        assert!(q.acquire(&show(), "1").is_err(), "for another download too");
         // another ani-hop dropping it now leaves it alone
         q.discard(&folder, &["1".into()]);
         assert!(part.exists() && folder.is_dir());
@@ -1104,6 +1112,20 @@ mod tests {
             !folder.exists()
         });
         wait("let go", || q.claim(&folder, "1").unwrap().is_some());
+        clean(&dir);
+    }
+
+    #[test]
+    fn a_claim_lets_go_while_a_process_just_started_has_a_copy_of_its_lock() {
+        let dir = temp("copy");
+        let (q, _) = queue(&dir, "a", QUICK);
+        let claim = q.acquire(&show(), "1").unwrap();
+        let folder = claim.dir.clone();
+        // what a process started right then has until its exec closes it
+        let copy = claim.held.try_clone().unwrap();
+        drop(claim);
+        assert!(q.try_claim(&folder, "1").unwrap().is_some(), "let go");
+        drop(copy);
         clean(&dir);
     }
 
