@@ -42,7 +42,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -193,6 +193,9 @@ enum Msg {
     Scanned(Vec<(Media, OnDisk)>),
     /// an episode downloaded or failed: ("Show E3", result)
     DlDone(String, Result<(), String>),
+    /// (show, episode, the ^o it's for, whether one that isn't downloaded is downloaded first,
+    /// the TV that's asked to play it or why it isn't, or stopped)
+    Cast(Media, String, u64, bool, Result<String, String>),
     /// (version, update command) of a newer ani-hop
     Release(Option<(String, String)>),
     /// (the ani-cli version it's about, and a newer one that's out)
@@ -260,6 +263,12 @@ pub struct App {
     focus: Focus,
     /// the next episode's stream is fetched ahead (Settings)
     preloading: bool,
+    /// catt is installed, so ^o casts an episode
+    pub catt: bool,
+    /// how many times ^o was pressed: a cast is only started for the last
+    cast_turn: Arc<AtomicU64>,
+    /// the episode ^o asked for last, while it waits for its download
+    cast: Option<(Media, String)>,
     /// whether background work runs: a test delivers the answers itself, in the order it's about
     background: bool,
     quit: bool,
@@ -591,6 +600,9 @@ impl App {
             continuing: None,
             focus: Focus::default(),
             preloading: false,
+            catt: false,
+            cast_turn: Arc::default(),
+            cast: None,
             background: seams.background,
             quit: false,
         }
@@ -622,6 +634,7 @@ impl App {
         app.missing = ani::missing_deps();
         app.ani_cli = ani::ani_cli_version();
         app.preloading = ani::preload_on();
+        app.catt = ani::have("catt");
         app.read_continue();
         app.push("ani-hop", View::Main);
         let welcomed = ani::config_dir().join("welcomed");
@@ -1597,6 +1610,14 @@ impl App {
         {
             return self.more();
         }
+        if ctrl
+            && k.code == KeyCode::Char('o')
+            && let Some(top) = self.stack.last()
+            && let View::Episodes(m, EpMode::Play) = &top.view
+            && let Some(ep) = top.menu.current().map(|i| i.key.clone())
+        {
+            return self.cast(m.clone(), ep);
+        }
         // fzf's preview keys page through a preview that doesn't fit; Menu::key would take
         // them for plain ↑↓
         if k.modifiers.contains(KeyModifiers::SHIFT)
@@ -2385,6 +2406,84 @@ impl App {
         }
     }
 
+    /// Casts episode `ep` of `m` to the TV with catt, from its file: one that isn't downloaded
+    /// yet is first, as the provider's streams won't play without a header a TV can't send.
+    fn cast(&mut self, m: Media, ep: String) {
+        if !self.catt {
+            return self.toast("Casting needs catt · pipx install catt", true);
+        }
+        // the one asked for last takes over, also from one waiting for its download
+        self.cast = None;
+        self.cast_turn.fetch_add(1, Ordering::Relaxed);
+        if self.queued_elsewhere(&m, &ep) {
+            return;
+        }
+        // its file may be there already, without its subtitles yet
+        if self.in_queue(&m, &ep) {
+            return self.wait_to_cast(m, ep);
+        }
+        self.toast(format!("Casting {}…", cast_what(&m, &ep)), false);
+        self.cast_file(m, ep, true);
+    }
+
+    /// Looks for episode `ep` of `m` on disk and casts it, in the background as playing does,
+    /// since the folder may be on a sleeping disk. Without the file, `download` asks for it.
+    fn cast_file(&self, m: Media, ep: String, download: bool) {
+        let (tx, turn) = (self.tx.clone(), self.cast_turn.clone());
+        let mine = turn.load(Ordering::Relaxed);
+        self.run(move || {
+            let send = |res| _ = tx.send(Msg::Cast(m.clone(), ep.clone(), mine, download, res));
+            let wanted = || turn.load(Ordering::Relaxed) == mine;
+            if let Err(e) = ani::cast(&m, &ep, &wanted, &|tv| send(Ok(tv))) {
+                send(Err(e));
+            }
+        });
+    }
+
+    /// Whether episode `ep` of `m` is in this ani-hop's download queue: once it's out, it's done,
+    /// subtitles and all, or it failed.
+    fn in_queue(&self, m: &Media, ep: &str) -> bool {
+        // a whole show's job skips what's on disk
+        let on_disk = self.local.get(&m.id).map_or(&[][..], Vec::as_slice);
+        let queued = self.downloads.queued(m, self.sources.get(m.id), on_disk);
+        queued.iter().any(|e| e == ep)
+    }
+
+    /// Says so when another ani-hop has episode `ep` of `m` queued: its file may be there
+    /// without its subtitles yet, and this one never hears when it's done.
+    fn queued_elsewhere(&mut self, m: &Media, ep: &str) -> bool {
+        let theirs = (self.elsewhere.get(&m.id)).is_some_and(|eps| eps.iter().any(|e| e == ep));
+        if theirs {
+            let what = cast_what(m, ep);
+            let text = format!("Couldn't cast {what} · another ani-hop is downloading it");
+            self.toast(text, true);
+        }
+        theirs
+    }
+
+    /// Downloads episode `ep` of `m`, which isn't on disk, to cast it once it's done.
+    fn cast_downloaded(&mut self, m: Media, ep: String) {
+        if self.queued_elsewhere(&m, &ep) {
+            return;
+        }
+        if !self.in_queue(&m, &ep) && !self.download(self.job(m.clone(), Some(vec![ep.clone()]))) {
+            return;
+        }
+        self.wait_to_cast(m, ep);
+    }
+
+    fn wait_to_cast(&mut self, m: Media, ep: String) {
+        let what = cast_what(&m, &ep);
+        let text = match self.downloads.snapshot().paused {
+            true => {
+                format!("Downloads are paused · {what} is cast once they're resumed and it's done")
+            }
+            false => format!("Downloading {what} · it's cast once it's done"),
+        };
+        self.toast(text, false);
+        self.cast = Some((m, ep));
+    }
+
     fn fulfill(&mut self, m: Media, want: Want) {
         match want {
             Want::Play(ep) => self.play(m, ep),
@@ -2813,6 +2912,13 @@ impl App {
                 }
                 self.downloaded = Some(shows);
                 self.rebuild();
+                // out of the queue once it's done, subtitles and all, or failed, which said so
+                if let Some((m, ep)) = self.cast.clone()
+                    && !self.in_queue(&m, &ep)
+                {
+                    self.cast = None;
+                    self.cast_file(m, ep, false);
+                }
                 // and the one asked for meanwhile, for what changed since this one started
                 if again {
                     self.scan_local();
@@ -2831,12 +2937,35 @@ impl App {
                 }
                 self.refresh();
             }
+            // another ^o came since: what the TV says of the one before is old news
+            Msg::Cast(_, _, turn, ..) if turn != self.cast_turn.load(Ordering::Relaxed) => {}
+            Msg::Cast(m, ep, _, download, res) => {
+                let what = cast_what(&m, &ep);
+                match res {
+                    // whether it plays comes later, as an error if it doesn't
+                    Ok(tv) => self.toast(format!("Casting {what} to {tv}"), false),
+                    // another ^o came first
+                    Err(e) if e.is_empty() => {}
+                    // not after its download, which said why it failed
+                    Err(e) if e == ani::NOT_DOWNLOADED => {
+                        if download {
+                            self.cast_downloaded(m, ep);
+                        }
+                    }
+                    Err(e) => self.toast(format!("Couldn't cast {what} · {e}"), true),
+                }
+            }
             Msg::Release(v) => self.release = v,
             // an answer from before an update isn't about this ani-cli
             Msg::AniCliRelease(asked, newer) if asked == self.ani_cli => self.ani_cli_newer = newer,
             Msg::AniCliRelease(..) => {}
         }
     }
+}
+
+/// An episode as a cast's toasts name it.
+fn cast_what(m: &Media, ep: &str) -> String {
+    format!("episode {ep} of {}", m.name())
 }
 
 /// What a show's row says when its choice differs from every show's.
@@ -3173,6 +3302,81 @@ mod tests {
         let stamp = app.entries.stamp();
         app.open_show(m.clone());
         (app, m, part, stamp)
+    }
+
+    #[test]
+    fn casting_an_episode_not_downloaded_downloads_it_first() {
+        let mut app = app();
+        let m = show(50_007, 12, None);
+        app.sources = Sources::knowing(HashMap::from([(m.id, source(12))]));
+        app.push("Episodes", View::Episodes(m.clone(), EpMode::Play));
+        app.top().menu.select_key("3");
+        let ctrl = |code| KeyEvent::new(code, KeyModifiers::CONTROL);
+        assert!(!screen(&mut app, 100, 30).contains("^o"), "only with catt");
+        app.on_key(ctrl(KeyCode::Char('o')));
+        assert!(toast(&app).unwrap().0.contains("catt"));
+        app.catt = true;
+        assert!(screen(&mut app, 100, 30).contains("^o cast"));
+        let waits = |app: &App| app.cast.as_ref().map(|c| (c.0.id, c.1.clone()));
+        let cast = |m: &Media, ep: &str, turn: u64, res: Result<&str, &str>| {
+            let res = res.map(String::from).map_err(String::from);
+            Msg::Cast(m.clone(), ep.into(), turn, true, res)
+        };
+        app.on_key(ctrl(KeyCode::Char('o')));
+        assert_eq!(toast(&app).unwrap().0, "Casting episode 3 of Show…");
+        // not on disk: downloaded first
+        app.on_msg(cast(&m, "3", 1, Err(ani::NOT_DOWNLOADED)));
+        assert_eq!(waits(&app), Some((m.id, "3".into())));
+        assert!(toast(&app).unwrap().0.contains("episode 3 of Show"));
+        // another ^o takes over, also from a look on disk still on its way
+        app.top().menu.select_key("2");
+        app.on_key(ctrl(KeyCode::Char('o')));
+        assert_eq!(waits(&app), None);
+        app.on_msg(cast(&m, "3", 1, Err(ani::NOT_DOWNLOADED)));
+        assert_eq!(waits(&app), None);
+        app.on_msg(cast(&m, "2", 2, Ok("Wohnzimmer")));
+        assert_eq!(
+            toast(&app).unwrap().0,
+            "Casting episode 2 of Show to Wohnzimmer"
+        );
+        // the episode before's refusal is old news
+        app.on_msg(cast(&m, "3", 1, Err("Playback of local file has failed")));
+        assert_eq!(
+            toast(&app).unwrap().0,
+            "Casting episode 2 of Show to Wohnzimmer"
+        );
+        // the TV can still refuse it
+        app.on_msg(cast(&m, "2", 2, Err("Playback of local file has failed")));
+        let (text, error) = toast(&app).unwrap();
+        assert!(error && text.ends_with("has failed"), "{text}");
+        // another ani-hop's download may not have its subtitles yet
+        app.elsewhere.insert(m.id, vec!["4".into()]);
+        app.top().menu.select_key("4");
+        app.on_key(ctrl(KeyCode::Char('o')));
+        let (text, error) = toast(&app).unwrap();
+        assert!(
+            error && text.ends_with("another ani-hop is downloading it"),
+            "{text}"
+        );
+        // once its download is out of the queue, it's looked for once more, and never queued
+        // again
+        app.cast = Some((m.clone(), "5".into()));
+        app.on_msg(Msg::DlDone("Other E1".into(), Err("failed".into())));
+        assert!(
+            app.cast.is_some(),
+            "another download's failure isn't this one's"
+        );
+        app.on_msg(Msg::Scanned(vec![]));
+        assert_eq!(waits(&app), None);
+        let after = Msg::Cast(
+            m.clone(),
+            "5".into(),
+            2,
+            false,
+            Err(ani::NOT_DOWNLOADED.into()),
+        );
+        app.on_msg(after);
+        assert_eq!(waits(&app), None);
     }
 
     #[test]

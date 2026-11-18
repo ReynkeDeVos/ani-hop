@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.11.1 – 2026-11-18
+
+### Added
+
+- With [catt](https://github.com/skorokithakis/catt) installed, `^o` on an episode casts it to your Chromecast, with subtitles if the show plays with them. An episode that isn't downloaded yet downloads first, as the streams don't play on a TV.
+
 ## 0.11.0 – 2026-11-18
 
 ### Added
