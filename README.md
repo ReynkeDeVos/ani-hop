@@ -15,6 +15,7 @@ A fast terminal UI for anime: find a show, then stream or download it through [a
 | **Sub or dub** | Japanese or English audio, with or without subtitles, for all shows or just one. |
 | **Openings and endings** | mpv's timeline marks them, in streams and downloads alike. To jump over them, turn on skipping in Settings, or for one show under its Playback. A show's last episode keeps its ending, as the story can go on after it. |
 | **Autoplay** | When an episode plays to the end, ani-hop marks it watched and starts the next one. Close mpv to stop. Turn it on in Settings, or for one show. |
+| **Chromecast** | With [catt](https://github.com/skorokithakis/catt) installed, `^o` in an episode list plays a downloaded episode on your TV. Your firewall has to allow incoming connections on ports 45000–47000. Tried with one Chromecast so far. |
 
 ## Install
 
