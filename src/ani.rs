@@ -73,6 +73,9 @@ esac
 case " $* " in
 *" --script-opts=ani-hop-"* | *" --script-opts=skip-"*) set -- --script="${0%/*}/ani-hop-skip.lua" "$@" ;;
 esac
+# says what's left of the episode, which ani-hop reads: mpv also says "End of file" when a stream
+# broke off. First, so a flag of the user's own still wins
+set -- '--term-status-msg=ani-hop-left ${=time-remaining}' "$@"
 # fetched ahead: what mpv would start with goes in a file, for when the episode is wanted
 if [ -n "$ANIHOP_HOLD" ]; then
 	printf '%s\0' "$@" >"$ANIHOP_HOLD.$$" && mv -f "$ANIHOP_HOLD.$$" "$ANIHOP_HOLD"
@@ -788,10 +791,33 @@ pub fn follow(mut child: Child, mut line: impl FnMut(&str)) -> (bool, Vec<u8>) {
 /// What FAKE_MPV says right before it starts mpv.
 const PLAYER_STARTS: &str = "ani-hop-player-starts";
 
-/// Whether mpv says it closes after playing to the end, where closing it says "(Quit)". After
-/// a prefix, as a config can have mpv name the module ("cplayer: ") or the time on each line.
-fn played_to_the_end(line: &str) -> bool {
-    line.ends_with("Exiting... (End of file)")
+/// Has mpv's status line say how many seconds are left, for `End`.
+const SAY_LEFT: &str = "--term-status-msg=ani-hop-left ${=time-remaining}";
+
+/// Whether mpv played an episode to its end, from what it prints. It says "End of file" also
+/// when a stream broke off, so only with about nothing left by its status line (SAY_LEFT).
+#[derive(Default)]
+struct End {
+    left: Option<f64>,
+    eof: bool,
+}
+
+impl End {
+    /// After a prefix, as a config can have mpv name the module ("cplayer: ") or the time.
+    fn hear(&mut self, line: &str) {
+        let left = line
+            .split_once("ani-hop-left ")
+            .map(|(_, l)| l.trim().parse());
+        if let Some(Ok(left)) = left {
+            self.left = Some(left);
+        }
+        self.eof |= line.ends_with("Exiting... (End of file)");
+    }
+
+    /// Closing it says "(Quit)"; without a status line it can't tell.
+    fn played(&self) -> bool {
+        self.eof && self.left.is_some_and(|left| left < 10.0)
+    }
 }
 
 /// mpv prints "VO: [gpu-next] 1920x1080 ..." once its window opens.
@@ -1150,12 +1176,12 @@ pub fn stream(
             std::thread::sleep(Duration::from_millis(200));
         }
     });
-    let mut to_the_end = false;
+    let mut end = End::default();
     let played = follow(child, |l| {
         if l == PLAYER_STARTS || l.starts_with("VO:") {
             started.store(true, Ordering::Relaxed);
         }
-        to_the_end |= played_to_the_end(l);
+        end.hear(l);
         stream_step(l, step)
     });
     started.store(true, Ordering::Relaxed);
@@ -1164,7 +1190,7 @@ pub fn stream(
         let _ = fs::remove_file(file);
     }
     match played {
-        (true, _) => Ok(to_the_end),
+        (true, _) => Ok(end.played()),
         (false, _) if stalled.load(Ordering::Relaxed) => {
             Err("ani-cli didn't answer for a minute".into())
         }
@@ -1251,16 +1277,16 @@ pub fn play_held(held: &Held, mut up: impl FnMut()) -> Replayed {
         Err(e) => return Replayed::Ended(Err(format!("mpv: {e}"))),
     };
     let _player = Listed::on(&PLAYERS, &child);
-    let (mut shown, mut to_the_end) = (false, false);
+    let (mut shown, mut end) = (false, End::default());
     let played = follow(child, |l| {
-        to_the_end |= played_to_the_end(l);
+        end.hear(l);
         player_up(l, &mut || {
             shown = true;
             up()
         })
     });
     match played {
-        (true, _) => Replayed::Ended(Ok(to_the_end)),
+        (true, _) => Replayed::Ended(Ok(end.played())),
         (false, _) if !shown => Replayed::TooOld,
         (false, stderr) => Replayed::Ended(Err(last_error(&stderr))),
     }
@@ -1270,6 +1296,7 @@ pub fn play_held(held: &Held, mut up: impl FnMut()) -> Replayed {
 pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Result<bool, String> {
     let mut mpv = Command::new("mpv");
     mpv.arg(format!("--force-media-title={} Episode {ep}", m.name()))
+        .arg(SAY_LEFT)
         .args(hwdec_unset().then_some(HWDEC));
     let vtt = file.with_extension("vtt");
     if vtt.exists() {
@@ -1298,13 +1325,13 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
         .spawn()
         .map_err(|e| format!("mpv: {e}"))?;
     let _player = Listed::on(&PLAYERS, &child);
-    let mut to_the_end = false;
+    let mut end = End::default();
     let played = follow(child, |l| {
-        to_the_end |= played_to_the_end(l);
+        end.hear(l);
         player_up(l, &mut up)
     });
     match played {
-        (true, _) => Ok(to_the_end),
+        (true, _) => Ok(end.played()),
         (false, stderr) => Err(last_error(&stderr)),
     }
 }
@@ -2046,15 +2073,32 @@ watch["time-pos"](nil, 30)
 
     #[test]
     fn mpv_says_when_it_played_to_the_end_and_not_when_closed() {
-        assert!(played_to_the_end("cplayer: Exiting... (End of file)"));
-        assert!(!played_to_the_end("Exiting... (Quit)"));
+        let end = |lines: &[&str]| {
+            let mut end = End::default();
+            lines.iter().for_each(|l| end.hear(l));
+            end.played()
+        };
+        assert!(end(&["ani-hop-left 0.07", "Exiting... (End of file)"]));
+        let prefixed = [
+            "statusline: ani-hop-left 0.0",
+            "cplayer: Exiting... (End of file)",
+        ];
+        assert!(end(&prefixed));
+        // a stream that broke off
+        assert!(!end(&["ani-hop-left 28.06", "Exiting... (End of file)"]));
+        assert!(!end(&["ani-hop-left 0.0", "Exiting... (Quit)"]));
+        assert!(
+            !end(&["Exiting... (End of file)"]),
+            "no status line: can't tell"
+        );
+        assert!(FAKE_MPV.contains(SAY_LEFT.trim_start_matches("--term-status-msg=")));
         // CI has no mpv
         if !have("mpv") {
             return;
         }
         let ends = |extra: &[&str]| {
             let child = Command::new("mpv")
-                .args(["--no-config", "--vo=null", "--ao=null"])
+                .args(["--no-config", "--vo=null", "--ao=null", SAY_LEFT])
                 .args(extra)
                 .arg("av://lavfi:testsrc=d=0.2")
                 .stdin(Stdio::null())
@@ -2062,10 +2106,10 @@ watch["time-pos"](nil, 30)
                 .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
-            let mut to_the_end = false;
-            let (ok, _) = follow(child, |l| to_the_end |= played_to_the_end(l));
+            let mut end = End::default();
+            let (ok, _) = follow(child, |l| end.hear(l));
             assert!(ok, "mpv played it");
-            to_the_end
+            end.played()
         };
         assert!(ends(&[]));
         assert!(ends(&["--msg-module", "--msg-time"]));
@@ -2553,6 +2597,7 @@ watch["time-pos"](nil, 30)
         assert_eq!(
             args,
             [
+                SAY_LEFT.as_bytes(),
                 b"--referrer=https://a b/".as_slice(),
                 b"--title=It's \"one\"".as_slice(),
                 b"https://x/y".as_slice(),
@@ -2577,7 +2622,8 @@ watch["time-pos"](nil, 30)
                 .unwrap();
             assert!(out.status.success());
             let args = fs::read(&held).unwrap();
-            String::from_utf8(args.split(|b| *b == 0).next().unwrap().to_vec()).unwrap()
+            // after what has mpv say what's left
+            String::from_utf8(args.split(|b| *b == 0).nth(1).unwrap().to_vec()).unwrap()
         };
         // this ani-hop asks later; an older one, still running after an update, gives the times
         assert_eq!(first("--script-opts=ani-hop-mal=1,ani-hop-ep=2"), script);
@@ -3081,8 +3127,11 @@ esac
                 .output()
                 .unwrap();
             assert_eq!(o.status.code(), Some(7), "mpv's own exit code");
+            let said = fs::read_to_string(log.with_extension("mpv")).unwrap();
+            let rest = said.strip_prefix(&format!("{SAY_LEFT}\n"));
             (
-                fs::read_to_string(log.with_extension("mpv")).unwrap(),
+                rest.expect("what has mpv say what's left comes first")
+                    .to_string(),
                 fs::read_to_string(log.with_extension("curl")).unwrap_or_default(),
                 fs::read_to_string(&file).ok(),
             )
