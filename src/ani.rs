@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::{BufReader, Read};
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -554,7 +555,7 @@ fn clear_leftovers(dir: &Path) {
     };
     for p in rd.flatten().map(|e| e.path()) {
         let name = p.file_name().unwrap_or_default().to_string_lossy();
-        let pid = (["menu-", "held-", "subs-"].iter())
+        let pid = (["menu-", "held-", "subs-", "cast-"].iter())
             .find_map(|kind| name.strip_prefix(kind))
             .and_then(|rest| rest.split('-').next());
         if pid.is_some_and(|pid| !running(pid)) {
@@ -1334,6 +1335,81 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
         (true, _) => Ok(end.played()),
         (false, stderr) => Err(last_error(&stderr)),
     }
+}
+
+/// Why `cast` didn't: the episode isn't downloaded.
+pub const NOT_DOWNLOADED: &str = "not downloaded";
+
+/// Casts a downloaded episode with catt, to its default Chromecast or the one it finds, with
+/// the subtitles mpv would show. The file's looked for as playing does, so an ani-cli result
+/// finds the AniList show's folder it shares. `wanted` says right before catt starts whether
+/// it's still the episode asked for, and `asked` hears the TV's name once catt asks it to play.
+/// catt serves the file for as long as the TV plays it, in a process group of its own so
+/// quitting ani-hop doesn't end it, and this waits for it: Ok once the TV is done, else why
+/// not, NOT_DOWNLOADED, or nothing when it wasn't wanted anymore.
+pub fn cast(
+    m: &Media,
+    ep: &str,
+    wanted: &dyn Fn() -> bool,
+    asked: &dyn Fn(String),
+) -> Result<(), String> {
+    let on_disk = local_episodes(&folder(m)).into_iter().find(|e| e.0 == ep);
+    let Some((_, file)) = on_disk else {
+        return Err(NOT_DOWNLOADED.into());
+    };
+    let mut catt = Command::new("catt");
+    catt.arg("cast")
+        .arg(format!("--title={} Episode {ep}", m.name()));
+    let vtt = file.with_extension("vtt");
+    match vtt.exists() && !hide_subs(audio(Some(m.id)), is_dub(&file)) {
+        true => catt.arg("--subtitles").arg(vtt),
+        false => catt.arg("--no-subs"),
+    };
+    // a file, not a pipe: catt goes on writing while the TV plays, maybe after ani-hop quit
+    static N: AtomicU64 = AtomicU64::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let log = cache_dir()
+        .join("probe")
+        .join(format!("cast-{}-{n}", std::process::id()));
+    let said = fs::create_dir_all(log.parent().unwrap()).and_then(|()| fs::File::create(&log));
+    let said = said.map_err(|e| e.to_string())?;
+    // last, as what comes before it may wait on a sleeping disk
+    if !wanted() {
+        let _ = fs::remove_file(&log);
+        return Err(String::new());
+    }
+    let mut child = (catt.arg(&file))
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(said.try_clone().map_err(|e| e.to_string())?)
+        .stderr(said)
+        .spawn()
+        .map_err(|e| format!("catt: {e}"))?;
+    let read = || fs::read_to_string(&log).unwrap_or_default();
+    // asking the TV comes first; whether it plays, a while later, only as how catt ends
+    let ended = loop {
+        if let Some(tv) = read().lines().find_map(casting_to) {
+            asked(tv);
+            break child.wait();
+        }
+        if let Some(ended) = child.try_wait().transpose() {
+            break ended;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let said = read();
+    let _ = fs::remove_file(&log);
+    match ended {
+        Ok(status) if status.success() => Ok(()),
+        Ok(_) => Err(last_error(said.as_bytes())),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The TV in what catt says right before it serves the file: Playing "<title>" on "<TV>"...
+fn casting_to(line: &str) -> Option<String> {
+    let (_, tv) = line.strip_prefix("Playing ")?.rsplit_once(" on \"")?;
+    Some(tv.strip_suffix("\"...")?.to_string())
 }
 
 /// What ani-hop knows about a show folder it downloaded into. It's kept in the config
@@ -2806,6 +2882,68 @@ watch["time-pos"](nil, 30)
         discard(&dir, &["2".into()]);
         assert!(dir.join(files[4]).exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn casting_hears_the_tv_asked_then_how_catt_ended() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-cast-{}", std::process::id()));
+        if std::env::var_os("ANIHOP_CHILD").is_none() {
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(dir.join("bin")).unwrap();
+            let catt = "#!/bin/sh\nprintf '%s\\n' \"$@\" >\"${0%/*}/args\"\n\
+                echo 'Playing \"Show Episode 1\" on \"Wohnzimmer\"...'\n\
+                sleep 0.3\necho 'Error: Playback of local file has failed' >&2\nexit 1\n";
+            write_helper(&dir.join("bin/catt"), catt).unwrap();
+            let path = format!(
+                "{}:{}",
+                dir.join("bin").display(),
+                std::env::var("PATH").unwrap()
+            );
+            let env = [
+                ("PATH", path.into()),
+                ("HOME", dir.clone().into_os_string()),
+                ("XDG_CONFIG_HOME", dir.join("config").into_os_string()),
+                ("XDG_CACHE_HOME", dir.join("cache").into_os_string()),
+                ("ANI_CLI_DOWNLOAD_DIR", dir.join("dl").into_os_string()),
+            ];
+            let name = "ani::tests::casting_hears_the_tv_asked_then_how_catt_ended";
+            assert!(crate::in_child(name, &env));
+            let args = fs::read_to_string(dir.join("bin/args")).unwrap();
+            assert!(
+                args.contains("--subtitles\n") && args.contains("Show Episode 1.vtt"),
+                "{args}"
+            );
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        }
+        let mut m = Media {
+            id: 1,
+            ..Default::default()
+        };
+        m.title.romaji = Some("Show".into());
+        let tvs = std::sync::Mutex::new(Vec::new());
+        let asked = |tv| tvs.lock().unwrap().push(tv);
+        assert_eq!(cast(&m, "1", &|| true, &asked), Err(NOT_DOWNLOADED.into()));
+        let folder = folder(&m);
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("Show Episode 1.mp4"), "").unwrap();
+        fs::write(folder.join("Show Episode 1.vtt"), "").unwrap();
+        assert_eq!(
+            cast(&m, "1", &|| false, &asked),
+            Err(String::new()),
+            "not wanted anymore"
+        );
+        assert!(tvs.lock().unwrap().is_empty());
+        let res = cast(&m, "1", &|| true, &asked);
+        assert_eq!(*tvs.lock().unwrap(), ["Wohnzimmer"]);
+        assert_eq!(res, Err("Error: Playback of local file has failed".into()));
+    }
+
+    #[test]
+    fn casting_says_the_tv_catt_plays_on() {
+        let said = r#"Playing "Frieren "on" TV Episode 1" on "Wohnzimmer"..."#;
+        assert_eq!(casting_to(said).as_deref(), Some("Wohnzimmer"));
+        assert_eq!(casting_to("Casting local file /a.mp4..."), None);
     }
 
     #[test]

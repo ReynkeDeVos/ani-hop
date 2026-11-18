@@ -921,6 +921,10 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
             .unwrap_or(keys.len());
         keys.insert(at, ("^f", "more"));
     }
+    // only where catt is: few have a Chromecast to cast to
+    if app.catt && matches!(&screen.view, View::Episodes(_, EpMode::Play)) && enter.is_some() {
+        keys.insert(1, ("^o", "cast"));
+    }
     keys.push(("^c", "quit"));
     let hints = Line::from(
         keys.iter()
