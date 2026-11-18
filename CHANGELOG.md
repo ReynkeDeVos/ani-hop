@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.11.0 – 2026-11-18
+
+### Added
+
+- Autoplay: when an episode plays to the end, ani-hop marks it watched without asking and starts the next one. Closing mpv before the end stops it, and asks as before. If marking it would change other episodes too, ani-hop asks and waits. It's off until you turn it on in Settings.
+- Each show has a Playback screen on its page, with its audio, skipping and autoplay. A show's own choice says "this show only". Switch it back to what Settings says, and the show follows Settings again.
+
+### Changed
+
+- The show page's Audio row is now Playback.
+
 ## 0.10.13 – 2026-11-06
 
 ### Fixed

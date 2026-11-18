@@ -19,6 +19,9 @@ const PROVIDER_KEY: &[u8] = b"otaku-embed-v1";
 
 /// What the helper standing in for ani-skip reads, set for a show's last episode.
 pub const LAST_EPISODE: &str = "ANIHOP_LAST_EPISODE";
+/// Says whether to jump over the opening and ending, which is up to the show and only the ani-hop
+/// that starts it knows: "yes" or "no".
+pub const JUMP: &str = "ANIHOP_JUMP";
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
 struct Span {
@@ -247,13 +250,13 @@ pub fn json_for_script(mal: &str, ep: &str, dub: bool, last: bool, jump: bool) -
 /// The flag that has ani-hop's mpv script ask for the times itself, so mpv starts without waiting
 /// for them: the chapters arrive a moment later, and the jumps with them. Whether to jump is
 /// decided now, so an episode fetched ahead keeps what it was fetched with.
-pub fn ask_later(mal: u64, ep: &str, dub: bool, last: bool) -> Option<String> {
+pub fn ask_later(mal: u64, ep: &str, dub: bool, last: bool, jump: bool) -> Option<String> {
     // a comma would end the option, and it goes into URLs
     if ep.is_empty() || !ep.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
         return None;
     }
     let yes = |on: bool| if on { "yes" } else { "no" };
-    let (dub, last, jump) = (yes(dub), yes(last), yes(ani::skip_on()));
+    let (dub, last, jump) = (yes(dub), yes(last), yes(jump));
     Some(format!(
         "--script-opts=ani-hop-mal={mal},ani-hop-ep={ep},ani-hop-dub={dub},ani-hop-last={last},ani-hop-jump={jump}"
     ))
@@ -274,10 +277,12 @@ pub fn flags_for_ani_cli(mal: &str, ep: &str, later: bool) -> String {
     let dub = std::env::var("ANI_CLI_MODE").is_ok_and(|m| m == "dub");
     let last = std::env::var_os(LAST_EPISODE).is_some();
     let player = std::env::var("ANI_CLI_PLAYER").unwrap_or_default();
+    // started by an ani-hop from before shows had their own: every show's
+    let jump = std::env::var(JUMP).map_or_else(|_| ani::SKIP.on(None), |j| j == "yes");
     if asks_later(&player, later) {
-        return ask_later(mal, ep, dub, last).unwrap_or_default();
+        return ask_later(mal, ep, dub, last, jump).unwrap_or_default();
     }
-    let mut flags = flags(&times(mal, ep, dub), ani::skip_on(), last);
+    let mut flags = flags(&times(mal, ep, dub), jump, last);
     let jumps = flags.iter().any(|f| f.starts_with("--script-opts="));
     if jumps && let Some(script) = script_flag(&player, &ani::skip_script()) {
         flags.push(script);
@@ -632,11 +637,14 @@ mod tests {
 
     #[test]
     fn asking_later_says_the_episode_in_one_option() {
-        let flag = ask_later(59978, "1", true, false).unwrap();
-        assert!(flag.starts_with("--script-opts=ani-hop-mal=59978,ani-hop-ep=1,ani-hop-dub=yes,ani-hop-last=no,ani-hop-jump="), "{flag}");
+        let flag = ask_later(59978, "1", true, false, true).unwrap();
+        assert_eq!(
+            flag,
+            "--script-opts=ani-hop-mal=59978,ani-hop-ep=1,ani-hop-dub=yes,ani-hop-last=no,ani-hop-jump=yes"
+        );
         assert!(!flag.contains(char::is_whitespace));
         for ep in ["", "1,ani-hop-jump=yes", "12 3"] {
-            assert_eq!(ask_later(1, ep, false, false), None, "{ep}");
+            assert_eq!(ask_later(1, ep, false, false, false), None, "{ep}");
         }
     }
 

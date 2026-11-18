@@ -788,6 +788,12 @@ pub fn follow(mut child: Child, mut line: impl FnMut(&str)) -> (bool, Vec<u8>) {
 /// What FAKE_MPV says right before it starts mpv.
 const PLAYER_STARTS: &str = "ani-hop-player-starts";
 
+/// Whether mpv says it closes after playing to the end, where closing it says "(Quit)". After
+/// a prefix, as a config can have mpv name the module ("cplayer: ") or the time on each line.
+fn played_to_the_end(line: &str) -> bool {
+    line.ends_with("Exiting... (End of file)")
+}
+
 /// mpv prints "VO: [gpu-next] 1920x1080 ..." once its window opens.
 fn player_up(line: &str, up: &mut impl FnMut()) {
     if line.starts_with("VO:") {
@@ -804,16 +810,65 @@ fn stream_step(line: &str, step: &dyn Fn(Option<&'static str>)) {
     }
 }
 
-/// Whether mpv jumps over openings and endings (Settings). Its chapters mark them either way.
-pub fn skip_on() -> bool {
-    !config_dir().join("no-skip").exists()
+/// A yes or no for every show (Settings), which a show can differ from (its Playback screen): a
+/// flag file says the one for every show, a JSON file of AniList ids the shows' own.
+pub struct Toggle {
+    flag: &'static str,
+    /// whether the flag's there when it's on
+    flag_on: bool,
+    shows: &'static str,
 }
 
-pub fn set_skip(on: bool) -> std::io::Result<()> {
-    let off = config_dir().join("no-skip");
-    match on {
-        true => fs::remove_file(off),
-        false => fs::create_dir_all(config_dir()).and_then(|()| fs::write(off, "")),
+/// Whether mpv jumps over openings and endings. Its chapters mark them either way.
+pub const SKIP: Toggle = Toggle {
+    flag: "no-skip",
+    flag_on: false,
+    shows: "skip.json",
+};
+
+/// Whether an episode played to its end saves it watched and plays the next.
+pub const AUTOPLAY: Toggle = Toggle {
+    flag: "autoplay",
+    flag_on: true,
+    shows: "autoplay.json",
+};
+
+impl Toggle {
+    /// Show `id`'s (None: every show's).
+    pub fn on(&self, id: Option<u64>) -> bool {
+        self.own(id).unwrap_or_else(|| self.for_all())
+    }
+
+    /// What show `id` has of its own, if it differs.
+    pub fn own(&self, id: Option<u64>) -> Option<bool> {
+        let shows: HashMap<String, bool> = read_json(&config_dir().join(self.shows));
+        id.and_then(|id| shows.get(&id.to_string()).copied())
+    }
+
+    fn for_all(&self) -> bool {
+        config_dir().join(self.flag).exists() == self.flag_on
+    }
+
+    /// A show keeps a choice of its own only while it differs from every show's.
+    pub fn set(&self, id: Option<u64>, on: bool) -> std::io::Result<()> {
+        // every show's first: if that fails, the shows' own still differ from it
+        match (id, on == self.flag_on) {
+            (Some(_), _) => {}
+            (None, true) => fs::write(config_dir().join(self.flag), "")?,
+            (None, false) => match fs::remove_file(config_dir().join(self.flag)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            },
+        }
+        let all = self.for_all();
+        edit_json(
+            &config_dir().join(self.shows),
+            |shows: &mut HashMap<String, bool>| match id {
+                Some(id) if on == all => _ = shows.remove(&id.to_string()),
+                Some(id) => _ = shows.insert(id.to_string(), on),
+                None => shows.retain(|_, own| *own != on),
+            },
+        )
     }
 }
 
@@ -1039,6 +1094,7 @@ fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, O
     if skip::last_episode(m, &src.episodes, ep) {
         cli.env(skip::LAST_EPISODE, "1");
     }
+    cli.env(skip::JUMP, if SKIP.on(Some(m.id)) { "yes" } else { "no" });
     let subs = subs_page(m, src, ep, dub(audio)).map(|page| {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
@@ -1068,14 +1124,14 @@ fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, O
 }
 
 /// Streams through ani-cli; `step` hears when mpv starts, and None once it
-/// shows the episode.
+/// shows the episode. Ok(true): mpv played it to the end.
 pub fn stream(
     m: &Media,
     src: &Source,
     ep: &str,
     audio: &str,
     step: &dyn Fn(Option<&'static str>),
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let (mut cli, subs) = stream_command(m, src, ep, audio);
     let child = cli.spawn().map_err(|e| format!("ani-cli: {e}"))?;
     let _player = Listed::on(&PLAYERS, &child);
@@ -1094,10 +1150,12 @@ pub fn stream(
             std::thread::sleep(Duration::from_millis(200));
         }
     });
+    let mut to_the_end = false;
     let played = follow(child, |l| {
         if l == PLAYER_STARTS || l.starts_with("VO:") {
             started.store(true, Ordering::Relaxed);
         }
+        to_the_end |= played_to_the_end(l);
         stream_step(l, step)
     });
     started.store(true, Ordering::Relaxed);
@@ -1106,7 +1164,7 @@ pub fn stream(
         let _ = fs::remove_file(file);
     }
     match played {
-        (true, _) => Ok(()),
+        (true, _) => Ok(to_the_end),
         (false, _) if stalled.load(Ordering::Relaxed) => {
             Err("ani-cli didn't answer for a minute".into())
         }
@@ -1132,7 +1190,8 @@ impl Drop for Held {
 
 /// How a stream fetched ahead went.
 pub enum Replayed {
-    Ended(Result<(), String>),
+    /// Ok(true): played to the end
+    Ended(Result<bool, String>),
     /// mpv never showed it and failed: its links are too old, nothing was watched
     TooOld,
 }
@@ -1192,21 +1251,23 @@ pub fn play_held(held: &Held, mut up: impl FnMut()) -> Replayed {
         Err(e) => return Replayed::Ended(Err(format!("mpv: {e}"))),
     };
     let _player = Listed::on(&PLAYERS, &child);
-    let mut shown = false;
+    let (mut shown, mut to_the_end) = (false, false);
     let played = follow(child, |l| {
+        to_the_end |= played_to_the_end(l);
         player_up(l, &mut || {
             shown = true;
             up()
         })
     });
     match played {
-        (true, _) => Replayed::Ended(Ok(())),
+        (true, _) => Replayed::Ended(Ok(to_the_end)),
         (false, _) if !shown => Replayed::TooOld,
         (false, stderr) => Replayed::Ended(Err(last_error(&stderr))),
     }
 }
 
-pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Result<(), String> {
+/// Ok(true): mpv played it to the end.
+pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Result<bool, String> {
     let mut mpv = Command::new("mpv");
     mpv.arg(format!("--force-media-title={} Episode {ep}", m.name()))
         .args(hwdec_unset().then_some(HWDEC));
@@ -1220,7 +1281,13 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
     if let Some(mal) = m.id_mal {
         let last = skip::last_episode(m, &[], ep);
         mpv.arg(format!("--script={}", skip_script().display()))
-            .args(skip::ask_later(mal, ep, is_dub(file), last))
+            .args(skip::ask_later(
+                mal,
+                ep,
+                is_dub(file),
+                last,
+                SKIP.on(Some(m.id)),
+            ))
             .env("ANIHOP_EXE", exe());
     }
     let child = mpv
@@ -1231,8 +1298,13 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
         .spawn()
         .map_err(|e| format!("mpv: {e}"))?;
     let _player = Listed::on(&PLAYERS, &child);
-    match follow(child, |l| player_up(l, &mut up)) {
-        (true, _) => Ok(()),
+    let mut to_the_end = false;
+    let played = follow(child, |l| {
+        to_the_end |= played_to_the_end(l);
+        player_up(l, &mut up)
+    });
+    match played {
+        (true, _) => Ok(to_the_end),
         (false, stderr) => Err(last_error(&stderr)),
     }
 }
@@ -1973,6 +2045,34 @@ watch["time-pos"](nil, 30)
     }
 
     #[test]
+    fn mpv_says_when_it_played_to_the_end_and_not_when_closed() {
+        assert!(played_to_the_end("cplayer: Exiting... (End of file)"));
+        assert!(!played_to_the_end("Exiting... (Quit)"));
+        // CI has no mpv
+        if !have("mpv") {
+            return;
+        }
+        let ends = |extra: &[&str]| {
+            let child = Command::new("mpv")
+                .args(["--no-config", "--vo=null", "--ao=null"])
+                .args(extra)
+                .arg("av://lavfi:testsrc=d=0.2")
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut to_the_end = false;
+            let (ok, _) = follow(child, |l| to_the_end |= played_to_the_end(l));
+            assert!(ok, "mpv played it");
+            to_the_end
+        };
+        assert!(ends(&[]));
+        assert!(ends(&["--msg-module", "--msg-time"]));
+        assert!(!ends(&["--input-commands=quit"]));
+    }
+
+    #[test]
     fn mpv_itself_says_what_its_config_sets_and_nothing_in_it_starts() {
         // mpv reads this config as well, and CI has no mpv
         if !have("mpv") || Path::new("/etc/mpv/mpv.conf").exists() {
@@ -2660,6 +2760,38 @@ watch["time-pos"](nil, 30)
         discard(&dir, &["2".into()]);
         assert!(dir.join(files[4]).exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_show_keeps_its_own_toggle_only_while_it_differs() {
+        let t = Toggle {
+            flag: "test-toggle",
+            flag_on: true,
+            shows: "test-toggle.json",
+        };
+        assert!(!t.on(None) && !t.on(Some(1)));
+        t.set(Some(1), true).unwrap();
+        assert_eq!(
+            (t.on(Some(1)), t.own(Some(1)), t.on(Some(2))),
+            (true, Some(true), false)
+        );
+        t.set(None, true).unwrap();
+        assert_eq!(
+            t.own(Some(1)),
+            None,
+            "show 1 matches every show's now and follows it"
+        );
+        assert!(t.on(Some(2)));
+        t.set(Some(2), false).unwrap();
+        t.set(Some(2), true).unwrap();
+        assert_eq!(
+            t.own(Some(2)),
+            None,
+            "back to every show's, nothing of its own left"
+        );
+        t.set(None, false).unwrap();
+        t.set(None, false).unwrap();
+        assert!(!t.on(Some(1)), "switching off twice is fine");
     }
 
     #[test]
