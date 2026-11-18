@@ -22,7 +22,7 @@ const FETCHING: &str = "fetching the stream";
 /// What plays episodes: ani-cli and mpv, or a script in tests.
 pub trait Player: Send + Sync {
     /// Streams episode `ep` of `src`; `step` hears what it waits on, and None once the player
-    /// shows it.
+    /// shows it. Ok(true): it played to the end.
     fn stream(
         &self,
         m: &Media,
@@ -30,15 +30,15 @@ pub trait Player: Send + Sync {
         ep: &str,
         audio: &str,
         step: &dyn Fn(Option<&'static str>),
-    ) -> Result<(), String>;
+    ) -> Result<bool, String>;
     /// Runs ani-cli up to where it would start the player, and keeps what it would start it with.
     fn hold(&self, m: &Media, src: &Source, ep: &str, audio: &str) -> Result<Held, String>;
     /// Starts the player with what `hold` kept; `step` hears the same as from `stream`.
     fn replay(&self, held: &Held, step: &dyn Fn(Option<&'static str>)) -> Replayed;
     /// Episode `ep` of `m`, if it's downloaded. It may be on a slow disk.
     fn on_disk(&self, m: &Media, ep: &str) -> Option<PathBuf>;
-    /// Plays a downloaded episode.
-    fn file(&self, m: &Media, ep: &str, file: &Path, up: &mut dyn FnMut()) -> Result<(), String>;
+    /// Plays a downloaded episode. Ok(true): to the end.
+    fn file(&self, m: &Media, ep: &str, file: &Path, up: &mut dyn FnMut()) -> Result<bool, String>;
     /// Where the provider has the show now.
     fn locate(&self, m: &Media, lookup: Lookup) -> Result<Source, String>;
 }
@@ -54,7 +54,7 @@ impl Player for Mpv {
         ep: &str,
         audio: &str,
         step: &dyn Fn(Option<&'static str>),
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
         ani::stream(m, src, ep, audio, step)
     }
 
@@ -71,7 +71,7 @@ impl Player for Mpv {
         eps.into_iter().find(|(e, _)| e == ep).map(|f| f.1)
     }
 
-    fn file(&self, m: &Media, ep: &str, file: &Path, up: &mut dyn FnMut()) -> Result<(), String> {
+    fn file(&self, m: &Media, ep: &str, file: &Path, up: &mut dyn FnMut()) -> Result<bool, String> {
         ani::play_file(m, ep, file, up)
     }
 
@@ -249,9 +249,15 @@ impl Playback {
         (self.now.as_ref()).is_some_and(|p| p.attempt == attempt && p.step.is_some())
     }
 
-    /// `attempt` ended, its player closed or it failed.
-    pub fn ended(&mut self, attempt: u64) {
-        self.now.take_if(|p| p.attempt == attempt);
+    /// The attempts started so far, the last one's id.
+    #[cfg(test)]
+    pub fn attempts(&self) -> u64 {
+        self.attempts
+    }
+
+    /// `attempt` ended, its player closed or it failed: whether it was the one on.
+    pub fn ended(&mut self, attempt: u64) -> bool {
+        self.now.take_if(|p| p.attempt == attempt).is_some()
     }
 
     /// The lookup show `id` waited on answered, and its episode wasn't started again (the
@@ -264,8 +270,8 @@ impl Playback {
 
 impl Run {
     /// Blocks until the player closes; `step` hears what it waits on, and None once the
-    /// player shows the episode.
-    pub fn run(self, step: &dyn Fn(Option<&'static str>)) -> Result<(), String> {
+    /// player shows the episode. Ok(true): it played to the end.
+    pub fn run(self, step: &dyn Fn(Option<&'static str>)) -> Result<bool, String> {
         // only here, with the pop-up up, as the folder may be on a slow disk
         if let Some(file) = self.player.on_disk(&self.show, &self.ep) {
             step(Some(OPENING));
@@ -328,7 +334,7 @@ mod tests {
             ep: &str,
             audio: &str,
             step: &dyn Fn(Option<&'static str>),
-        ) -> Result<(), String> {
+        ) -> Result<bool, String> {
             if self.no_dub && audio == "dub" {
                 return Err("No sources found for dub!".into());
             }
@@ -337,7 +343,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("stream {ep} {audio}"));
-            Ok(())
+            Ok(true)
         }
 
         fn hold(&self, _: &Media, _: &Source, ep: &str, audio: &str) -> Result<Held, String> {
@@ -360,17 +366,23 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("replay {}", held.args[0]));
-            Replayed::Ended(Ok(()))
+            Replayed::Ended(Ok(true))
         }
 
         fn on_disk(&self, _: &Media, ep: &str) -> Option<PathBuf> {
             self.files.iter().find(|f| *f == ep).map(PathBuf::from)
         }
 
-        fn file(&self, _: &Media, ep: &str, _: &Path, up: &mut dyn FnMut()) -> Result<(), String> {
+        fn file(
+            &self,
+            _: &Media,
+            ep: &str,
+            _: &Path,
+            up: &mut dyn FnMut(),
+        ) -> Result<bool, String> {
             up();
             self.played.lock().unwrap().push(format!("file {ep}"));
-            Ok(())
+            Ok(true)
         }
 
         fn locate(&self, _: &Media, _: Lookup) -> Result<Source, String> {

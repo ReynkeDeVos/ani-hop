@@ -497,7 +497,9 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 Some((key, text)) if *key == item.key => (text.clone(), ACCENT.into()),
                 _ if hero => (item.hint.clone(), ACCENT.into()),
                 // what Settings is there to show
-                _ if matches!(screen.view, View::Settings) => (item.hint.clone(), Style::new()),
+                _ if matches!(screen.view, View::Settings | View::Playback(_)) => {
+                    (item.hint.clone(), Style::new())
+                }
                 _ => (item.hint.clone(), SOFT),
             };
             let mut hint = hint;
@@ -647,6 +649,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
         | View::Sources(m, ..)
         | View::Input(Input::SourceQuery(m))
         | View::Audio(Some(m))
+        | View::Playback(m)
         | View::Confirm(Pending::Remove(m) | Pending::Stop(m, _) | Pending::Pause(m, _)) => {
             Some(m.clone())
         }

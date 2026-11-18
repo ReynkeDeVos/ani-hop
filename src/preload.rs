@@ -32,7 +32,7 @@ impl Key {
             show,
             ep: ep.to_string(),
             audio,
-            skip: ani::skip_on(),
+            skip: ani::SKIP.on(Some(show)),
             source: (src.query.clone(), src.index, src.title.clone()),
         }
     }

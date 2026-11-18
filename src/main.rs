@@ -80,6 +80,8 @@ pub enum View {
     Shows(List),
     /// audio picker for a show, or the default (None)
     Audio(Option<Media>),
+    /// a show's own audio, skipping and autoplay
+    Playback(Media),
     Show(Media),
     Episodes(Media, EpMode),
     Status(Media),
@@ -184,8 +186,9 @@ enum Msg {
     /// (Playback attempt, when it started, its show, what it waits on now; None = the player
     /// is up)
     PlayStep(u64, Stamp, Media, Option<&'static str>),
-    /// (Playback attempt, when it started, show, episode, how it ended)
-    Played(u64, Stamp, Media, String, Result<(), String>),
+    /// (Playback attempt, when it started, show, episode, how it ended: Ok(true) played to the
+    /// end)
+    Played(u64, Stamp, Media, String, Result<bool, String>),
     /// what a rescan of the download folder found: the shows and their episodes
     Scanned(Vec<(Media, OnDisk)>),
     /// an episode downloaded or failed: ("Show E3", result)
@@ -627,7 +630,7 @@ impl App {
             let _ = fs::create_dir_all(ani::config_dir());
             // skipping starts off; an install from before this keeps what it had. Saved first, so
             // a start that couldn't save it is still the first next time
-            if !first || ani::set_skip(false).is_ok() {
+            if !first || ani::SKIP.set(None, false).is_ok() {
                 let _ = fs::write(&welcomed, "");
             }
             app.push(if first { "Welcome" } else { "Setup" }, View::Setup);
@@ -1285,18 +1288,14 @@ impl App {
                 v
             }
             View::Settings => vec![
-                Item::new(
-                    "skip",
-                    // short enough for its on/off at 80 columns
-                    "Skip openings/endings",
-                    if ani::skip_on() { "on" } else { "off" },
-                ),
+                toggle_item("skip", &ani::SKIP, None),
+                toggle_item("autoplay", &ani::AUTOPLAY, None),
                 Item::new(
                     "preload",
                     "Preload next episode",
                     if self.preloading { "on" } else { "off" },
                 ),
-                audio_item("Default audio…", ani::audio(None)),
+                audio_item("Default audio…", None),
                 Item::new(
                     "folder",
                     "Download folder…",
@@ -1398,7 +1397,9 @@ impl App {
                     let progress = format!("{}/{total}", entry.map_or(0, |e| e.progress));
                     v.push(Item::new("watched", "✓  Watched up to…", progress));
                 }
-                v.push(audio_item("♪  Audio…", ani::audio(Some(m.id))));
+                let mut it = audio_item("♪  Playback…", Some(m.id));
+                it.key = "playback".into();
+                v.push(it);
                 v.push(Item::new(
                     "source",
                     "⇄  Change source…",
@@ -1490,6 +1491,11 @@ impl App {
                     })
                     .collect()
             }
+            View::Playback(m) => vec![
+                audio_item("Audio…", Some(m.id)),
+                toggle_item("skip", &ani::SKIP, Some(m.id)),
+                toggle_item("autoplay", &ani::AUTOPLAY, Some(m.id)),
+            ],
             View::Sources(_, _, hits) => hits
                 .iter()
                 .enumerate()
@@ -1659,6 +1665,10 @@ impl App {
             .map_or(String::new(), |i| i.label.clone());
         match &screen.view {
             View::Main | View::Settings => self.main_action(&key, &label),
+            View::Playback(m) => match key.as_str() {
+                "skip" | "autoplay" => self.flip(&key, Some(&m.clone())),
+                _ => self.show_action(m.clone(), &key),
+            },
             View::Setup => match key.as_str() {
                 "install" => self.external = screen.menu.current().map(|i| i.hint.clone()),
                 "login" => self.main_action("login", ""),
@@ -1965,15 +1975,7 @@ impl App {
                 Some(id) => self.start_auth(&id),
                 None => self.ask_client_id(),
             },
-            "skip" => {
-                let on = !ani::skip_on();
-                if let Err(e) = ani::set_skip(on) {
-                    return self.toast(e.to_string(), true);
-                }
-                let state = if on { "on" } else { "off" };
-                self.toast(format!("Skipping openings and endings: {state}"), false);
-                self.refresh();
-            }
+            "skip" | "autoplay" => self.flip(key, None),
             "audio" => {
                 self.push("Default audio", View::Audio(None));
                 self.top().menu.select_key(ani::audio(None));
@@ -2225,6 +2227,7 @@ impl App {
                 self.top().menu.paste(&q);
             }
             "web" => open_url(&format!("https://anilist.co/anime/{}", m.id)),
+            "playback" => _ = self.push("Playback", View::Playback(m)),
             "audio" => {
                 let cur = ani::audio(Some(m.id));
                 self.push("Audio", View::Audio(Some(m)));
@@ -2328,6 +2331,58 @@ impl App {
         let title = format!("Watched no episodes of {}? {also}", m.name());
         self.push(title, View::Confirm(Pending::Progress(marks, None)));
         self.top().menu.select_key("no");
+    }
+
+    /// Switches the setting `key` names, for show `m` (None: every show).
+    fn flip(&mut self, key: &str, m: Option<&Media>) {
+        let toggle = if key == "skip" {
+            &ani::SKIP
+        } else {
+            &ani::AUTOPLAY
+        };
+        let id = m.map(|m| m.id);
+        let on = !toggle.on(id);
+        if let Err(e) = toggle.set(id, on) {
+            return self.toast(e.to_string(), true);
+        }
+        let (_, what, how) = toggle_words(key);
+        let whose = m.map_or(String::new(), |m| format!(" for {}", m.name()));
+        let state = if on { format!("on{how}") } else { "off".into() };
+        self.toast(format!("{what}{whose}: {state}"), false);
+        self.refresh();
+    }
+
+    /// Episode `ep` of `m` played to its end with autoplay on: with `save`, it's marked watched
+    /// without asking, then the next one plays. A mark that would change other episodes too is
+    /// asked about as usual, and the next one waits for enter.
+    fn autoplay(&mut self, m: Media, ep: String, save: bool) {
+        if save && !self.counted(&m, &ep) {
+            return self.ask_watched(m, ep);
+        }
+        let progress = self.progress(&m);
+        let mark = progress.unwatched(&ep).filter(|_| save);
+        // a recap like 4.5 saves 4, and an extra after the last episode the last: maybe unwatched
+        let as_is = |k: &Mark| progress.entry(&ep).1 == k.to.to_string();
+        let quiet = mark.as_ref().is_some_and(|k| k.only_this() && as_is(k));
+        match mark {
+            Some(mark) if quiet => {
+                let work = self.entries.begin(Change::Progress(mark));
+                self.spawn(move || Msg::Entry(vec![work.run()]));
+            }
+            Some(_) => return self.ask_watched(m, ep),
+            None => {}
+        }
+        // shortcut: a show never looked up this session goes by its downloads alone; resolve
+        // it first if autoplay should stream past them
+        let listed = self.sources.get(m.id).map_or(&[][..], |s| &s.episodes);
+        let eps = self.show_downloads(&m).episodes(listed);
+        match eps.iter().skip_while(|e| **e != ep).nth(1).cloned() {
+            Some(next) => self.play(m, next),
+            None => self.toast(
+                format!("Episode {ep} is the last of {} out", m.name()),
+                false,
+            ),
+        }
     }
 
     fn fulfill(&mut self, m: Media, want: Want) {
@@ -2723,18 +2778,21 @@ impl App {
             Msg::Played(attempt, stamp, m, ep, res) => {
                 // a player other than mpv doesn't say when it's up; one that did, counted then
                 let unsaid = self.playback.starting(attempt);
-                self.playback.ended(attempt);
+                let latest = self.playback.ended(attempt);
                 // started before logging out or in again: no business of this login's
-                let ours = self.entries.same_login(stamp) && self.user.is_some();
+                let same_login = self.entries.same_login(stamp);
+                // nor what plays next, nor is it once another episode started
+                let autoplay = latest && same_login && ani::AUTOPLAY.on(Some(m.id));
+                let ours = same_login && self.user.is_some();
+                let ours = ours && m.on_anilist();
+                if ours && unsaid && res.is_ok() {
+                    self.played(m.clone());
+                }
                 match res {
                     Err(e) => self.toast(format!("Couldn't play episode {ep} · {e}"), true),
-                    Ok(()) if ours && m.on_anilist() => {
-                        if unsaid {
-                            self.played(m.clone());
-                        }
-                        self.ask_watched(m, ep);
-                    }
-                    Ok(()) => {}
+                    Ok(true) if autoplay => self.autoplay(m, ep, ours),
+                    Ok(_) if ours => self.ask_watched(m, ep),
+                    Ok(_) => {}
                 }
             }
             Msg::Scanned(found) => {
@@ -2781,10 +2839,42 @@ impl App {
     }
 }
 
-/// The row for choosing audio, saying the one now: shorter where the row is narrow.
-fn audio_item(label: &str, audio: &str) -> Item {
+/// What a show's row says when its choice differs from every show's.
+const OWN: &str = "this show only";
+
+/// The row for choosing show `id`'s audio (None: every show's), saying the one now: shorter
+/// where the row is narrow.
+fn audio_item(label: &str, id: Option<u64>) -> Item {
+    let audio = ani::audio(id);
     let mut it = Item::new("audio", label, ani::audio_label(audio));
     it.short = ani::audio_short(audio).into();
+    if id.is_some() && audio != ani::audio(None) {
+        it.hint = format!("{} · {OWN}", it.hint);
+    }
+    it
+}
+
+/// What a yes-or-no setting is called, and what it says when it's switched.
+fn toggle_words(key: &str) -> (&'static str, &'static str, &'static str) {
+    match key {
+        // short enough for its on/off at 80 columns
+        "skip" => ("Skip openings/endings", "Skipping openings and endings", ""),
+        _ => (
+            "Autoplay next episode",
+            "Autoplay",
+            " · an episode that ends is marked watched",
+        ),
+    }
+}
+
+/// A yes-or-no setting's row, for show `id` (None: every show).
+fn toggle_item(key: &str, toggle: &ani::Toggle, id: Option<u64>) -> Item {
+    let state = if toggle.on(id) { "on" } else { "off" };
+    let mut it = Item::new(key, toggle_words(key).0, state);
+    if toggle.own(id).is_some() {
+        it.hint = format!("{state} · {OWN}");
+        it.short = state.into();
+    }
     it
 }
 
@@ -2852,7 +2942,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &dyn Fn(Option<&'static str>),
-        ) -> Result<(), String> {
+        ) -> Result<bool, String> {
             unreachable!()
         }
         fn hold(&self, _: &Media, _: &Source, _: &str, _: &str) -> Result<ani::Held, String> {
@@ -2864,7 +2954,7 @@ mod tests {
         fn on_disk(&self, _: &Media, _: &str) -> Option<PathBuf> {
             unreachable!()
         }
-        fn file(&self, _: &Media, _: &str, _: &Path, _: &mut dyn FnMut()) -> Result<(), String> {
+        fn file(&self, _: &Media, _: &str, _: &Path, _: &mut dyn FnMut()) -> Result<bool, String> {
             unreachable!()
         }
         fn locate(&self, _: &Media, _: Lookup) -> Result<Source, String> {
@@ -3086,6 +3176,80 @@ mod tests {
     }
 
     #[test]
+    fn autoplay_marks_an_episode_played_to_its_end_and_plays_the_next() {
+        let mut app = app();
+        let m = show(50_005, 12, Some(3));
+        app.sources = Sources::knowing(HashMap::from([(m.id, source(12))]));
+        app.open_show(m.clone());
+        ani::AUTOPLAY.set(Some(m.id), true).unwrap();
+        let stamp = app.entries.stamp();
+        // what an episode's player says once it ended, as the attempt `play` started last
+        let ended = |app: &mut App, ep: &str, to_the_end: bool| {
+            app.play(m.clone(), ep.into());
+            let attempt = app.playback.attempts();
+            app.on_msg(Msg::Played(
+                attempt,
+                stamp,
+                m.clone(),
+                ep.into(),
+                Ok(to_the_end),
+            ));
+        };
+        // closed before the end: asks, as without autoplay
+        ended(&mut app, "4", false);
+        assert!(matches!(app.top().view, View::Confirm(_)));
+        app.pop(1);
+        assert!(app.playback.now().is_none());
+        // to the end: saved without asking, and on to the next
+        ended(&mut app, "4", true);
+        assert!(!matches!(app.top().view, View::Confirm(_)));
+        assert!(app.entries.saving(&m));
+        assert_eq!(app.playback.now().map(|p| p.ep.as_str()), Some("5"));
+        // an earlier player that ends now plays nothing over the one on
+        let on = app.playback.attempts();
+        app.on_msg(Msg::Played(on - 1, stamp, m.clone(), "7".into(), Ok(true)));
+        assert_eq!(app.playback.attempts(), on);
+        // an extra after the last episode would save the last: asked
+        let mut app = self::app();
+        let extra = show(50_009, 12, Some(11));
+        app.sources = Sources::knowing(HashMap::from([(extra.id, source(13))]));
+        ani::AUTOPLAY.set(Some(extra.id), true).unwrap();
+        // AniList says it has no second part
+        let stamp = app.entries.stamp();
+        app.open_show(extra.clone());
+        let asked = app.parts.asked(extra.id);
+        app.on_msg(Msg::Parts(extra.id, asked, stamp, Ok(vec![])));
+        assert!(app.counted(&extra, "13"));
+        app.play(extra.clone(), "13".into());
+        let attempt = app.playback.attempts();
+        app.on_msg(Msg::Played(attempt, stamp, extra, "13".into(), Ok(true)));
+        assert!(matches!(app.top().view, View::Confirm(_)));
+        // a recap after episode 3 would save episode 4: asked
+        let mut app = self::app();
+        let recap = show(50_008, 12, Some(3));
+        let mut src = source(12);
+        src.episodes.insert(4, "4.5".into());
+        app.sources = Sources::knowing(HashMap::from([(recap.id, src)]));
+        ani::AUTOPLAY.set(Some(recap.id), true).unwrap();
+        app.play(recap.clone(), "4.5".into());
+        let attempt = app.playback.attempts();
+        let stamp = app.entries.stamp();
+        app.on_msg(Msg::Played(attempt, stamp, recap, "4.5".into(), Ok(true)));
+        assert!(matches!(app.top().view, View::Confirm(_)));
+        assert!(app.playback.now().is_none());
+        // one that would mark 4 and 5 too is asked about, and nothing else starts
+        let mut app = self::app();
+        let other = show(50_006, 12, Some(3));
+        app.sources = Sources::knowing(HashMap::from([(other.id, source(12))]));
+        ani::AUTOPLAY.set(Some(other.id), true).unwrap();
+        let stamp = app.entries.stamp();
+        app.play(other.clone(), "6".into());
+        app.on_msg(Msg::Played(1, stamp, other.clone(), "6".into(), Ok(true)));
+        assert!(matches!(app.top().view, View::Confirm(_)));
+        assert!(app.playback.now().is_none());
+    }
+
+    #[test]
     fn an_episode_past_the_shows_own_waits_to_know_which_part_its_in() {
         let (mut app, m, part, stamp) = split_season(50_010);
         app.on_msg(Msg::Played(
@@ -3093,7 +3257,7 @@ mod tests {
             app.entries.stamp(),
             m.clone(),
             "13".into(),
-            Ok(()),
+            Ok(false),
         ));
         assert!(
             !matches!(app.top().view, View::Confirm(_)),
@@ -3115,7 +3279,7 @@ mod tests {
             app.entries.stamp(),
             m.clone(),
             "13".into(),
-            Ok(()),
+            Ok(false),
         ));
         let failed = Err("Can't reach AniList".to_string());
         app.on_msg(Msg::Parts(m.id, app.parts.asked(m.id), stamp, failed));
@@ -3133,7 +3297,7 @@ mod tests {
         app.user = Some((1, "Tester".into()));
         app.open_show(m.clone());
         let (now, stamp) = (app.parts.asked(m.id), app.entries.stamp());
-        app.on_msg(Msg::Played(1, stamp, m.clone(), "13".into(), Ok(())));
+        app.on_msg(Msg::Played(1, stamp, m.clone(), "13".into(), Ok(false)));
         app.on_msg(Msg::Parts(m.id, first, old, Err("offline".into())));
         assert!(toast(&app).is_none(), "{:?}", toast(&app));
         app.on_msg(Msg::Parts(m.id, now, stamp, Ok(vec![(12, part.clone())])));
@@ -3151,7 +3315,7 @@ mod tests {
             app.entries.stamp(),
             m.clone(),
             "12".into(),
-            Ok(()),
+            Ok(false),
         ));
         let View::Confirm(Pending::Progress(marks, _)) = &app.top().view else {
             panic!("asks");
@@ -3181,7 +3345,7 @@ mod tests {
             app.entries.stamp(),
             m,
             played.into(),
-            Ok(()),
+            Ok(false),
         ));
         app
     }
@@ -3222,7 +3386,7 @@ mod tests {
             app.entries.stamp(),
             other,
             "2".into(),
-            Ok(()),
+            Ok(false),
         ));
         app.playback = Playback::new(Arc::new(NoPlayer));
         app.back_to_main();
@@ -3831,7 +3995,7 @@ mod tests {
         app.user = Some((70_002, "Tester".into()));
         let stamp = app.entries.stamp();
         app.play(m.clone(), "4".into());
-        app.on_msg(Msg::Played(1, stamp, m.clone(), "4".into(), Ok(())));
+        app.on_msg(Msg::Played(1, stamp, m.clone(), "4".into(), Ok(false)));
         assert_eq!(app.last_played.as_ref().map(|s| s.id), Some(m.id));
         // one that failed doesn't
         let other = show(50_302, 12, Some(3));
@@ -4029,7 +4193,7 @@ mod tests {
         app.user = Some((70_013, "Other".into()));
         app.on_msg(Msg::PlayStep(1, stamp, m.clone(), None));
         assert!(app.last_played.is_none());
-        app.on_msg(Msg::Played(1, stamp, m, "4".into(), Ok(())));
+        app.on_msg(Msg::Played(1, stamp, m, "4".into(), Ok(false)));
         assert!(app.last_played.is_none());
         assert!(on_file(70_013).is_none());
         assert!(matches!(app.top().view, View::Main), "no question about it");
@@ -4045,7 +4209,7 @@ mod tests {
         shows_episode(&mut app, 1, &a);
         app.play(b.clone(), "4".into());
         shows_episode(&mut app, 2, &b);
-        app.on_msg(Msg::Played(1, stamp, a, "4".into(), Ok(())));
+        app.on_msg(Msg::Played(1, stamp, a, "4".into(), Ok(false)));
         assert_eq!(app.last_played.as_ref().map(|s| s.id), Some(b.id));
         assert_eq!(on_file(70_014).map(|s| s.id), Some(b.id));
     }
