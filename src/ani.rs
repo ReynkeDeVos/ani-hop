@@ -1351,7 +1351,7 @@ pub fn play_trailer(m: &Media, url: &str, mut up: impl FnMut()) -> Result<(), St
     let _player = Listed::on(&PLAYERS, &child);
     let mut out = Vec::new();
     let played = follow(child, |l| {
-        if l.contains("[ytdl_hook]") || l.contains("[curl]") {
+        if l.contains("[ytdl_hook]") {
             out.push(l.to_string());
         }
         player_up(l, &mut up);
@@ -1368,7 +1368,6 @@ fn trailer_error(url: &str, stdout: &[String], stderr: &[u8]) -> String {
     let offline = |s: &str| {
         NO_NETWORK.iter().any(|n| s.contains(n))
             || s.contains("Failed to resolve")
-            || s.contains("Could not resolve hostname")
             || s.contains("Name or service not known")
     };
     if stdout.iter().any(|l| offline(l)) || offline(&err_text) {
@@ -3622,7 +3621,12 @@ esac
             "Sign in to confirm you're not a bot"
         );
         assert_eq!(
-            err(&["[curl] error: Could not resolve hostname"], b""),
+            err(
+                &[
+                    "[ytdl_hook] ERROR: [youtube] 00000000000: Unable to download webpage: Failed to resolve 'www.youtube.com' ([Errno -3] Temporary failure in name resolution)",
+                ],
+                b""
+            ),
             "can't reach youtube.com"
         );
         assert_eq!(

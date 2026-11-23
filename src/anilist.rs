@@ -37,7 +37,6 @@ pub struct Media {
     pub description: Option<String>,
     pub studios: Studios,
     pub next_airing_episode: Option<Airing>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub trailer: Option<Trailer>,
     pub media_list_entry: Option<Entry>,
     /// when it started, which only a series is asked for: many specials have no season
@@ -124,7 +123,7 @@ pub fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Trailer {
     pub id: Option<String>,
@@ -953,6 +952,5 @@ mod tests {
         assert_eq!(partial.trailer_url(), None);
         let old: super::Media = serde_json::from_str(r#"{"id": 1}"#).unwrap();
         assert!(old.trailer.is_none());
-        assert!(!serde_json::to_string(&old).unwrap().contains("trailer"));
     }
 }

@@ -219,7 +219,7 @@ impl Playback {
         audio: &'static str,
     ) -> Start {
         let waited = (self.now.as_ref())
-            .filter(|p| p.id == m.id && !p.trailer && p.ep == ep && p.step == Some(SEARCHING))
+            .filter(|p| p.id == m.id && p.ep == ep && p.step == Some(SEARCHING))
             .map(|p| p.since);
         // a second enter would open a second player
         if let Some(p) = self.now.as_ref().filter(|p| p.step.is_some())
@@ -262,10 +262,13 @@ impl Playback {
         })
     }
 
-    /// Enter on Watch trailer: opens `url` in mpv, unless something else is still starting.
+    /// Enter on Watch trailer: opens `url` in mpv, unless something else is starting or playing.
     pub fn start_trailer(&mut self, m: &Media, url: String) -> Result<TrailerRun, String> {
-        if let Some(p) = self.now.as_ref().filter(|p| p.step.is_some()) {
-            return Err(p.title.clone());
+        if let Some(p) = self.now.as_ref() {
+            return Err(match p.step {
+                Some(_) => format!("Still starting {}…", p.title),
+                None => format!("Already playing {}", p.title),
+            });
         }
         self.attempts += 1;
         self.now = Some(Playing {
@@ -628,7 +631,7 @@ mod tests {
         assert!(now.trailer && now.title == "Trailer · Show" && now.step == Some(TRAILER));
         assert_eq!(
             playback.start_trailer(&show(), url.into()).err().as_deref(),
-            Some("Trailer · Show")
+            Some("Still starting Trailer · Show…")
         );
         assert!(matches!(
             playback.start(&show(), "1", false, Lookup::Ready(source()), "sub"),
@@ -641,6 +644,21 @@ mod tests {
         assert_eq!(*script.played.lock().unwrap(), [format!("trailer {url}")]);
         playback.step(attempt, None);
         assert!(playback.now().unwrap().step.is_none());
+        assert_eq!(
+            playback.start_trailer(&show(), url.into()).err().as_deref(),
+            Some("Already playing Trailer · Show")
+        );
         assert!(playback.ended(attempt) && playback.now().is_none());
+        // while an episode is playing, starting a trailer leaves that episode's attempt intact
+        let Start::Run(ep) = playback.start(&show(), "1", false, Lookup::Ready(source()), "sub")
+        else {
+            panic!("not started");
+        };
+        playback.step(ep.attempt, None);
+        assert_eq!(
+            playback.start_trailer(&show(), url.into()).err().as_deref(),
+            Some("Already playing Episode 1 · Show")
+        );
+        assert!(playback.ended(ep.attempt) && playback.now().is_none());
     }
 }

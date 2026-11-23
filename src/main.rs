@@ -2545,7 +2545,7 @@ impl App {
 
     fn play_trailer(&mut self, m: Media, url: String) {
         match self.playback.start_trailer(&m, url) {
-            Err(title) => self.toast(format!("Still starting {title}…"), false),
+            Err(why) => self.toast(why, false),
             Ok(run) => {
                 let (tx, attempt) = (self.tx.clone(), run.attempt);
                 self.spawn(move || {
@@ -5150,18 +5150,19 @@ mod tests {
     #[test]
     fn a_show_with_a_trailer_plays_it_without_touching_progress_or_continue() {
         let mut app = app();
-        let plain = show(50_410, 12, None);
+        let plain = show(50_420, 12, None);
         app.open_show(plain);
         assert!(
             !app.top().menu.items.iter().any(|i| i.key == "trailer"),
             "no row without a trailer"
         );
-        let mut m = show(50_411, 12, Some(3));
+        let mut m = show(50_421, 12, Some(3));
         m.trailer = Some(anilist::Trailer {
             id: Some("4MYo8FfiXMA".into()),
             site: Some("youtube".into()),
         });
         ani::AUTOPLAY.set(Some(m.id), true).unwrap();
+        app.sources = Sources::knowing(HashMap::from([(m.id, source(12))]));
         app.open_show(m.clone());
         app.top().menu.select_key("trailer");
         assert_eq!(app.enter_verb(), Some("play"));
@@ -5191,6 +5192,31 @@ mod tests {
         app.on_msg(Msg::TrailerPlayed(attempt, Ok(())));
         assert!(app.playback.now().is_none());
         assert!(matches!(app.top().view, View::Show(_)));
+        // while an episode is playing, Watch trailer refuses instead of breaking its autoplay
+        let stamp = app.entries.stamp();
+        app.play(m.clone(), "4".into());
+        let ep_attempt = app.playback.attempts();
+        app.on_msg(Msg::PlayStep(ep_attempt, stamp, m.clone(), None));
+        enter(&mut app);
+        assert_eq!(app.playback.attempts(), ep_attempt);
+        assert_eq!(
+            toast(&app),
+            Some(("Already playing Episode 4 · Show", false))
+        );
+        app.on_msg(Msg::Played(
+            ep_attempt,
+            stamp,
+            m.clone(),
+            "4".into(),
+            Ok(true),
+        ));
+        assert_eq!(
+            app.playback.now().map(|p| p.ep.as_str()),
+            Some("5"),
+            "episode's autoplay still ran"
+        );
+        let ep5 = app.playback.attempts();
+        app.playback.ended(ep5);
         // a failure tells the user why
         enter(&mut app);
         let attempt = app.playback.attempts();
