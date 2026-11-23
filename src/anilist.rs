@@ -14,7 +14,7 @@ pub static ENGLISH_TITLES: AtomicBool = AtomicBool::new(false);
 const MEDIA: &str = "id idMal title { romaji english } synonyms coverImage { extraLarge color }
   episodes status format season seasonYear averageScore genres description(asHtml: false)
   studios { edges { isMain node { name } } } nextAiringEpisode { episode airingAt }
-  mediaListEntry { id status progress }";
+  trailer { id site } mediaListEntry { id status progress }";
 
 /// Shows per AniList page, the most it hands out at once.
 pub const PER_PAGE: usize = 50;
@@ -37,6 +37,7 @@ pub struct Media {
     pub description: Option<String>,
     pub studios: Studios,
     pub next_airing_episode: Option<Airing>,
+    pub trailer: Option<Trailer>,
     pub media_list_entry: Option<Entry>,
     /// when it started, which only a series is asked for: many specials have no season
     pub start_date: StartDate,
@@ -122,6 +123,30 @@ pub fn now() -> i64 {
         .map_or(0, |d| d.as_secs() as i64)
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Trailer {
+    pub id: Option<String>,
+    pub site: Option<String>,
+}
+
+impl Trailer {
+    /// Watch URL on YouTube or Dailymotion, if site and id are valid.
+    pub fn url(&self) -> Option<String> {
+        let id = self.id.as_deref().map(str::trim).filter(|id| {
+            !id.is_empty()
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        })?;
+        match self.site.as_deref()?.to_ascii_lowercase().as_str() {
+            "youtube" => Some(format!("https://www.youtube.com/watch?v={id}")),
+            "dailymotion" => Some(format!("https://www.dailymotion.com/video/{id}")),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
     pub id: u64,
@@ -160,6 +185,10 @@ impl Media {
 
     pub fn on_anilist(&self) -> bool {
         self.id < ANI_CLI_ONLY
+    }
+
+    pub fn trailer_url(&self) -> Option<String> {
+        self.trailer.as_ref().and_then(Trailer::url)
     }
 
     pub fn name(&self) -> &str {
@@ -883,5 +912,45 @@ mod tests {
             super::backoff(200, None, Some(50), Some(1_030), 1_000),
             None
         );
+    }
+
+    #[test]
+    fn trailer_urls_keep_only_valid_known_sites() {
+        let url = |site: Option<&str>, id: Option<&str>| {
+            let t = super::Trailer {
+                id: id.map(String::from),
+                site: site.map(String::from),
+            };
+            t.url()
+        };
+        assert_eq!(
+            url(Some("youtube"), Some("4MYo8FfiXMA")),
+            Some("https://www.youtube.com/watch?v=4MYo8FfiXMA".into())
+        );
+        assert_eq!(
+            url(Some("YouTube"), Some(" -_AbC123 ")),
+            Some("https://www.youtube.com/watch?v=-_AbC123".into())
+        );
+        assert_eq!(
+            url(Some("dailymotion"), Some("x8abcde")),
+            Some("https://www.dailymotion.com/video/x8abcde".into())
+        );
+        for (site, id) in [
+            (Some("vimeo"), Some("12345")),
+            (Some("youtube"), Some("")),
+            (Some("youtube"), Some("abc&t=1")),
+            (Some("youtube"), Some("../bad")),
+            (Some("youtube"), None),
+            (None, Some("4MYo8FfiXMA")),
+        ] {
+            assert_eq!(url(site, id), None, "{site:?} {id:?}");
+        }
+        // null fields in AniList JSON and older caches without trailer deserialize cleanly
+        let partial: super::Media =
+            serde_json::from_str(r#"{"id": 1, "trailer": {"id": null, "site": "youtube"}}"#)
+                .unwrap();
+        assert_eq!(partial.trailer_url(), None);
+        let old: super::Media = serde_json::from_str(r#"{"id": 1}"#).unwrap();
+        assert!(old.trailer.is_none());
     }
 }

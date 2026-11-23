@@ -18,6 +18,8 @@ pub const SEARCHING: &str = "searching ani-cli";
 pub const OPENING: &str = "opening the player";
 /// What an attempt waits on while ani-cli gets the episode's links.
 const FETCHING: &str = "fetching the stream";
+/// What a trailer waits on while mpv resolves it through yt-dlp.
+const TRAILER: &str = "fetching the trailer";
 
 /// What plays episodes: ani-cli and mpv, or a script in tests.
 pub trait Player: Send + Sync {
@@ -39,6 +41,8 @@ pub trait Player: Send + Sync {
     fn on_disk(&self, m: &Media, ep: &str) -> Option<PathBuf>;
     /// Plays a downloaded episode. Ok(true): to the end.
     fn file(&self, m: &Media, ep: &str, file: &Path, up: &mut dyn FnMut()) -> Result<bool, String>;
+    /// Plays a show's trailer URL; `up` hears once the player shows it.
+    fn trailer(&self, m: &Media, url: &str, up: &mut dyn FnMut()) -> Result<(), String>;
     /// Where the provider has the show now.
     fn locate(&self, m: &Media, lookup: Lookup) -> Result<Source, String>;
 }
@@ -75,15 +79,20 @@ impl Player for Mpv {
         ani::play_file(m, ep, file, up)
     }
 
+    fn trailer(&self, m: &Media, url: &str, up: &mut dyn FnMut()) -> Result<(), String> {
+        ani::play_trailer(m, url, up)
+    }
+
     fn locate(&self, m: &Media, lookup: Lookup) -> Result<Source, String> {
         lookup.run(m)
     }
 }
 
-/// The episode being started or watched.
+/// The episode or trailer being started or watched.
 pub struct Playing {
     pub id: u64,
     pub ep: String,
+    pub trailer: bool,
     pub title: String,
     /// what it waits on, None once the player shows it
     pub step: Option<&'static str>,
@@ -122,6 +131,21 @@ pub struct Run {
     lookup: Lookup,
     audio: &'static str,
     pub attempt: u64,
+}
+
+/// A trailer attempt to run in the background, once.
+pub struct TrailerRun {
+    player: Arc<dyn Player>,
+    show: Media,
+    url: String,
+    pub attempt: u64,
+}
+
+impl TrailerRun {
+    /// Blocks until the player closes; `up` hears once the player shows the trailer.
+    pub fn run(self, mut up: impl FnMut()) -> Result<(), String> {
+        self.player.trailer(&self.show, &self.url, &mut up)
+    }
 }
 
 /// Fetching a stream ahead, to run in the background, once.
@@ -213,6 +237,7 @@ impl Playback {
         self.now = Some(Playing {
             id: m.id,
             ep: ep.to_string(),
+            trailer: false,
             // the number first: a long title loses its end, not the episode
             title: format!("Episode {ep} · {}", m.name()),
             step: Some(step),
@@ -233,6 +258,33 @@ impl Playback {
             on_disk,
             lookup,
             audio,
+            attempt: self.attempts,
+        })
+    }
+
+    /// Enter on Watch trailer: opens `url` in mpv, unless something else is starting or playing.
+    pub fn start_trailer(&mut self, m: &Media, url: String) -> Result<TrailerRun, String> {
+        if let Some(p) = self.now.as_ref() {
+            return Err(match p.step {
+                Some(_) => format!("Still starting {}…", p.title),
+                None => format!("Already playing {}", p.title),
+            });
+        }
+        self.attempts += 1;
+        self.now = Some(Playing {
+            id: m.id,
+            ep: String::new(),
+            trailer: true,
+            title: format!("Trailer · {}", m.name()),
+            step: Some(TRAILER),
+            since: Instant::now(),
+            color: m.cover_image.color.clone(),
+            attempt: self.attempts,
+        });
+        Ok(TrailerRun {
+            player: self.player.clone(),
+            show: m.clone(),
+            url,
             attempt: self.attempts,
         })
     }
@@ -383,6 +435,12 @@ mod tests {
             up();
             self.played.lock().unwrap().push(format!("file {ep}"));
             Ok(true)
+        }
+
+        fn trailer(&self, _: &Media, url: &str, up: &mut dyn FnMut()) -> Result<(), String> {
+            up();
+            self.played.lock().unwrap().push(format!("trailer {url}"));
+            Ok(())
         }
 
         fn locate(&self, _: &Media, _: Lookup) -> Result<Source, String> {
@@ -561,5 +619,46 @@ mod tests {
         playback.start(&show(), "2", false, Lookup::Resolve, "sub");
         playback.give_up(1);
         assert!(playback.now().is_none());
+    }
+
+    #[test]
+    fn a_trailer_starts_in_its_own_attempt_and_blocks_a_second_start() {
+        let script = Arc::new(Script::default());
+        let mut playback = Playback::new(script.clone());
+        let url = "https://www.youtube.com/watch?v=4MYo8FfiXMA";
+        let run = playback.start_trailer(&show(), url.into()).unwrap();
+        let now = playback.now().unwrap();
+        assert!(now.trailer && now.title == "Trailer · Show" && now.step == Some(TRAILER));
+        assert_eq!(
+            playback.start_trailer(&show(), url.into()).err().as_deref(),
+            Some("Still starting Trailer · Show…")
+        );
+        assert!(matches!(
+            playback.start(&show(), "1", false, Lookup::Ready(source()), "sub"),
+            Start::Busy(t) if t == "Trailer · Show"
+        ));
+        let mut shown = false;
+        let attempt = run.attempt;
+        run.run(|| shown = true).unwrap();
+        assert!(shown);
+        assert_eq!(*script.played.lock().unwrap(), [format!("trailer {url}")]);
+        playback.step(attempt, None);
+        assert!(playback.now().unwrap().step.is_none());
+        assert_eq!(
+            playback.start_trailer(&show(), url.into()).err().as_deref(),
+            Some("Already playing Trailer · Show")
+        );
+        assert!(playback.ended(attempt) && playback.now().is_none());
+        // while an episode is playing, starting a trailer leaves that episode's attempt intact
+        let Start::Run(ep) = playback.start(&show(), "1", false, Lookup::Ready(source()), "sub")
+        else {
+            panic!("not started");
+        };
+        playback.step(ep.attempt, None);
+        assert_eq!(
+            playback.start_trailer(&show(), url.into()).err().as_deref(),
+            Some("Already playing Episode 1 · Show")
+        );
+        assert!(playback.ended(ep.attempt) && playback.now().is_none());
     }
 }

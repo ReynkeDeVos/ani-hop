@@ -426,10 +426,11 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         return f.render_widget(line, list_area);
     }
 
-    // the episode being started shows it right where enter was pressed
+    // the episode or trailer being started shows it right where enter was pressed
     let busy = app.playback.now().and_then(|p| {
         let key = match &screen.view {
             View::Episodes(m, EpMode::Play) if m.id == p.id => p.ep.clone(),
+            View::Show(m) if m.id == p.id && p.trailer => "trailer".into(),
             View::Show(m) if m.id == p.id && next.as_ref() == Some(&p.ep) => "next".into(),
             _ => return None,
         };
