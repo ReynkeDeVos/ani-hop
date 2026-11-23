@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 const FAKE_ROFI: &str = r#"#!/bin/sh
 # ani-hop: captures ani-cli's menu instead of showing one
@@ -538,6 +538,7 @@ pub fn setup() -> std::io::Result<()> {
     fs::rename(&tmp, run.join(format!("{me}.lock")))?;
     let _ = ALIVE.set(lock);
     clear_leftovers(&cache_dir().join("probe"));
+    prune_covers(&cache_dir().join("covers"), SystemTime::now());
     for p in fs::read_dir(&run)?.flatten().map(|e| e.path()) {
         let pid = p.file_stem().unwrap_or_default().to_string_lossy();
         if p.extension().is_some_and(|x| x == "lock") && !running(&pid) {
@@ -559,6 +560,28 @@ fn clear_leftovers(dir: &Path) {
             .find_map(|kind| name.strip_prefix(kind))
             .and_then(|rest| rest.split('-').next());
         if pid.is_some_and(|pid| !running(pid)) {
+            let _ = fs::remove_file(&p);
+        }
+    }
+}
+
+const COVER_MAX_AGE: Duration = Duration::from_secs(60 * 24 * 60 * 60);
+
+/// Drops cached poster covers older than 60 days so the cache doesn't grow forever.
+fn prune_covers(dir: &Path, now: SystemTime) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    for p in rd.flatten().map(|e| e.path()) {
+        if p.extension().is_none_or(|x| x != "jpg") {
+            continue;
+        }
+        let old = fs::metadata(&p)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age > COVER_MAX_AGE);
+        if old {
             let _ = fs::remove_file(&p);
         }
     }
@@ -908,7 +931,10 @@ pub fn set_preload(on: bool) -> std::io::Result<()> {
     let flag = config_dir().join("preload");
     match on {
         true => fs::create_dir_all(config_dir()).and_then(|()| fs::write(flag, "")),
-        false => fs::remove_file(flag),
+        false => match fs::remove_file(flag) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
     }
 }
 
@@ -1150,6 +1176,50 @@ fn stream_command(m: &Media, src: &Source, ep: &str, audio: &str) -> (Command, O
     (cli, subs)
 }
 
+/// Ends a child process if it hasn't reached the player within `limit`.
+struct Watchdog {
+    done: Arc<AtomicBool>,
+    stalled: Arc<AtomicBool>,
+}
+
+impl Watchdog {
+    fn start(pid: u32, limit: Duration, armed: bool) -> Self {
+        let done = Arc::new(AtomicBool::new(!armed));
+        let stalled = Arc::new(AtomicBool::new(false));
+        if armed {
+            let (done, stalled) = (done.clone(), stalled.clone());
+            std::thread::spawn(move || {
+                let since = std::time::Instant::now();
+                while !done.load(Ordering::Relaxed) {
+                    if since.elapsed() >= limit {
+                        if !done.swap(true, Ordering::Relaxed) {
+                            stalled.store(true, Ordering::Relaxed);
+                            end(pid);
+                        }
+                        return;
+                    }
+                    std::thread::sleep(limit.min(Duration::from_millis(200)));
+                }
+            });
+        }
+        Watchdog { done, stalled }
+    }
+
+    fn disarm(&self) {
+        self.done.store(true, Ordering::Relaxed);
+    }
+
+    fn stalled(&self) -> bool {
+        self.stalled.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.disarm();
+    }
+}
+
 /// Streams through ani-cli; `step` hears when mpv starts, and None once it
 /// shows the episode. Ok(true): mpv played it to the end.
 pub fn stream(
@@ -1163,38 +1233,23 @@ pub fn stream(
     let child = cli.spawn().map_err(|e| format!("ani-cli: {e}"))?;
     let _player = Listed::on(&PLAYERS, &child);
     // up to mpv only: another player may never say it's there, and one playing mustn't be ended
-    let started = Arc::new(AtomicBool::new(own_player().is_some()));
-    let stalled = Arc::new(AtomicBool::new(false));
-    let watch = (started.clone(), stalled.clone(), child.id());
-    std::thread::spawn(move || {
-        let (started, stalled, pid) = watch;
-        let since = std::time::Instant::now();
-        while !started.load(Ordering::Relaxed) {
-            if since.elapsed() > ANI_CLI_LIMIT {
-                stalled.store(true, Ordering::Relaxed);
-                return end(pid);
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    });
+    let watch = Watchdog::start(child.id(), ANI_CLI_LIMIT, own_player().is_none());
     let mut end = End::default();
     let played = follow(child, |l| {
         if l == PLAYER_STARTS || l.starts_with("VO:") {
-            started.store(true, Ordering::Relaxed);
+            watch.disarm();
         }
         end.hear(l);
         stream_step(l, step)
     });
-    started.store(true, Ordering::Relaxed);
+    watch.disarm();
     // gone once the player is, which read it at the start
     if let Some(file) = subs {
         let _ = fs::remove_file(file);
     }
     match played {
         (true, _) => Ok(end.played()),
-        (false, _) if stalled.load(Ordering::Relaxed) => {
-            Err("ani-cli didn't answer for a minute".into())
-        }
+        (false, _) if watch.stalled() => Err("ani-cli didn't answer for a minute".into()),
         (false, stderr) => Err(last_error(&stderr)),
     }
 }
@@ -1337,29 +1392,60 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
     }
 }
 
-/// Plays a show's trailer URL directly in mpv (which resolves YouTube/Dailymotion via yt-dlp).
-pub fn play_trailer(m: &Media, url: &str, mut up: impl FnMut()) -> Result<(), String> {
+fn trailer_command(m: &Media, url: &str) -> Command {
     let mut mpv = Command::new("mpv");
     mpv.arg(format!("--force-media-title={} · Trailer", m.name()))
+        .args(["--resume-playback=no", "--save-position-on-quit=no"])
         .args(hwdec_unset().then_some(HWDEC))
         .arg("--")
-        .arg(url)
+        .arg(url);
+    mpv
+}
+
+/// Plays a show's trailer URL directly in mpv (which resolves YouTube/Dailymotion via yt-dlp).
+pub fn play_trailer(m: &Media, url: &str, up: impl FnMut()) -> Result<(), String> {
+    run_trailer(trailer_command(m, url), url, ANI_CLI_LIMIT, up)
+}
+
+fn run_trailer(
+    mut mpv: Command,
+    url: &str,
+    limit: Duration,
+    mut up: impl FnMut(),
+) -> Result<(), String> {
+    let child = mpv
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let child = mpv.spawn().map_err(|e| format!("mpv: {e}"))?;
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("mpv: {e}"))?;
     let _player = Listed::on(&PLAYERS, &child);
+    let watch = Watchdog::start(child.id(), limit, true);
     let mut out = Vec::new();
     let played = follow(child, |l| {
         if l.contains("[ytdl_hook]") {
             out.push(l.to_string());
         }
-        player_up(l, &mut up);
+        player_up(l, &mut || {
+            watch.disarm();
+            up();
+        });
     });
+    watch.disarm();
     match played {
         (true, _) => Ok(()),
+        (false, _) if watch.stalled() => Err(unreachable_host(url)),
         (false, stderr) => Err(trailer_error(url, &out, &stderr)),
     }
+}
+
+fn unreachable_host(url: &str) -> String {
+    let host = url
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', ':']).next())
+        .map(|h| h.strip_prefix("www.").unwrap_or(h))
+        .filter(|h| !h.is_empty());
+    format!("can't reach {}", host.unwrap_or("its site"))
 }
 
 /// Turns mpv's ytdl_hook stdout (where yt-dlp errors land) or stderr into a short user message.
@@ -1369,14 +1455,11 @@ fn trailer_error(url: &str, stdout: &[String], stderr: &[u8]) -> String {
         NO_NETWORK.iter().any(|n| s.contains(n))
             || s.contains("Failed to resolve")
             || s.contains("Name or service not known")
+            || s.contains("timed out")
+            || s.contains("ConnectTimeoutError")
     };
     if stdout.iter().any(|l| offline(l)) || offline(&err_text) {
-        let host = url
-            .split_once("://")
-            .and_then(|(_, rest)| rest.split(['/', ':']).next())
-            .map(|h| h.strip_prefix("www.").unwrap_or(h))
-            .filter(|h| !h.is_empty());
-        return format!("can't reach {}", host.unwrap_or("its site"));
+        return unreachable_host(url);
     }
     if let Some(msg) = stdout
         .iter()
@@ -3631,11 +3714,75 @@ esac
         );
         assert_eq!(
             err(
+                &[
+                    "[ytdl_hook] ERROR: [youtube] 00000000000: Unable to download API page: ('Unable to connect to proxy', ConnectTimeoutError('Connection to www.youtube.com timed out.'))",
+                ],
+                b""
+            ),
+            "can't reach youtube.com"
+        );
+        assert_eq!(
+            err(
                 &["[ytdl_hook] youtube-dl failed: not found or not enough permissions"],
                 b""
             ),
             "yt-dlp not found"
         );
         assert_eq!(err(&[], b""), "mpv couldn't play it");
+    }
+
+    #[test]
+    fn a_stalled_trailer_stops_at_its_limit_and_a_playing_one_does_not() {
+        let mut m = Media::default();
+        m.title.romaji = Some("Show".into());
+        let url = "https://www.youtube.com/watch?v=4MYo8FfiXMA";
+        let cmd = trailer_command(&m, url);
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
+        assert!(args.iter().any(|a| a == "--resume-playback=no"));
+        assert!(args.iter().any(|a| a == "--save-position-on-quit=no"));
+        assert!(args.ends_with(&["--".into(), url.into()]));
+
+        // never opens a window: stopped at the limit
+        let mut hung = Command::new("sh");
+        hung.args(["-c", "sleep 5"]);
+        let since = std::time::Instant::now();
+        let mut shown = false;
+        let res = run_trailer(hung, url, Duration::from_millis(150), || shown = true);
+        assert_eq!(res, Err("can't reach youtube.com".into()));
+        assert!(!shown && since.elapsed() < Duration::from_secs(3));
+
+        // once VO: arrives, the watchdog disarms and it plays past the limit
+        let mut playing = Command::new("sh");
+        playing.args(["-c", "echo 'VO: [gpu] 1920x1080'; sleep 0.3"]);
+        let mut shown = false;
+        let res = run_trailer(playing, url, Duration::from_millis(100), || shown = true);
+        assert!(res.is_ok() && shown);
+    }
+
+    #[test]
+    fn old_cached_covers_are_pruned_and_fresh_or_in_flight_ones_stay() {
+        let dir = std::env::temp_dir().join(format!("ani-hop-covers-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let now = SystemTime::now();
+        let old = now - Duration::from_secs(61 * 24 * 60 * 60);
+        let fresh = now - Duration::from_secs(59 * 24 * 60 * 60);
+        let write_at = |name: &str, at: SystemTime| {
+            let p = dir.join(name);
+            fs::write(&p, "x").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(at)
+                .unwrap();
+            p
+        };
+        let expired = write_at("1.jpg", old);
+        let kept = write_at("2.jpg", fresh);
+        let in_flight = write_at("3.tmp", old);
+        prune_covers(&dir, now);
+        assert!(!expired.exists() && kept.exists() && in_flight.exists());
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

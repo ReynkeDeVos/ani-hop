@@ -3832,6 +3832,10 @@ mod tests {
         app.main_action("preload", "");
         assert!(!app.preloading && !fetching(&app, &m, "2", &src));
         assert!(!ani::preload_on());
+        // another ani-hop turned it off meanwhile: turning it off here still works
+        app.preloading = true;
+        app.main_action("preload", "");
+        assert!(!app.preloading && !ani::preload_on());
     }
 
     #[test]
