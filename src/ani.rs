@@ -1401,7 +1401,7 @@ fn trailer_command(m: &Media, url: &str) -> Command {
             // stdout is piped: ensure VO: and ytdl_hook errors still print under a quiet mpv.conf
             "--really-quiet=no",
             "--terminal=yes",
-            "--msg-level=vo=info,ytdl_hook=error",
+            "--msg-level=cplayer=info,ytdl_hook=error",
         ])
         .args(hwdec_unset().then_some(HWDEC))
         .arg("--")
@@ -3751,7 +3751,7 @@ esac
             "--save-position-on-quit=no",
             "--really-quiet=no",
             "--terminal=yes",
-            "--msg-level=vo=info,ytdl_hook=error",
+            "--msg-level=cplayer=info,ytdl_hook=error",
         ] {
             assert!(args.iter().any(|a| a == flag), "missing {flag}: {args:?}");
         }
