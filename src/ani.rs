@@ -1395,7 +1395,14 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
 fn trailer_command(m: &Media, url: &str) -> Command {
     let mut mpv = Command::new("mpv");
     mpv.arg(format!("--force-media-title={} · Trailer", m.name()))
-        .args(["--resume-playback=no", "--save-position-on-quit=no"])
+        .args([
+            "--resume-playback=no",
+            "--save-position-on-quit=no",
+            // stdout is piped: ensure VO: and ytdl_hook errors still print under a quiet mpv.conf
+            "--really-quiet=no",
+            "--terminal=yes",
+            "--msg-level=vo=info,ytdl_hook=error",
+        ])
         .args(hwdec_unset().then_some(HWDEC))
         .arg("--")
         .arg(url);
@@ -3733,13 +3740,21 @@ esac
 
     #[test]
     fn a_stalled_trailer_stops_at_its_limit_and_a_playing_one_does_not() {
+        let _turn = CLOSING.lock().unwrap_or_else(|e| e.into_inner());
         let mut m = Media::default();
         m.title.romaji = Some("Show".into());
         let url = "https://www.youtube.com/watch?v=4MYo8FfiXMA";
         let cmd = trailer_command(&m, url);
         let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy()).collect();
-        assert!(args.iter().any(|a| a == "--resume-playback=no"));
-        assert!(args.iter().any(|a| a == "--save-position-on-quit=no"));
+        for flag in [
+            "--resume-playback=no",
+            "--save-position-on-quit=no",
+            "--really-quiet=no",
+            "--terminal=yes",
+            "--msg-level=vo=info,ytdl_hook=error",
+        ] {
+            assert!(args.iter().any(|a| a == flag), "missing {flag}: {args:?}");
+        }
         assert!(args.ends_with(&["--".into(), url.into()]));
 
         // never opens a window: stopped at the limit
