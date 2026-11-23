@@ -189,6 +189,10 @@ enum Msg {
     /// (Playback attempt, when it started, show, episode, how it ended: Ok(true) played to the
     /// end)
     Played(u64, Stamp, Media, String, Result<bool, String>),
+    /// (Playback attempt, what a trailer waits on now; None = the player is up)
+    TrailerStep(u64, Option<&'static str>),
+    /// (Playback attempt, how a trailer ended)
+    TrailerPlayed(u64, Result<(), String>),
     /// what a rescan of the download folder found: the shows and their episodes
     Scanned(Vec<(Media, OnDisk)>),
     /// an episode downloaded or failed: ("Show E3", result)
@@ -1016,7 +1020,12 @@ impl App {
             _ if screen.menu.selection().is_empty() => return None,
             View::Episodes(m, EpMode::Download) => m,
             View::Episodes(_, EpMode::Play) => return Some("play"),
-            View::Show(_) if screen.menu.current().is_some_and(|i| i.key == "next") => {
+            View::Show(_)
+                if screen
+                    .menu
+                    .current()
+                    .is_some_and(|i| matches!(i.key.as_str(), "next" | "trailer")) =>
+            {
                 return Some("play");
             }
             View::Main
@@ -1418,6 +1427,9 @@ impl App {
                     "⇄  Change source…",
                     src.map(|s| s.title.clone()).unwrap_or_default(),
                 ));
+                if m.trailer_url().is_some() {
+                    v.push(Item::new("trailer", "▶  Watch trailer", ""));
+                }
                 if m.on_anilist() {
                     v.push(Item::new("web", "↗  Open on AniList", ""));
                 }
@@ -2247,6 +2259,11 @@ impl App {
                 self.push("Change source", View::Input(Input::SourceQuery(m)));
                 self.top().menu.paste(&q);
             }
+            "trailer" => {
+                if let Some(url) = m.trailer_url() {
+                    self.play_trailer(m, url);
+                }
+            }
             "web" => open_url(&format!("https://anilist.co/anime/{}", m.id)),
             "playback" => _ = self.push("Playback", View::Playback(m)),
             "audio" => {
@@ -2521,6 +2538,19 @@ impl App {
                     let step = |step| _ = tx.send(Msg::PlayStep(attempt, stamp, m.clone(), step));
                     let res = run.run(&step);
                     Msg::Played(attempt, stamp, m, ep, res)
+                });
+            }
+        }
+    }
+
+    fn play_trailer(&mut self, m: Media, url: String) {
+        match self.playback.start_trailer(&m, url) {
+            Err(title) => self.toast(format!("Still starting {title}…"), false),
+            Ok(run) => {
+                let (tx, attempt) = (self.tx.clone(), run.attempt);
+                self.spawn(move || {
+                    let res = run.run(|| _ = tx.send(Msg::TrailerStep(attempt, None)));
+                    Msg::TrailerPlayed(attempt, res)
                 });
             }
         }
@@ -2894,6 +2924,13 @@ impl App {
                     Ok(_) => {}
                 }
             }
+            Msg::TrailerStep(attempt, step) => self.playback.step(attempt, step),
+            Msg::TrailerPlayed(attempt, res) => {
+                self.playback.ended(attempt);
+                if let Err(e) = res {
+                    self.toast(format!("Couldn't play trailer · {e}"), true);
+                }
+            }
             Msg::Scanned(found) => {
                 self.entries.catch_up();
                 let again = self.scanning.take() == Some(true);
@@ -3084,6 +3121,9 @@ mod tests {
             unreachable!()
         }
         fn file(&self, _: &Media, _: &str, _: &Path, _: &mut dyn FnMut()) -> Result<bool, String> {
+            unreachable!()
+        }
+        fn trailer(&self, _: &Media, _: &str, _: &mut dyn FnMut()) -> Result<(), String> {
             unreachable!()
         }
         fn locate(&self, _: &Media, _: Lookup) -> Result<Source, String> {
@@ -5105,5 +5145,63 @@ mod tests {
         // and an update takes it along at once, with the new answer still on its way
         app.after_install();
         assert_eq!(app.ani_cli_newer, None);
+    }
+
+    #[test]
+    fn a_show_with_a_trailer_plays_it_without_touching_progress_or_continue() {
+        let mut app = app();
+        let plain = show(50_410, 12, None);
+        app.open_show(plain);
+        assert!(
+            !app.top().menu.items.iter().any(|i| i.key == "trailer"),
+            "no row without a trailer"
+        );
+        let mut m = show(50_411, 12, Some(3));
+        m.trailer = Some(anilist::Trailer {
+            id: Some("4MYo8FfiXMA".into()),
+            site: Some("youtube".into()),
+        });
+        ani::AUTOPLAY.set(Some(m.id), true).unwrap();
+        app.open_show(m.clone());
+        app.top().menu.select_key("trailer");
+        assert_eq!(app.enter_verb(), Some("play"));
+        enter(&mut app);
+        let attempt = app.playback.attempts();
+        let now = app.playback.now().unwrap();
+        assert!(now.trailer && now.title == "Trailer · Show" && now.step.is_some());
+        let drawn = screen(&mut app, 120, 34);
+        assert!(
+            drawn.contains("▶ Starting") && drawn.contains("fetching the trailer…"),
+            "{drawn}"
+        );
+        // a second enter while starting says so and opens no second player
+        enter(&mut app);
+        assert_eq!(app.playback.attempts(), attempt);
+        assert_eq!(toast(&app), Some(("Still starting Trailer · Show…", false)));
+        // once mpv opens, it doesn't hijack the Continue row
+        app.toast.as_mut().unwrap().2 -= Duration::from_secs(5);
+        app.on_msg(Msg::TrailerStep(attempt, None));
+        assert!(app.last_played.is_none());
+        let drawn = screen(&mut app, 100, 24);
+        assert!(
+            drawn.contains("▶ Trailer · Show") && drawn.contains("playing"),
+            "{drawn}"
+        );
+        // closing it asks nothing about progress and doesn't trigger autoplay
+        app.on_msg(Msg::TrailerPlayed(attempt, Ok(())));
+        assert!(app.playback.now().is_none());
+        assert!(matches!(app.top().view, View::Show(_)));
+        // a failure tells the user why
+        enter(&mut app);
+        let attempt = app.playback.attempts();
+        app.on_msg(Msg::TrailerPlayed(
+            attempt,
+            Err("This video is unavailable".into()),
+        ));
+        assert!(app.playback.now().is_none());
+        assert_eq!(
+            toast(&app),
+            Some(("Couldn't play trailer · This video is unavailable", true))
+        );
     }
 }

@@ -1337,6 +1337,85 @@ pub fn play_file(m: &Media, ep: &str, file: &Path, mut up: impl FnMut()) -> Resu
     }
 }
 
+/// Plays a show's trailer URL directly in mpv (which resolves YouTube/Dailymotion via yt-dlp).
+pub fn play_trailer(m: &Media, url: &str, mut up: impl FnMut()) -> Result<(), String> {
+    let mut mpv = Command::new("mpv");
+    mpv.arg(format!("--force-media-title={} · Trailer", m.name()))
+        .args(hwdec_unset().then_some(HWDEC))
+        .arg("--")
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = mpv.spawn().map_err(|e| format!("mpv: {e}"))?;
+    let _player = Listed::on(&PLAYERS, &child);
+    let mut out = Vec::new();
+    let played = follow(child, |l| {
+        if l.contains("[ytdl_hook]") || l.contains("[curl]") {
+            out.push(l.to_string());
+        }
+        player_up(l, &mut up);
+    });
+    match played {
+        (true, _) => Ok(()),
+        (false, stderr) => Err(trailer_error(url, &out, &stderr)),
+    }
+}
+
+/// Turns mpv's ytdl_hook stdout (where yt-dlp errors land) or stderr into a short user message.
+fn trailer_error(url: &str, stdout: &[String], stderr: &[u8]) -> String {
+    let err_text = String::from_utf8_lossy(stderr);
+    let offline = |s: &str| {
+        NO_NETWORK.iter().any(|n| s.contains(n))
+            || s.contains("Failed to resolve")
+            || s.contains("Could not resolve hostname")
+            || s.contains("Name or service not known")
+    };
+    if stdout.iter().any(|l| offline(l)) || offline(&err_text) {
+        let host = url
+            .split_once("://")
+            .and_then(|(_, rest)| rest.split(['/', ':']).next())
+            .map(|h| h.strip_prefix("www.").unwrap_or(h))
+            .filter(|h| !h.is_empty());
+        return format!("can't reach {}", host.unwrap_or("its site"));
+    }
+    if let Some(msg) = stdout
+        .iter()
+        .find_map(|l| l.split_once("[ytdl_hook] ERROR:").map(|(_, r)| r.trim()))
+    {
+        // strip "[youtube] <id>: " when present, and drop yt-dlp's CLI/cookie advice
+        let msg = match msg.strip_prefix('[').and_then(|s| s.split_once("] ")) {
+            Some((_, rest)) => match rest.split_once(": ") {
+                Some((id, reason)) if !id.contains(' ') => reason,
+                _ => rest,
+            },
+            None => msg,
+        };
+        let msg = msg
+            .split(" Use --")
+            .next()
+            .unwrap_or(msg)
+            .split(" See http")
+            .next()
+            .unwrap_or(msg)
+            .trim()
+            .trim_end_matches('.');
+        if !msg.is_empty() {
+            return msg.to_string();
+        }
+    }
+    if stdout
+        .iter()
+        .any(|l| l.contains("youtube-dl failed:") && l.contains("not found"))
+    {
+        return "yt-dlp not found".into();
+    }
+    if !err_text.trim().is_empty() {
+        return last_error(stderr);
+    }
+    "mpv couldn't play it".into()
+}
+
 /// Why `cast` didn't: the episode isn't downloaded.
 pub const NOT_DOWNLOADED: &str = "not downloaded";
 
@@ -3514,5 +3593,45 @@ esac
         }
         assert_eq!(*steps.borrow(), [Some("opening the player"), None]);
         assert!(FAKE_MPV.contains("echo ani-hop-player-starts"));
+    }
+
+    #[test]
+    fn trailer_errors_say_what_failed_in_plain_words() {
+        let yt = "https://www.youtube.com/watch?v=00000000000";
+        let err = |lines: &[&str], stderr: &[u8]| {
+            let out: Vec<String> = lines.iter().map(|s| s.to_string()).collect();
+            trailer_error(yt, &out, stderr)
+        };
+        assert_eq!(
+            err(
+                &[
+                    "[ytdl_hook] ERROR: [youtube] 00000000000: This video is unavailable",
+                    "[ytdl_hook] youtube-dl failed: unexpected error occurred",
+                ],
+                b""
+            ),
+            "This video is unavailable"
+        );
+        assert_eq!(
+            err(
+                &[
+                    "[ytdl_hook] ERROR: [youtube] abc: Sign in to confirm you're not a bot. Use --cookies-from-browser or --cookies for the authentication. See https://github.com/yt-dlp/yt-dlp/wiki/FAQ",
+                ],
+                b""
+            ),
+            "Sign in to confirm you're not a bot"
+        );
+        assert_eq!(
+            err(&["[curl] error: Could not resolve hostname"], b""),
+            "can't reach youtube.com"
+        );
+        assert_eq!(
+            err(
+                &["[ytdl_hook] youtube-dl failed: not found or not enough permissions"],
+                b""
+            ),
+            "yt-dlp not found"
+        );
+        assert_eq!(err(&[], b""), "mpv couldn't play it");
     }
 }
