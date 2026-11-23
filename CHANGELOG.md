@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.12.0 – 2026-11-23
+
+### Added
+
+- A show's page has a "Watch trailer" row when AniList lists a YouTube or Dailymotion trailer for it, playing it straight in mpv without touching your progress, Continue row or watch-later position.
+
+### Fixed
+
+- Turning Preload next episode off while another ani-hop window already turned it off no longer fails with an OS error or leaves the toggle stuck on.
+- Cached poster covers older than 60 days are removed at startup so the cache doesn't grow forever.
+
 ## 0.11.1 – 2026-11-18
 
 ### Added
