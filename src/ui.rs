@@ -1,7 +1,8 @@
 use crate::anilist::Media;
 use crate::kitty;
+use crate::playback::AttemptKind;
 use crate::preview::{self, Shown};
-use crate::{App, EpMode, Input, PIN_REDIRECT, Pending, View, ani};
+use crate::{App, DeleteTarget, EpMode, Input, PIN_REDIRECT, Pending, ShowRow, View, ani};
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, BorderType, Clear, HighlightSpacing, List, ListItem, Paragraph, Wrap,
@@ -85,11 +86,12 @@ fn starting(app: &App, f: &mut Frame) {
             )
         })
         .collect();
+    let inner_w = inner.width as usize;
     let lines = vec![
-        Line::styled(p.title.as_str(), Style::new().bold()),
+        Line::styled(fit(p.title.clone(), inner_w), Style::new().bold()),
         Line::from(vec![
             Span::styled(format!("{} ", spinner(app)), color),
-            Span::styled(format!("{step}…"), SOFT),
+            Span::styled(fit(format!("{step}…"), inner_w.saturating_sub(2)), SOFT),
         ]),
         Line::from(bar),
     ];
@@ -418,7 +420,8 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
         View::Episodes(..) if unaired => Some("Not out yet"),
         View::Episodes(..) => Some("No episodes found"),
         // its download row goes when none of its shows is out
-        View::Bulk(_) => Some("None of them is out yet"),
+        View::Bulk(_) => Some("None of these shows is out yet"),
+        View::Sources(..) => Some("No sources found"),
         _ => None,
     };
     if let Some(text) = empty {
@@ -428,10 +431,16 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
 
     // the episode or trailer being started shows it right where enter was pressed
     let busy = app.playback.now().and_then(|p| {
-        let key = match &screen.view {
-            View::Episodes(m, EpMode::Play) if m.id == p.id => p.ep.clone(),
-            View::Show(m) if m.id == p.id && p.trailer => "trailer".into(),
-            View::Show(m) if m.id == p.id && next.as_ref() == Some(&p.ep) => "next".into(),
+        let key = match (&screen.view, &p.kind) {
+            (View::Episodes(m, EpMode::Play), AttemptKind::Episode(ep)) if m.id == p.id => {
+                ep.clone()
+            }
+            (View::Show(m), AttemptKind::Trailer) if m.id == p.id => ShowRow::Trailer.key().into(),
+            (View::Show(m), AttemptKind::Episode(ep))
+                if m.id == p.id && next.as_ref() == Some(ep) =>
+            {
+                ShowRow::Next.key().into()
+            }
             _ => return None,
         };
         Some((
@@ -696,7 +705,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             progress: app.progress(&m),
             entries: &app.entries,
             source: app.sources.get(m.id),
-            on_disk: app.local.get(&m.id).map_or(0, Vec::len),
+            on_disk: app.local.get(&m.id).map_or(0, |s| s.eps.len()),
             info: ep.as_deref().and_then(|ep| app.ep_about(&m, ep)),
             next: matches!(screen.view, View::Main),
         });
@@ -713,24 +722,25 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
                 line
             })
             .collect(),
-        // a show's files under its folder, as one of the user's own may be among them
-        View::Confirm(Pending::Delete(paths)) => {
+        // a show's files under its folder, already scanned in the background so drawing never
+        // touches a sleeping disk
+        View::Confirm(Pending::Delete(targets)) => {
             let name = |p: &std::path::Path| {
                 p.file_name()
                     .unwrap_or_default()
                     .to_string_lossy()
                     .into_owned()
             };
-            (paths.iter())
-                .flat_map(|p| {
-                    let files = match p.is_dir() {
-                        true => ani::show_files(p),
-                        false => Vec::new(),
+            (targets.iter())
+                .flat_map(|target| {
+                    let (root, files): (&std::path::Path, &[std::path::PathBuf]) = match target {
+                        DeleteTarget::Episode(p) => (p, &[]),
+                        DeleteTarget::Show(dir, files) => (dir, files),
                     };
-                    let head = Line::from(format!("✗ {}", name(p)));
+                    let head = Line::from(format!("✗ {}", name(root)));
                     let files = files
-                        .into_iter()
-                        .map(move |f| Line::styled(format!("    {}", name(&f)), SOFT));
+                        .iter()
+                        .map(move |f| Line::styled(format!("    {}", name(f)), SOFT));
                     std::iter::once(head).chain(files)
                 })
                 .collect()
@@ -747,6 +757,7 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             })
             .collect(),
         View::Setup => setup(app),
+        View::Settings => settings_help(app),
         _ => banner(app, inner),
     };
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
@@ -813,6 +824,64 @@ fn setup(app: &App) -> Vec<Line<'static>> {
             Line::styled("  Log in to see your lists", SOFT),
             Line::styled("  and save progress after each episode.", SOFT),
         ]),
+    }
+    v
+}
+
+/// Right-hand explanation for the focused row on Settings & AniList.
+fn settings_help(app: &App) -> Vec<Line<'static>> {
+    let mut v = Vec::new();
+    if let Some((new, cmd)) = &app.release {
+        v.push(Line::styled(
+            format!("↑ ani-hop {new} is out: {cmd}"),
+            ACCENT,
+        ));
+        v.push("".into());
+    }
+    let key = app
+        .stack
+        .last()
+        .and_then(|s| s.menu.current())
+        .map(|i| i.key.as_str());
+    let (title, body, note): (&str, &str, Option<&str>) = match key {
+        Some("skip") => (
+            "Skip openings and endings",
+            "Jumps over openings and endings in mpv. A show's last episode keeps its ending.",
+            Some("Each show can override this under Playback…"),
+        ),
+        Some("autoplay") => (
+            "Autoplay next episode",
+            "When an episode plays to the end, marks it watched on AniList without asking and starts the next one.",
+            Some("Each show can override this under Playback…"),
+        ),
+        Some("preload") => (
+            "Preload next episode",
+            "Fetches the next episode's stream while a show's page is open, so playback starts right away.",
+            Some("Uses a little more data if you don't play it."),
+        ),
+        Some("audio") => (
+            "Default audio",
+            "Language and subtitles for streams and downloads. Falls back to subtitles if a dub isn't out yet.",
+            Some("Each show can override this under Playback…"),
+        ),
+        Some("folder") => (
+            "Download folder",
+            "Where new show folders are saved. Shows downloaded elsewhere stay where they are.",
+            Some("Leave it empty to go back to the default."),
+        ),
+        Some("login" | "logout") => (
+            "AniList",
+            "Syncs your lists and episode progress across devices, and powers the Continue row on the main menu.",
+            None,
+        ),
+        _ => return banner(app, Rect::default()),
+    };
+    v.push(Line::styled(title, Style::new().bold()));
+    v.push("".into());
+    v.push(body.into());
+    if let Some(note) = note {
+        v.push("".into());
+        v.push(Line::styled(note, SOFT));
     }
     v
 }
@@ -974,10 +1043,18 @@ fn footer(app: &App, f: &mut Frame, area: Rect) {
             // cut before the key hints, with a column between
             let room =
                 (area.width as usize).saturating_sub(hints.width() + Span::raw(&head).width() + 1);
-            Line::from(vec![
-                Span::styled(head, ACCENT),
-                Span::styled(fit(tail, room), SOFT),
-            ])
+            let mut tail = tail;
+            while Span::raw(tail.as_str()).width() > room
+                && let Some((left, _)) = tail.rsplit_once(" · ")
+            {
+                tail = left.to_string();
+            }
+            let tail = if room >= 4 {
+                fit(tail, room)
+            } else {
+                String::new()
+            };
+            Line::from(vec![Span::styled(head, ACCENT), Span::styled(tail, SOFT)])
         }
         // only with nothing else to say, and only on the main menu
         _ if app.stack.len() == 1 => {

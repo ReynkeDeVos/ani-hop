@@ -1,5 +1,32 @@
 # Changelog
 
+## 0.12.5 – 2026-11-24
+
+### Added
+
+- Settings now shows a short explanation on the right for the selected option (skipping, autoplay, preloading, default audio, download folder, and AniList).
+
+### Changed
+
+- On a show's page, a divider sets the trailer, AniList and related shows apart from the rest.
+- The ♪ Playback row on a show's page shows the show's own skipping and autoplay when it has them, and the toast for a change says when a show follows Settings again.
+- The episode list's cursor also moves on when autoplay saves an episode without asking.
+- Input prompts show what `enter` will do when the field is empty (such as `change ID` on an empty token, `reset` on an empty download folder, and no action on an empty search).
+- Narrow terminals truncate long titles in the "Starting" pop-up cleanly and drop trailing download details from the footer instead of showing a lone ellipsis.
+- Tightened wording in empty states, multi-item quit prompts, and the browser-login hint (no longer naming `xdg-open`).
+
+### Fixed
+
+- Autoplay and the "Starting" pop-up now work even when `mpv.conf` sets `quiet`, `really-quiet`, or `terminal=no`.
+- Changing a setting on a fresh install creates the config folder first instead of failing when it does not exist yet.
+- Delete confirmations scan download folders in the background instead of reading the disk while drawing, preventing UI stalls on sleeping drives.
+- Deleting downloads from a multi-show selection no longer asks to delete 0 shows if the files were already removed.
+- Episode summaries decode more HTML entities (smart quotes, dashes and non-breaking spaces) without double-decoding `&amp;`.
+- With two ani-hop windows open, changing a setting or saving a source lookup in one no longer undoes the other's change.
+- A download lock that can't be read (for example on a network folder) now counts as held, so one ani-hop no longer takes over another's queue.
+- Switching AniList tokens clears the previous logged-in user immediately instead of showing stale account info while the new token loads.
+- Casting with `^o` reads the show's download queue the same way the Downloads screen does, so both agree on what's queued, paused or downloading in another window.
+
 ## 0.12.0 – 2026-11-23
 
 ### Added

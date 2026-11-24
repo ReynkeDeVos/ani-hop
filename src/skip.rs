@@ -278,7 +278,7 @@ pub fn flags_for_ani_cli(mal: &str, ep: &str, later: bool) -> String {
     let last = std::env::var_os(LAST_EPISODE).is_some();
     let player = std::env::var("ANI_CLI_PLAYER").unwrap_or_default();
     // started by an ani-hop from before shows had their own: every show's
-    let jump = std::env::var(JUMP).map_or_else(|_| ani::SKIP.on(None), |j| j == "yes");
+    let jump = std::env::var(JUMP).map_or_else(|_| crate::prefs::skip_all(), |j| j == "yes");
     if asks_later(&player, later) {
         return ask_later(mal, ep, dub, last, jump).unwrap_or_default();
     }
