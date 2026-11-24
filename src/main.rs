@@ -2501,8 +2501,8 @@ impl App {
         }
     }
 
-    /// Says so when episode `ep` of `m` is in a download queue, waiting for this ani-hop's
-    /// to finish: false when it's in none.
+    /// Says so when episode `ep` of `m` is in a download queue: waits for this ani-hop's to
+    /// finish, and refuses another's. False when it's in none.
     fn cast_queued(&mut self, m: &Media, ep: &str) -> bool {
         let what = cast_what(m, ep);
         match self.show_downloads(m).cast(ep) {
@@ -3494,9 +3494,7 @@ mod tests {
             toast(&app).unwrap().0,
             "Downloading episode 3 of Show · will cast when done"
         );
-        // another ^o on a downloaded episode takes over and casts right away
-        app.local
-            .insert(m.id, scan_ep("2", "/d/Show/Show Episode 2.mp4"));
+        // another ^o takes over
         app.top().menu.select_key("2");
         app.on_key(ctrl(KeyCode::Char('o')));
         assert_eq!(app.cast.waiting(), None);
