@@ -34,7 +34,7 @@ pub enum Action {
     /// asks which: they stand differently, or one is downloading (pause or stop)
     Choose,
     Download(Vec<String>),
-    /// takes them out of the queue; asks first when that deletes what they got (`deletes_bytes`)
+    /// takes them out of the queue; asks first when that deletes what they got
     Stop(Vec<String>),
     /// asks first, with their files
     Delete(Vec<(String, PathBuf)>),
@@ -94,13 +94,12 @@ impl CastState {
     }
 
     /// Called after a download rescan with the waited episode's current `CastAction`: once it
-    /// leaves the queue, clears the wait and returns it along with whether it's on disk to cast.
-    pub fn after_scan(&mut self, action: CastAction) -> Option<(Media, String, bool)> {
-        if self.waiting.is_none() || matches!(action, CastAction::Wait { .. }) {
+    /// leaves the queue, clears the wait and returns it, for the disk to say whether it landed.
+    pub fn after_scan(&mut self, action: CastAction) -> Option<(Media, String)> {
+        if matches!(action, CastAction::Wait { .. }) {
             return None;
         }
-        let (m, ep) = self.waiting.take().unwrap();
-        Some((m, ep, action == CastAction::CastNow))
+        self.waiting.take()
     }
 
     #[cfg(test)]
@@ -572,18 +571,13 @@ mod tests {
         state.wait(m.clone(), "2".into());
         assert!(state.after_scan(active.cast("2")).is_none());
         let ready = state.after_scan(CastAction::CastNow);
-        assert_eq!(
-            ready.map(|(s, ep, ok)| (s.id, ep, ok)),
-            Some((1, "2".into(), true))
-        );
+        assert_eq!(ready.map(|(s, ep)| (s.id, ep)), Some((1, "2".into())));
         assert_eq!(state.waiting(), None);
-        // a failed download leaves the queue without landing on disk: cleared without casting
+        // out of the queue but not in the scan (it may predate the file): still handed back,
+        // for the disk to decide
         state.wait(m.clone(), "5".into());
-        let failed = state.after_scan(CastAction::DownloadThenCast);
-        assert_eq!(
-            failed.map(|(s, ep, ok)| (s.id, ep, ok)),
-            Some((1, "5".into(), false))
-        );
+        let unscanned = state.after_scan(CastAction::DownloadThenCast);
+        assert_eq!(unscanned.map(|(s, ep)| (s.id, ep)), Some((1, "5".into())));
         // a new ^o invalidates the previous turn and clears any wait
         state.wait(m, "6".into());
         let (_, t2) = state.begin();

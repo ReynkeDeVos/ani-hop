@@ -2139,7 +2139,7 @@ watch["time-pos"](nil, 30)
 
     #[test]
     fn held_treats_missing_lock_as_free_and_other_errors_as_held() {
-        let dir = std::env::temp_dir().join(format!("ani-hop-lock-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("ani-hop-held-errors-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         assert!(!held(&dir.join("missing.lock")));

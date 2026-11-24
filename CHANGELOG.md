@@ -8,7 +8,9 @@
 
 ### Changed
 
-- On a show's page, a divider separates playback actions from list, source, and management rows.
+- On a show's page, a divider sets the trailer, AniList and related shows apart from the rest.
+- The ♪ Playback row on a show's page also shows its skipping and autoplay, and the toast for a change says when a show follows Settings again.
+- After an episode is marked watched, the episode list's cursor moves on to the next one.
 - Input prompts show what `enter` will do when the field is empty (such as `change ID` on an empty token, `reset` on an empty download folder, and no action on an empty search).
 - Narrow terminals truncate long titles in the "Starting" pop-up cleanly and drop trailing download details from the footer instead of showing a lone ellipsis.
 - Tightened wording in empty states, multi-item quit prompts, and the browser-login hint (no longer naming `xdg-open`).
@@ -19,10 +21,11 @@
 - Changing a setting on a fresh install creates the config folder first instead of failing when it does not exist yet.
 - Delete confirmations scan download folders in the background instead of reading the disk while drawing, preventing UI stalls on sleeping drives.
 - Deleting downloads from a multi-show selection no longer asks to delete 0 shows if the files were already removed.
-- Episode summaries decode more HTML entities (smart quotes, dashes, non-breaking spaces, and numeric/hex references) without double-decoding `&amp;`.
-- Config files and saved source picks (`resolved.json`) write through atomic replacement so two open ani-hop windows cannot corrupt each other.
+- Episode summaries decode more HTML entities (smart quotes, dashes and non-breaking spaces) without double-decoding `&amp;`.
+- With two ani-hop windows open, changing a setting or saving a source lookup in one no longer undoes the other's change.
+- A download lock that can't be read (for example on a network folder) now counts as held, so one ani-hop no longer takes over another's queue.
 - Switching AniList tokens clears the previous logged-in user immediately instead of showing stale account info while the new token loads.
-- Casting with `^o` shares the show's download state directly so queue, pause, and cross-window download status stay in sync.
+- Casting with `^o` reads the show's download queue the same way the Downloads screen does, so both agree on what's queued, paused or downloading in another window.
 
 ## 0.12.0 – 2026-11-23
 

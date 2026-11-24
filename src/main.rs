@@ -989,7 +989,9 @@ impl App {
         let dl = self.show_downloads(&m);
         let action = dl.action(&eps, chosen);
         // asks when that deletes what they got, so no stray enter or → can
-        let stop_asks = matches!(&action, Action::Stop(stop) if dl.deletes_bytes(stop).is_some());
+        // from the disk now, as the last scan may predate the parts
+        let stop_asks =
+            matches!(&action, Action::Stop(stop) if !ani::parts(&ani::folder(&m), stop).is_empty());
         match &action {
             Action::Nothing(why) if !why.is_empty() => return self.toast(*why, false),
             Action::Choose => {
@@ -2511,7 +2513,11 @@ impl App {
         }
         // the one asked for last takes over, also from one waiting for its download
         self.cast.begin();
-        let action = self.show_downloads(&m).cast(&ep);
+        let action = match self.show_downloads(&m).cast(&ep) {
+            // the last scan may predate the file, or not list this show: the disk decides
+            CastAction::DownloadThenCast => CastAction::CastNow,
+            other => other,
+        };
         self.carry_out_cast(m, ep, action);
     }
 
@@ -3062,7 +3068,7 @@ impl App {
                 // out of the queue once it's done, subtitles and all, or failed, which said so
                 if let Some((m, ep)) = self.cast.pending() {
                     let action = self.show_downloads(m).cast(ep);
-                    if let Some((m, ep, true)) = self.cast.after_scan(action) {
+                    if let Some((m, ep)) = self.cast.after_scan(action) {
                         self.cast_file(m, ep, false);
                     }
                 }
@@ -3490,8 +3496,12 @@ mod tests {
             let res = res.map(String::from).map_err(String::from);
             Msg::Cast(m.clone(), ep.into(), turn, true, res)
         };
-        // not on disk: ShowDownloads queues the download first and waits
+        // the last scan may predate the file: the disk is looked at first
         app.on_key(ctrl(KeyCode::Char('o')));
+        assert_eq!(toast(&app).unwrap().0, "Casting episode 3 of Show…");
+        assert_eq!(app.cast.waiting(), None);
+        // not on disk: downloaded first
+        app.on_msg(cast(&m, "3", 1, Err(mpv::NOT_DOWNLOADED)));
         assert_eq!(app.cast.waiting(), Some((m.id, "3")));
         assert_eq!(
             toast(&app).unwrap().0,
@@ -3533,6 +3543,7 @@ mod tests {
         // waiting on a download: another download's failure leaves it alone, and a scan clears it
         app.top().menu.select_key("5");
         app.on_key(ctrl(KeyCode::Char('o')));
+        app.on_msg(cast(&m, "5", 4, Err(mpv::NOT_DOWNLOADED)));
         assert_eq!(app.cast.waiting(), Some((m.id, "5")));
         app.on_msg(Msg::DlDone("Other E1".into(), Err("failed".into())));
         assert_eq!(app.cast.waiting(), Some((m.id, "5")));
@@ -5459,19 +5470,20 @@ mod tests {
         );
         app.playback.finish(_ep_long, Ok(false));
 
-        // 3-item quit prompt uses natural English comma + "and"
+        // the quit prompt names what still runs; no download here, as the real worker can
+        // fail and pause the queue before the prompt counts it
         let mark = app.progress(&m).mark("4").unwrap();
         let _save = app.entries.begin(entries::Change::Progress(mark));
         let _ep = start_ep(&mut app, &m, "4");
-        app.download(app.job(m.clone(), Some(vec!["1".into()])));
         app.request_quit();
         assert_eq!(
             app.top().title,
-            "the player, 1 download and 1 AniList save still running, quit anyway?"
+            "the player and 1 AniList save still running, quit anyway?"
         );
         // Tight-width footer never renders a lone "…" next to download status (U8)
         app.pop(1);
         app.playback.finish(_ep, Ok(false));
+        app.download(app.job(m.clone(), Some(vec!["1".into()])));
         for w in 40..=64 {
             let drawn = screen(&mut app, w, 12);
             let foot = drawn.lines().last().unwrap_or("");

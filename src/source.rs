@@ -188,9 +188,13 @@ impl Sources {
         if let Ok(src) = res {
             self.known.insert(id, src.clone());
             self.checked.insert(id, Instant::now());
-            let _ = ani::edit_json(&resolved_path(), |all: &mut HashMap<u64, Source>| {
+            let saved = ani::edit_json(&resolved_path(), |all: &mut HashMap<u64, Source>| {
                 all.insert(id, src.clone());
             });
+            // a broken cache would never save again: start it over from what's known
+            if saved.is_err() {
+                let _ = ani::write_json(&resolved_path(), &self.known);
+            }
         }
         true
     }
