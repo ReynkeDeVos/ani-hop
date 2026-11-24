@@ -191,8 +191,10 @@ impl Sources {
             let saved = ani::edit_json(&resolved_path(), |all: &mut HashMap<u64, Source>| {
                 all.insert(id, src.clone());
             });
-            // a broken cache would never save again: start it over from what's known
-            if saved.is_err() {
+            // a broken cache would never save again: start it over from what's known (only
+            // then, as writing without the lock can drop another window's entries)
+            use std::io::ErrorKind::{InvalidData, UnexpectedEof};
+            if saved.is_err_and(|e| matches!(e.kind(), InvalidData | UnexpectedEof)) {
                 let _ = ani::write_json(&resolved_path(), &self.known);
             }
         }

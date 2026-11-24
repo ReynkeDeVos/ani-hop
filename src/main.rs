@@ -3099,7 +3099,7 @@ impl App {
                     Ok(tv) => self.toast(format!("Casting {what} to {tv}"), false),
                     // another ^o came first
                     Err(e) if e.is_empty() => {}
-                    // file disappeared since the last scan: download it unless queued/elsewhere
+                    // not on disk: download it, unless it's queued here or elsewhere by now
                     Err(e) if e == mpv::NOT_DOWNLOADED => {
                         if download {
                             let action = match self.show_downloads(&m).cast(&ep) {

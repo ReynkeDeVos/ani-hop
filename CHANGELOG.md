@@ -9,8 +9,8 @@
 ### Changed
 
 - On a show's page, a divider sets the trailer, AniList and related shows apart from the rest.
-- The ♪ Playback row on a show's page also shows its skipping and autoplay, and the toast for a change says when a show follows Settings again.
-- After an episode is marked watched, the episode list's cursor moves on to the next one.
+- The ♪ Playback row on a show's page shows the show's own skipping and autoplay when it has them, and the toast for a change says when a show follows Settings again.
+- The episode list's cursor also moves on when autoplay saves an episode without asking.
 - Input prompts show what `enter` will do when the field is empty (such as `change ID` on an empty token, `reset` on an empty download folder, and no action on an empty search).
 - Narrow terminals truncate long titles in the "Starting" pop-up cleanly and drop trailing download details from the footer instead of showing a lone ellipsis.
 - Tightened wording in empty states, multi-item quit prompts, and the browser-login hint (no longer naming `xdg-open`).
