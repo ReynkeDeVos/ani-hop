@@ -1117,21 +1117,14 @@ pub fn scan_show(dir: &Path) -> ShowScan {
     let mut maybe_parts: Vec<(String, u64)> = Vec::new();
     for entry in rd.flatten() {
         let path = entry.path();
-        let fname = path.file_name().unwrap_or_default().to_string_lossy();
-        let Some((_, rest)) = fname.rsplit_once(" Episode ") else {
+        let Some((ep, finished)) = episode_file(&path) else {
             continue;
         };
         let bytes = entry.metadata().map_or(0, |m| m.len());
-        if let Some(ep) = rest.strip_suffix(".mp4") {
-            let ep = ep.to_string();
-            scan.files.push(path.clone());
-            scan.eps.push(LocalEp { ep, path, bytes });
-        } else if let Some(ep) = rest.strip_suffix(".vtt") {
-            maybe_parts.push((ep.to_string(), bytes));
-            scan.files.push(path);
-        } else if let Some((ep, _)) = rest.split_once(".mp4.") {
-            maybe_parts.push((ep.to_string(), bytes));
-            scan.files.push(path);
+        scan.files.push(path.clone());
+        match finished {
+            true => scan.eps.push(LocalEp { ep, path, bytes }),
+            false => maybe_parts.push((ep, bytes)),
         }
     }
     scan.eps
@@ -1144,23 +1137,27 @@ pub fn scan_show(dir: &Path) -> ShowScan {
     scan
 }
 
+/// The episode a download's file is of, and whether it's that episode's finished `.mp4`
+/// rather than its subtitles or an unfinished part: none for any other file.
+fn episode_file(path: &Path) -> Option<(String, bool)> {
+    let name = path.file_name()?.to_string_lossy();
+    let (_, rest) = name.rsplit_once(" Episode ")?;
+    if let Some(ep) = rest.strip_suffix(".mp4") {
+        return Some((ep.to_string(), true));
+    }
+    let ep = (rest.strip_suffix(".vtt")).or_else(|| rest.split_once(".mp4.").map(|(ep, _)| ep))?;
+    Some((ep.to_string(), false))
+}
+
 /// Downloaded episodes as (episode, file), sorted by episode number.
 pub fn local_episodes(dir: &Path) -> Vec<(String, PathBuf)> {
     let Ok(rd) = fs::read_dir(dir) else {
         return Vec::new();
     };
-    let mut eps: Vec<_> = rd
-        .flatten()
-        .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "mp4"))
-        .filter_map(|p| {
-            let ep = p
-                .file_stem()?
-                .to_str()?
-                .rsplit_once(" Episode ")?
-                .1
-                .to_string();
-            Some((ep, p))
+    let mut eps: Vec<_> = (rd.flatten().map(|e| e.path()))
+        .filter_map(|p| match episode_file(&p)? {
+            (ep, true) => Some((ep, p)),
+            (_, false) => None,
         })
         .collect();
     eps.sort_by(|a, b| ep_num(&a.0).total_cmp(&ep_num(&b.0)));
@@ -1231,11 +1228,7 @@ pub fn show_files(dir: &Path) -> Vec<PathBuf> {
         return Vec::new();
     };
     let mut files: Vec<PathBuf> = (rd.flatten().map(|e| e.path()))
-        .filter(|p| {
-            let name = p.file_name().unwrap_or_default().to_string_lossy();
-            name.contains(" Episode ")
-                && (name.ends_with(".mp4") || name.ends_with(".vtt") || name.contains(".mp4."))
-        })
+        .filter(|p| episode_file(p).is_some())
         .collect();
     files.sort();
     files
@@ -1289,11 +1282,8 @@ pub fn parts(dir: &Path, eps: &[String]) -> Vec<PathBuf> {
     };
     (rd.flatten().map(|e| e.path()))
         .filter(|p| {
-            let name = p.file_name().unwrap_or_default().to_string_lossy();
-            eps.iter().filter(|ep| !done.contains(ep)).any(|ep| {
-                name.contains(&format!(" Episode {ep}.mp4."))
-                    || name.ends_with(&format!(" Episode {ep}.vtt"))
-            })
+            episode_file(p)
+                .is_some_and(|(ep, finished)| !finished && eps.contains(&ep) && !done.contains(&ep))
         })
         .collect()
 }

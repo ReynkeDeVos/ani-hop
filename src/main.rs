@@ -761,12 +761,8 @@ impl App {
         };
         gone(token_path())?;
         gone(user_path())?;
-        self.forget_login();
-        Ok(())
-    }
-
-    fn forget_login(&mut self) {
         self.set_login(None);
+        Ok(())
     }
 
     fn set_login(&mut self, token: Option<String>) {
@@ -1742,29 +1738,15 @@ impl App {
         let s = self.downloads.snapshot();
         let downloads = if s.paused { 0 } else { s.pending };
         let saves = self.entries.pending();
-        let playing = self.playing();
-        let busy = downloads > 0 || saves > 0 || playing;
-        if busy && !matches!(self.top().view, View::Confirm(Pending::Quit)) {
-            let mut left = Vec::new();
-            if playing {
-                left.push("the player".to_string());
+        let asked = matches!(self.top().view, View::Confirm(Pending::Quit));
+        match still_running(self.playing(), downloads, saves) {
+            Some(list) if !asked => {
+                self.push(
+                    format!("{list} still running, quit anyway?"),
+                    View::Confirm(Pending::Quit),
+                );
             }
-            if downloads > 0 {
-                left.push(plural(downloads, "download"));
-            }
-            if saves > 0 {
-                left.push(plural(saves, "AniList save"));
-            }
-            let list = match left.as_slice() {
-                [a, b, c] => format!("{a}, {b} and {c}"),
-                _ => left.join(" and "),
-            };
-            self.push(
-                format!("{list} still running, quit anyway?"),
-                View::Confirm(Pending::Quit),
-            );
-        } else {
-            self.quit = true;
+            _ => self.quit = true,
         }
     }
 
@@ -2513,46 +2495,32 @@ impl App {
         }
         // the one asked for last takes over, also from one waiting for its download
         self.cast.begin();
-        let action = match self.show_downloads(&m).cast(&ep) {
-            // the last scan may predate the file, or not list this show: the disk decides
-            CastAction::DownloadThenCast => CastAction::CastNow,
-            other => other,
-        };
-        self.carry_out_cast(m, ep, action);
+        if !self.cast_queued(&m, &ep) {
+            self.toast(format!("Casting {}…", cast_what(&m, &ep)), false);
+            self.cast_file(m, ep, true);
+        }
     }
 
-    fn carry_out_cast(&mut self, m: Media, ep: String, action: CastAction) {
-        match action {
-            CastAction::Elsewhere => {
-                let what = cast_what(&m, &ep);
-                self.toast(
-                    format!("Couldn't cast {what} · another ani-hop is downloading it"),
-                    true,
-                );
-            }
+    /// Says so when episode `ep` of `m` is in a download queue, waiting for this ani-hop's
+    /// to finish: false when it's in none.
+    fn cast_queued(&mut self, m: &Media, ep: &str) -> bool {
+        let what = cast_what(m, ep);
+        match self.show_downloads(m).cast(ep) {
+            CastAction::Cast => return false,
+            CastAction::Elsewhere => self.toast(
+                format!("Couldn't cast {what} · another ani-hop is downloading it"),
+                true,
+            ),
             CastAction::Wait { paused } => {
                 let text = match paused {
                     true => format!("Downloads paused · resume to download and cast episode {ep}"),
-                    false => format!("Downloading {} · will cast when done", cast_what(&m, &ep)),
+                    false => format!("Downloading {what} · will cast when done"),
                 };
                 self.toast(text, false);
-                self.cast.wait(m, ep);
-            }
-            CastAction::DownloadThenCast => {
-                if !self.download(self.job(m.clone(), Some(vec![ep.clone()]))) {
-                    return;
-                }
-                self.toast(
-                    format!("Downloading {} · will cast when done", cast_what(&m, &ep)),
-                    false,
-                );
-                self.cast.wait(m, ep);
-            }
-            CastAction::CastNow => {
-                self.toast(format!("Casting {}…", cast_what(&m, &ep)), false);
-                self.cast_file(m, ep, true);
+                self.cast.wait(m.clone(), ep.into());
             }
         }
+        true
     }
 
     /// Looks for episode `ep` of `m` on disk and casts it, in the background as playing does,
@@ -2784,7 +2752,7 @@ impl App {
                 if e.contains("Invalid token") || e.contains("Unauthorized") {
                     // no good anymore, whether or not it could be deleted
                     if self.log_out().is_err() {
-                        self.forget_login();
+                        self.set_login(None);
                     }
                     self.back_to_main();
                     self.toast("AniList rejected the login, log in again", true);
@@ -3101,12 +3069,12 @@ impl App {
                     Err(e) if e.is_empty() => {}
                     // not on disk: download it, unless it's queued here or elsewhere by now
                     Err(e) if e == mpv::NOT_DOWNLOADED => {
-                        if download {
-                            let action = match self.show_downloads(&m).cast(&ep) {
-                                CastAction::CastNow => CastAction::DownloadThenCast,
-                                other => other,
-                            };
-                            self.carry_out_cast(m, ep, action);
+                        if download
+                            && !self.cast_queued(&m, &ep)
+                            && self.download(self.job(m.clone(), Some(vec![ep.clone()])))
+                        {
+                            self.toast(format!("Downloading {what} · will cast when done"), false);
+                            self.cast.wait(m, ep);
                         }
                     }
                     Err(e) => self.toast(format!("Couldn't cast {what} · {e}"), true),
@@ -3131,6 +3099,25 @@ fn no_match(m: &Media) -> &'static str {
     match m.next_airing_episode.is_some() && m.released() == Some(1) {
         true => "no match yet · new shows can take a day, or try Change source…",
         false => "no match for this show · try Change source…",
+    }
+}
+
+/// What quitting would cut short: "the player, 1 download and 2 AniList saves", or none.
+fn still_running(playing: bool, downloads: usize, saves: usize) -> Option<String> {
+    let mut left = Vec::new();
+    if playing {
+        left.push("the player".to_string());
+    }
+    if downloads > 0 {
+        left.push(plural(downloads, "download"));
+    }
+    if saves > 0 {
+        left.push(plural(saves, "AniList save"));
+    }
+    match left.as_slice() {
+        [] => None,
+        [a, b, c] => Some(format!("{a}, {b} and {c}")),
+        _ => Some(left.join(" and ")),
     }
 }
 
@@ -3673,7 +3660,7 @@ mod tests {
         let (mut app, m, part, old) = split_season(50_025);
         let first = app.parts.asked(m.id);
         // logged out and in again while the first lookup still runs
-        app.forget_login();
+        app.set_login(None);
         app.user = Some((1, "Tester".into()));
         app.open_show(m.clone());
         let (now, stamp) = (app.parts.asked(m.id), app.entries.stamp());
@@ -4390,7 +4377,7 @@ mod tests {
         let mut app = app();
         app.user = Some((70_003, "Tester".into()));
         shows_episode(&mut app, &m);
-        app.forget_login();
+        app.set_login(None);
         app.refresh();
         assert!(app.last_played.is_none() && app.watching.is_none());
         assert!(!first_row(&mut app).0.starts_with("continue:"));
@@ -4554,7 +4541,7 @@ mod tests {
         let mut app = app();
         app.user = Some((70_012, "Tester".into()));
         let attempt = start_ep(&mut app, &m, "4");
-        app.forget_login();
+        app.set_login(None);
         app.user = Some((70_013, "Other".into()));
         app.on_msg(Msg::PlayStep(attempt, None));
         assert!(app.last_played.is_none());
@@ -5348,6 +5335,20 @@ mod tests {
     }
 
     #[test]
+    fn the_quit_prompt_lists_what_still_runs() {
+        assert_eq!(still_running(false, 0, 0), None);
+        assert_eq!(still_running(false, 2, 0).as_deref(), Some("2 downloads"));
+        assert_eq!(
+            still_running(true, 0, 1).as_deref(),
+            Some("the player and 1 AniList save")
+        );
+        assert_eq!(
+            still_running(true, 1, 2).as_deref(),
+            Some("the player, 1 download and 2 AniList saves")
+        );
+    }
+
+    #[test]
     fn ui_polish_covers_show_divider_settings_help_input_verbs_and_guards() {
         let mut app = app();
         let mut m = show(50_500, 12, Some(3));
@@ -5470,8 +5471,8 @@ mod tests {
         );
         app.playback.finish(_ep_long, Ok(false));
 
-        // the quit prompt names what still runs; no download here, as the real worker can
-        // fail and pause the queue before the prompt counts it
+        // the quit prompt names what still runs (no download here: the test worker fails it
+        // and pauses the queue before the prompt counts it, so `still_running` is tested apart)
         let mark = app.progress(&m).mark("4").unwrap();
         let _save = app.entries.begin(entries::Change::Progress(mark));
         let _ep = start_ep(&mut app, &m, "4");

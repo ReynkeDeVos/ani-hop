@@ -47,12 +47,10 @@ pub enum Action {
 /// What `^o` (cast to TV) does with an episode.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CastAction {
-    /// On disk and not still in any download queue: cast its file now.
-    CastNow,
+    /// In no download queue: cast its file, or download it first if the disk hasn't got it.
+    Cast,
     /// Already in this ani-hop's download queue: wait until it finishes, then cast.
     Wait { paused: bool },
-    /// Not on disk or queued: queue it to download, then cast once done.
-    DownloadThenCast,
     /// Queued in another ani-hop: refuse (may lack subtitles yet, we won't hear when it's done).
     Elsewhere,
 }
@@ -67,10 +65,9 @@ pub struct CastState {
 
 impl CastState {
     /// Starts a new cast turn, replacing any previous cast or download wait.
-    pub fn begin(&mut self) -> (Arc<AtomicU64>, u64) {
+    pub fn begin(&mut self) {
         self.waiting = None;
-        let mine = self.turn.fetch_add(1, Ordering::Relaxed) + 1;
-        (self.turn.clone(), mine)
+        self.turn.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Current turn handle, without advancing it (e.g. when casting after a waited download).
@@ -283,8 +280,9 @@ impl<'a> ShowDownloads<'a> {
         }
     }
 
-    /// What `^o` (cast) does with episode `ep`. Queued states win over `on_disk` because a
-    /// downloading episode's `.mp4` can land before its `.vtt` subtitles finish.
+    /// What `^o` (cast) does with episode `ep`. Only the queues decide, as a downloading
+    /// episode's `.mp4` can land before its `.vtt` subtitles finish, and the last scan may
+    /// predate a file or not list this show: what's on disk is for the disk to say.
     pub fn cast(&self, ep: &str) -> CastAction {
         if self.elsewhere.iter().any(|e| e == ep) {
             CastAction::Elsewhere
@@ -292,10 +290,8 @@ impl<'a> ShowDownloads<'a> {
             CastAction::Wait {
                 paused: self.queue.paused,
             }
-        } else if self.on_disk.iter().any(|e| e.ep == ep) {
-            CastAction::CastNow
         } else {
-            CastAction::DownloadThenCast
+            CastAction::Cast
         }
     }
 
@@ -539,10 +535,10 @@ mod tests {
     fn casting_agrees_with_show_downloads_and_waits_for_subtitles() {
         let m = show();
         let active = standing(&m, Some(("2", true)), false);
-        assert_eq!(active.cast("1"), CastAction::CastNow);
+        assert_eq!(active.cast("1"), CastAction::Cast);
         assert_eq!(active.cast("2"), CastAction::Wait { paused: false });
         assert_eq!(active.cast("3"), CastAction::Elsewhere);
-        assert_eq!(active.cast("4"), CastAction::DownloadThenCast);
+        assert_eq!(active.cast("4"), CastAction::Cast);
         let paused = standing(&m, Some(("2", true)), true);
         assert_eq!(paused.cast("2"), CastAction::Wait { paused: true });
         // an .mp4 already on disk while the episode is still queued (fetching .vtt) still waits
@@ -566,21 +562,18 @@ mod tests {
 
         // CastState tracks turns and resolves waits when a scan shows the download finished or failed
         let mut state = CastState::default();
-        let (_, t1) = state.begin();
+        state.begin();
+        let t1 = state.turn().1;
         assert!(state.current(t1));
         state.wait(m.clone(), "2".into());
         assert!(state.after_scan(active.cast("2")).is_none());
-        let ready = state.after_scan(CastAction::CastNow);
+        let ready = state.after_scan(CastAction::Cast);
         assert_eq!(ready.map(|(s, ep)| (s.id, ep)), Some((1, "2".into())));
         assert_eq!(state.waiting(), None);
-        // out of the queue but not in the scan (it may predate the file): still handed back,
-        // for the disk to decide
-        state.wait(m.clone(), "5".into());
-        let unscanned = state.after_scan(CastAction::DownloadThenCast);
-        assert_eq!(unscanned.map(|(s, ep)| (s.id, ep)), Some((1, "5".into())));
         // a new ^o invalidates the previous turn and clears any wait
         state.wait(m, "6".into());
-        let (_, t2) = state.begin();
+        state.begin();
+        let t2 = state.turn().1;
         assert!(!state.current(t1) && state.current(t2) && state.waiting().is_none());
     }
 }
