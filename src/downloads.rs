@@ -74,7 +74,9 @@ impl Job {
     fn number(&mut self) {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         self.id = NEXT.fetch_add(1, Ordering::Relaxed);
-        (self.dub).get_or_insert_with(|| ani::dub(ani::audio(Some(self.media.id))));
+        (self.dub).get_or_insert_with(|| {
+            crate::prefs::dub(crate::prefs::audio_from_disk(Some(self.media.id)))
+        });
         if let Some(src) = &self.source {
             self.lookup = Lookup::Check(src.clone());
         }

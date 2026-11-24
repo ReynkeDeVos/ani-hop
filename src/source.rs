@@ -126,6 +126,14 @@ impl Sources {
         }
     }
 
+    /// Marks `src` as checked this session, for tests.
+    #[cfg(test)]
+    pub fn ready(&mut self, id: u64, src: Source) {
+        self.asked.remove(&id);
+        self.known.insert(id, src);
+        self.checked.insert(id, Instant::now());
+    }
+
     fn checked(&self, id: u64) -> bool {
         (self.checked.get(&id)).is_some_and(|at| at.elapsed() < CHECK_FOR)
     }
@@ -180,7 +188,9 @@ impl Sources {
         if let Ok(src) = res {
             self.known.insert(id, src.clone());
             self.checked.insert(id, Instant::now());
-            let _ = ani::write_json(&resolved_path(), &self.known);
+            let _ = ani::edit_json(&resolved_path(), |all: &mut HashMap<u64, Source>| {
+                all.insert(id, src.clone());
+            });
         }
         true
     }
@@ -200,7 +210,9 @@ impl Sources {
         self.checked.remove(&id);
         self.asked.remove(&id);
         // gone from the file too, or a restart before its lookup finds the old one again
-        let _ = ani::write_json(&resolved_path(), &self.known);
+        let _ = ani::edit_json(&resolved_path(), |all: &mut HashMap<u64, Source>| {
+            all.remove(&id);
+        });
         Ok(())
     }
 }
@@ -1344,5 +1356,32 @@ mod tests {
         assert_eq!(ani::plain("Pokémon"), "Pok%C3%A9mon");
         assert_eq!(ani::plain("A & B+ [1] 100%"), "A %26 B%2B %5B1%5D 100%25");
         assert_eq!(ani::plain("葬送"), "%E8%91%AC%E9%80%81");
+    }
+
+    #[test]
+    fn two_ani_hops_keep_each_others_resolved_sources() {
+        let src = |title: &str| Source {
+            query: title.into(),
+            index: 1,
+            title: title.into(),
+            nth: 1,
+            episodes: vec!["1".into()],
+        };
+        let (mut a, mut b) = (
+            Sources::knowing(HashMap::new()),
+            Sources::knowing(HashMap::new()),
+        );
+        let ta = a.ask(80_001).unwrap();
+        let tb = b.ask(80_002).unwrap();
+        assert!(a.answer(80_001, ta, &Ok(src("First"))));
+        assert!(b.answer(80_002, tb, &Ok(src("Second"))));
+        let saved: HashMap<u64, Source> = ani::read_json(&resolved_path());
+        assert_eq!(saved.get(&80_001).map(|s| s.title.as_str()), Some("First"));
+        assert_eq!(saved.get(&80_002).map(|s| s.title.as_str()), Some("Second"));
+        // choosing a new source for 80_001 removes only 80_001 from resolved.json
+        a.choose(80_001, "q", &["Picked".into()], 0).unwrap();
+        let saved: HashMap<u64, Source> = ani::read_json(&resolved_path());
+        assert!(!saved.contains_key(&80_001));
+        assert_eq!(saved.get(&80_002).map(|s| s.title.as_str()), Some("Second"));
     }
 }

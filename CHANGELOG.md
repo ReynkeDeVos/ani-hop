@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.12.5 – 2026-11-24
+
+### Added
+
+- Settings now shows a short explanation on the right for the selected option (skipping, autoplay, preloading, default audio, download folder, and AniList).
+
+### Changed
+
+- On a show's page, a divider separates playback actions from list, source, and management rows.
+- Input prompts show what `enter` will do when the field is empty (such as `change ID` on an empty token, `reset` on an empty download folder, and no action on an empty search).
+- Narrow terminals truncate long titles in the "Starting" pop-up cleanly and drop trailing download details from the footer instead of showing a lone ellipsis.
+- Tightened wording in empty states, multi-item quit prompts, and the browser-login hint (no longer naming `xdg-open`).
+
+### Fixed
+
+- Autoplay and the "Starting" pop-up now work even when `mpv.conf` sets `quiet`, `really-quiet`, or `terminal=no`.
+- Changing a setting on a fresh install creates the config folder first instead of failing when it does not exist yet.
+- Delete confirmations scan download folders in the background instead of reading the disk while drawing, preventing UI stalls on sleeping drives.
+- Deleting downloads from a multi-show selection no longer asks to delete 0 shows if the files were already removed.
+- Episode summaries decode more HTML entities (smart quotes, dashes, non-breaking spaces, and numeric/hex references) without double-decoding `&amp;`.
+- Config files and saved source picks (`resolved.json`) write through atomic replacement so two open ani-hop windows cannot corrupt each other.
+- Switching AniList tokens clears the previous logged-in user immediately instead of showing stale account info while the new token loads.
+- Casting with `^o` shares the show's download state directly so queue, pause, and cross-window download status stay in sync.
+
 ## 0.12.0 – 2026-11-23
 
 ### Added

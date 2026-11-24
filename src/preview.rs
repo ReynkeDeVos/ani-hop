@@ -541,10 +541,20 @@ fn strip_html(s: &str) -> String {
     while out.contains("\n\n\n") {
         out = out.replace("\n\n\n", "\n\n");
     }
-    out.replace("&amp;", "&")
-        .replace("&quot;", "\"")
+    out.replace("&quot;", "\"")
         .replace("&#039;", "'")
+        .replace("&#39;", "'")
+        .replace("&rsquo;", "’")
+        .replace("&lsquo;", "‘")
+        .replace("&ldquo;", "“")
+        .replace("&rdquo;", "”")
         .replace("&mdash;", "—")
+        .replace("&ndash;", "–")
+        .replace("&hellip;", "…")
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
         .trim()
         .to_string()
 }
@@ -651,6 +661,12 @@ mod tests {
         assert_eq!(
             strip_html("A <i>mage</i>.<br><br>\n<br>(Source: X)"),
             "A mage.\n\n(Source: X)"
+        );
+        assert_eq!(
+            strip_html(
+                "She&#39;s &ldquo;ready&rdquo; &ndash; &hellip;&nbsp;&lt;tag&gt; &amp; &amp;quot;"
+            ),
+            "She's “ready” – … <tag> & &quot;"
         );
         assert_eq!(pretty("NOT_YET_RELEASED"), "Upcoming");
         assert_eq!(pretty("SPECIAL"), "Special");
