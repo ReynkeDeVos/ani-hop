@@ -28,6 +28,7 @@ pub fn rating_style(tenths: u8) -> Style {
         _ => SOFT,
     }
 }
+
 /// the row under the cursor
 const SELECTED: Style = Style::new().add_modifier(Modifier::BOLD);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -745,7 +746,9 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             source: app.sources.get(m.id),
             on_disk: app.local.get(&m.id).map_or(0, |s| s.eps.len()),
             info: ep.as_deref().and_then(|ep| app.ep_about(&m, ep)),
-            unwatched_ratings: app.prefs.toggle(crate::prefs::Toggle::Ratings, Some(m.id)),
+            unwatched_ratings: ep.is_some()
+                && !matches!(screen.view, View::Main)
+                && app.prefs.toggle(crate::prefs::Toggle::Ratings, Some(m.id)),
             next: matches!(screen.view, View::Main),
         });
         return app.preview.draw(&page, &ahead, f, area, inner);

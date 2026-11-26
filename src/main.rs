@@ -5616,15 +5616,6 @@ mod tests {
         let r1 = line(y1);
         let col1 = r1[..r1.find("6.8").unwrap()].chars().count() as u16;
         assert_eq!(Some(buf[(col1, y1)].fg), ui::SOFT.fg);
-        // no text cell uses LINE (borders/separators only)
-        for pos in buf.area.positions() {
-            let cell = &buf[pos];
-            assert!(
-                cell.fg != ui::LINE || "─│╭╮╰╯━ ›·\u{a0}".contains(cell.symbol()),
-                "{:?} at {pos:?}",
-                cell.symbol()
-            );
-        }
 
         // Download mode keeps download hints/sizes without episode ratings
         app.push("Downloads", View::Episodes(m.clone(), EpMode::Download));

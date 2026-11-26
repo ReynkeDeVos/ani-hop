@@ -303,7 +303,7 @@ impl EpInfo {
     /// Its AniDB rating in tenths (1..=100) when `show` is true (watched, or the unwatched
     /// ratings setting is on); hidden otherwise so a spike doesn't give away where a turn comes.
     pub fn rated(&self, show: bool) -> Option<u8> {
-        show.then_some(self.rating.unwrap_or(0)).filter(|&r| r > 0)
+        self.rating.filter(|&r| show && r > 0)
     }
 }
 
