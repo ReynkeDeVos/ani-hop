@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.0 – 2026-11-26
+
+### Added
+
+- Watched episodes now show their AniDB rating (from the `ani.zip` response ani-hop already fetches) on the right edge of the episode list and beside the air date in the Preview (`★ 8.6 AniDB`), styled with the terminal theme (mid gray below 8.0, yellow at 8.0+, bold yellow at 9.0+).
+- An "Unwatched ratings" toggle in Settings & AniList and per show under Playback lets you show ratings on unwatched episodes too, while keeping their titles and summaries hidden. It is off by default to avoid spoilers.
+
 ## 0.12.5 – 2026-11-24
 
 ### Added
