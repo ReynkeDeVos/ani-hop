@@ -1,9 +1,10 @@
-//! Playback settings: audio, skipping openings/endings, autoplay and preloading.
+//! Settings: audio, skipping openings/endings, autoplay, preloading and unwatched ratings.
 //!
 //! Each per-show setting keeps a choice of its own only while it differs from Settings' global
 //! choice, so changing the default in Settings carries over to every show that follows it.
 //! On disk these live in `ani::config_dir()` (`audio.json`, `no-skip`/`skip.json`,
-//! `autoplay`/`autoplay.json`, `preload`) so multiple ani-hop windows stay in sync.
+//! `autoplay`/`autoplay.json`, `unwatched-ratings`/`unwatched-ratings.json`, `preload`) so
+//! multiple ani-hop windows stay in sync.
 
 use crate::ani;
 use crate::menu::Item;
@@ -47,13 +48,15 @@ pub fn hide_subs(audio: &str, dub_file: bool) -> bool {
     audio == "raw" || (dub_file && !subs(audio))
 }
 
-/// A yes-or-no playback setting that applies globally in Settings and can be overridden per show.
+/// A yes-or-no setting that applies globally in Settings and can be overridden per show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Toggle {
     /// Whether mpv jumps over openings and endings. Its chapters mark them either way.
     Skip,
     /// Whether an episode played to its end saves it watched and plays the next.
     Autoplay,
+    /// Whether unwatched episodes show their AniDB rating (watched episodes always do).
+    Ratings,
 }
 
 impl Toggle {
@@ -61,6 +64,7 @@ impl Toggle {
         match self {
             Toggle::Skip => "skip",
             Toggle::Autoplay => "autoplay",
+            Toggle::Ratings => "ratings",
         }
     }
 
@@ -68,6 +72,7 @@ impl Toggle {
         match key {
             "skip" => Some(Toggle::Skip),
             "autoplay" => Some(Toggle::Autoplay),
+            "ratings" => Some(Toggle::Ratings),
             _ => None,
         }
     }
@@ -82,6 +87,7 @@ impl Toggle {
                 "Autoplay",
                 " · an episode that ends is marked watched",
             ),
+            Toggle::Ratings => ("Unwatched ratings", "Unwatched episode ratings", ""),
         }
     }
 
@@ -90,11 +96,12 @@ impl Toggle {
             // flag_on = false: absence of `no-skip` means skipping is on (for existing installs)
             Toggle::Skip => ("no-skip", false, "skip.json"),
             Toggle::Autoplay => ("autoplay", true, "autoplay.json"),
+            Toggle::Ratings => ("unwatched-ratings", true, "unwatched-ratings.json"),
         }
     }
 }
 
-/// All playback settings resolved once for one show, plus which ones differ from Settings.
+/// All per-show settings resolved once for one show, plus which ones differ from Settings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShowPrefs {
     pub audio: &'static str,
@@ -103,6 +110,8 @@ pub struct ShowPrefs {
     pub skip_own: bool,
     pub autoplay: bool,
     pub autoplay_own: bool,
+    pub ratings: bool,
+    pub ratings_own: bool,
 }
 
 impl ShowPrefs {
@@ -110,11 +119,11 @@ impl ShowPrefs {
         dub(self.audio)
     }
 
-    /// The "♪  Playback…" row on a show's page: shows audio, plus any per-show skip or autoplay
+    /// The "♪  Playback…" row on a show's page: shows audio, plus any per-show toggle
     /// overrides so nothing hides behind the submenu.
     pub fn playback_row(self, key: &str) -> Item {
         let mut it = Item::new(key, "♪  Playback…", "");
-        if !self.skip_own && !self.autoplay_own {
+        if !self.skip_own && !self.autoplay_own && !self.ratings_own {
             it.hint = match self.audio_own {
                 true => format!("{} · {OWN}", audio_label(self.audio)),
                 false => audio_label(self.audio).into(),
@@ -135,6 +144,13 @@ impl ShowPrefs {
                 "autoplay on"
             } else {
                 "autoplay off"
+            });
+        }
+        if self.ratings_own {
+            overrides.push(if self.ratings {
+                "ratings on"
+            } else {
+                "ratings off"
             });
         }
         let mut full = Vec::new();
@@ -161,6 +177,8 @@ struct Memory {
     skip: HashMap<String, bool>,
     autoplay_default: bool,
     autoplay: HashMap<String, bool>,
+    ratings_default: bool,
+    ratings: HashMap<String, bool>,
     preload: bool,
 }
 
@@ -210,6 +228,7 @@ impl Prefs {
         let audio = self.audio(Some(id));
         let skip_own = self.toggle_own(Toggle::Skip, Some(id));
         let autoplay_own = self.toggle_own(Toggle::Autoplay, Some(id));
+        let ratings_own = self.toggle_own(Toggle::Ratings, Some(id));
         ShowPrefs {
             audio,
             audio_own: audio != default_audio,
@@ -217,6 +236,8 @@ impl Prefs {
             skip_own: skip_own.is_some(),
             autoplay: autoplay_own.unwrap_or_else(|| self.toggle(Toggle::Autoplay, None)),
             autoplay_own: autoplay_own.is_some(),
+            ratings: ratings_own.unwrap_or_else(|| self.toggle(Toggle::Ratings, None)),
+            ratings_own: ratings_own.is_some(),
         }
     }
 
@@ -273,6 +294,7 @@ impl Prefs {
                 let map = match toggle {
                     Toggle::Skip => &mem.skip,
                     Toggle::Autoplay => &mem.autoplay,
+                    Toggle::Ratings => &mem.ratings,
                 };
                 map.get(&id.to_string()).copied()
             }
@@ -289,6 +311,7 @@ impl Prefs {
             Store::Memory(mem) => match toggle {
                 Toggle::Skip => mem.skip_default,
                 Toggle::Autoplay => mem.autoplay_default,
+                Toggle::Ratings => mem.ratings_default,
             },
         }
     }
@@ -323,6 +346,7 @@ impl Prefs {
                 let (default, map) = match toggle {
                     Toggle::Skip => (&mut mem.skip_default, &mut mem.skip),
                     Toggle::Autoplay => (&mut mem.autoplay_default, &mut mem.autoplay),
+                    Toggle::Ratings => (&mut mem.ratings_default, &mut mem.ratings),
                 };
                 if id.is_none() {
                     *default = on;
@@ -488,6 +512,14 @@ mod tests {
         assert!(p.toggle(Toggle::Skip, None));
         p.set_toggle(Toggle::Skip, None, false).unwrap();
         assert!(!p.toggle(Toggle::Skip, None) && dir.join("no-skip").exists());
+        // Unwatched ratings defaults to off, supports global + per-show override
+        assert!(!p.toggle(Toggle::Ratings, None) && !p.toggle(Toggle::Ratings, Some(1)));
+        p.set_toggle(Toggle::Ratings, Some(1), true).unwrap();
+        assert!(p.toggle(Toggle::Ratings, Some(1)) && !p.toggle(Toggle::Ratings, Some(2)));
+        p.set_toggle(Toggle::Ratings, None, true).unwrap();
+        assert!(dir.join("unwatched-ratings").exists());
+        assert_eq!(p.toggle_own(Toggle::Ratings, Some(1)), None);
+        assert!(p.toggle(Toggle::Ratings, Some(2)));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -534,8 +566,12 @@ mod tests {
 
         p.set_audio(Some(1), "dub").unwrap();
         p.set_toggle(Toggle::Autoplay, Some(1), true).unwrap();
+        p.set_toggle(Toggle::Ratings, Some(1), true).unwrap();
         let all = p.for_show(1).playback_row("playback");
-        assert_eq!(all.hint, "dubbed · skip on · autoplay on · this show only");
-        assert_eq!(all.short, "dubbed · skip on · autoplay on");
+        assert_eq!(
+            all.hint,
+            "dubbed · skip on · autoplay on · ratings on · this show only"
+        );
+        assert_eq!(all.short, "dubbed · skip on · autoplay on · ratings on");
     }
 }

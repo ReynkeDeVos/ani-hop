@@ -724,6 +724,8 @@ mod tests {
             skip_own: false,
             autoplay: false,
             autoplay_own: false,
+            ratings: false,
+            ratings_own: false,
         }
     }
 

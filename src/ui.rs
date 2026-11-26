@@ -17,6 +17,18 @@ pub const LINE: Color = Color::DarkGray;
 /// Text to read that steps back: a mid gray, the one thing at 3:1 or better on every Omarchy
 /// theme, light and dark. Ghostty's faint falls under 2:1 on all the light ones.
 pub const SOFT: Style = Style::new().fg(Color::Indexed(244));
+
+/// Style for an AniDB episode rating (tenths, 1..=100): quiet on ordinary episodes so watched
+/// rows don't outshine the cursor, and in the score's yellow on standouts (bold at 9.0+). ANSI
+/// colors and `SOFT` only, so switching light and dark terminal themes stays readable.
+pub fn rating_style(tenths: u8) -> Style {
+    match tenths {
+        90.. => Style::new().fg(Color::Yellow).bold(),
+        80.. => Style::new().fg(Color::Yellow),
+        _ => SOFT,
+    }
+}
+
 /// the row under the cursor
 const SELECTED: Style = Style::new().add_modifier(Modifier::BOLD);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -474,6 +486,9 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 true => SOFT,
                 false => Style::new(),
             };
+            let busy_row = busy.as_ref().filter(|(k, _)| *k == item.key);
+            let rating = item.rating.filter(|_| busy_row.is_none());
+            let rating_text = rating.map(crate::anilist::rating_text);
             // a title makes room for what's short and always worth seeing (a show's progress),
             // unless too little of the title would be left to tell which show it is
             let short = match item.short.as_str() {
@@ -492,9 +507,15 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 play.style = ACCENT.into();
             }
             let mut used: usize = spans.iter().map(|s| s.width()).sum();
+            // a watched episode trims its title at the end to keep room for its rating, unless
+            // too little would stay to read which episode it is
+            let label_max = match &rating_text {
+                Some(rt) if (width - 2).saturating_sub(rt.len() + 1) >= 20 => width - rt.len() - 1,
+                _ => width,
+            };
             // a title too long for the row ends in "…", like a cut hint
-            if used > width {
-                while used >= width
+            if used > label_max {
+                while used >= label_max
                     && let Some(s) = spans.pop()
                 {
                     used -= s.width();
@@ -503,30 +524,48 @@ fn menu(app: &mut App, f: &mut Frame, area: Rect) {
                 used += 1;
             }
             let room = width.saturating_sub(used + 1);
-            let (hint, style): (String, Style) = match &busy {
-                Some((key, text)) if *key == item.key => (text.clone(), ACCENT.into()),
-                _ if hero => (item.hint.clone(), ACCENT.into()),
-                // what Settings is there to show
-                _ if matches!(screen.view, View::Settings | View::Playback(_)) => {
-                    (item.hint.clone(), Style::new())
+            if let (Some(r), Some(rt)) = (rating, rating_text) {
+                let rw = rt.len();
+                if rw <= room {
+                    let hint_w = Span::raw(item.hint.as_str()).width();
+                    if !item.hint.is_empty() && hint_w + 3 + rw <= room {
+                        let gap = width.saturating_sub(used + hint_w + 3 + rw);
+                        spans.push(" ".repeat(gap).into());
+                        spans.push(Span::styled(item.hint.clone(), SOFT));
+                        spans.push(Span::styled(" · ", LINE));
+                        spans.push(Span::styled(rt, rating_style(r)));
+                    } else {
+                        let gap = width.saturating_sub(used + rw);
+                        spans.push(" ".repeat(gap).into());
+                        spans.push(Span::styled(rt, rating_style(r)));
+                    }
                 }
-                _ => (item.hint.clone(), SOFT),
-            };
-            let mut hint = hint;
-            if Span::raw(hint.as_str()).width() > room && !item.short.is_empty() {
-                hint = item.short.clone();
-            }
-            while Span::raw(hint.as_str()).width() > room
-                && let Some((head, _)) = hint.rsplit_once(" · ")
-            {
-                hint = head.to_string();
-            }
-            // a hint cut to less than half says nothing ("not l…", "loses pr…"), so it goes
-            let w = Span::raw(hint.as_str()).width();
-            if !hint.is_empty() && (w <= room || room > 3 && room * 2 >= w) {
-                let hint = Span::styled(fit(hint, room), style);
-                spans.push(" ".repeat(width.saturating_sub(used + hint.width())).into());
-                spans.push(hint);
+            } else {
+                let (hint, style): (String, Style) = match busy_row {
+                    Some((_, text)) => (text.clone(), ACCENT.into()),
+                    _ if hero => (item.hint.clone(), ACCENT.into()),
+                    // what Settings is there to show
+                    _ if matches!(screen.view, View::Settings | View::Playback(_)) => {
+                        (item.hint.clone(), Style::new())
+                    }
+                    _ => (item.hint.clone(), SOFT),
+                };
+                let mut hint = hint;
+                if Span::raw(hint.as_str()).width() > room && !item.short.is_empty() {
+                    hint = item.short.clone();
+                }
+                while Span::raw(hint.as_str()).width() > room
+                    && let Some((head, _)) = hint.rsplit_once(" · ")
+                {
+                    hint = head.to_string();
+                }
+                // a hint cut to less than half says nothing ("not l…", "loses pr…"), so it goes
+                let w = Span::raw(hint.as_str()).width();
+                if !hint.is_empty() && (w <= room || room > 3 && room * 2 >= w) {
+                    let hint = Span::styled(fit(hint, room), style);
+                    spans.push(" ".repeat(width.saturating_sub(used + hint.width())).into());
+                    spans.push(hint);
+                }
             }
             // its row only, not a rule under it, and what's gray reads in full there
             if selected == Some(k) {
@@ -707,6 +746,9 @@ fn preview(app: &mut App, f: &mut Frame, area: Rect) {
             source: app.sources.get(m.id),
             on_disk: app.local.get(&m.id).map_or(0, |s| s.eps.len()),
             info: ep.as_deref().and_then(|ep| app.ep_about(&m, ep)),
+            unwatched_ratings: ep.is_some()
+                && !matches!(screen.view, View::Main)
+                && app.prefs.toggle(crate::prefs::Toggle::Ratings, Some(m.id)),
             next: matches!(screen.view, View::Main),
         });
         return app.preview.draw(&page, &ahead, f, area, inner);
@@ -858,6 +900,11 @@ fn settings_help(app: &App) -> Vec<Line<'static>> {
             "Preload next episode",
             "Fetches the next episode's stream while a show's page is open, so playback starts right away.",
             Some("Uses a little more data if you don't play it."),
+        ),
+        Some("ratings") => (
+            "Unwatched episode ratings",
+            "Shows AniDB episode ratings before you've watched them. Watched episodes always show their rating.",
+            Some("Off by default to avoid spoilers. Each show can override this under Playback…"),
         ),
         Some("audio") => (
             "Default audio",
