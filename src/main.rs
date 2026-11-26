@@ -564,12 +564,12 @@ fn load_episodes(m: &Media) -> HashMap<String, EpInfo> {
     let age = age.and_then(|t| t.elapsed().ok()).unwrap_or(Duration::MAX);
     let cached: Option<HashMap<String, EpInfo>> = ani::read_json(&path);
     match cached {
-        // one from before air dates or seasons fetches again, but still stands in when that fails
+        // one from before air dates, seasons or ratings fetches again, but still stands in when that fails
         Some(eps)
             if age.as_secs() < days * 86_400
                 && eps
                     .values()
-                    .all(|e| e.aired.is_some() && e.season.is_some()) =>
+                    .all(|e| e.aired.is_some() && e.season.is_some() && e.rating.is_some()) =>
         {
             eps
         }
@@ -1376,6 +1376,7 @@ impl App {
                     "Preload next episode",
                     if self.prefs.preload() { "on" } else { "off" },
                 ),
+                self.prefs.toggle_item(Toggle::Ratings, None),
                 self.prefs.audio_item("Default audio…", None),
                 Item::new(
                     "folder",
@@ -1535,15 +1536,20 @@ impl App {
                     eps.iter()
                         .map(|ep| (self.ep_about(m, ep).and_then(|i| i.season)).unwrap_or(0)),
                 );
+                let unwatched_ratings = self.prefs.toggle(Toggle::Ratings, Some(m.id));
                 // what a watched episode is called and about; nothing that spoils the rest
                 let item = |key: &str, ep: &str, hint: String, season: u32| {
                     let mut it = Item::new(key, format!("Episode {ep}"), hint);
                     it.done = run.watched(ep);
-                    if let Some((title, about)) = self.ep_about(m, ep).map(|i| i.told(it.done)) {
+                    if let Some(info) = self.ep_about(m, ep) {
+                        let (title, about) = info.told(it.done);
                         if !title.is_empty() {
                             it.label = format!("{} · {title}", it.label);
                         }
                         it.about = about.to_string();
+                        if *mode == EpMode::Play {
+                            it.rating = info.rated(it.done || unwatched_ratings);
+                        }
                     }
                     // a part AniList counts on its own, or TheTVDB's season (a long show
                     // like One Piece has 23, where AniList has one entry)
@@ -1604,6 +1610,7 @@ impl App {
                 self.prefs.audio_item("Audio…", Some(m.id)),
                 self.prefs.toggle_item(Toggle::Skip, Some(m.id)),
                 self.prefs.toggle_item(Toggle::Autoplay, Some(m.id)),
+                self.prefs.toggle_item(Toggle::Ratings, Some(m.id)),
             ],
             View::Sources(_, _, hits) => hits
                 .iter()
@@ -2089,6 +2096,9 @@ impl App {
             let feed = Feed::Pages(sort.clone(), None, Some(2), false);
             return self.push_loading(label, feed, Some(cache), move || c.browse(&sort, None, 1));
         }
+        if let Some(toggle) = Toggle::from_key(key) {
+            return self.flip(toggle, None);
+        }
         match key {
             "search" => _ = self.push("Search", View::Input(Input::Search)),
             "settings" => _ = self.push("Settings & AniList", View::Settings),
@@ -2106,11 +2116,6 @@ impl App {
                 Some(id) => self.start_auth(&id),
                 None => self.ask_client_id(),
             },
-            "skip" | "autoplay" => {
-                if let Some(toggle) = Toggle::from_key(key) {
-                    self.flip(toggle, None);
-                }
-            }
             "audio" => {
                 let cur = self.prefs.audio(None);
                 self.push("Default audio", View::Audio(None));
@@ -5497,5 +5502,218 @@ mod tests {
         app.submit(Input::Token, "new-token-value".into());
         assert!(app.user.is_none());
         assert_eq!(app.client.token.as_deref(), Some("new-token-value"));
+    }
+
+    #[test]
+    fn watched_episode_ratings_show_on_the_list_with_theme_colors() {
+        use ratatui::style::{Color, Modifier};
+
+        let mut app = app();
+        let m = show(50_610, 5, Some(3));
+        app.sources = Sources::knowing(HashMap::from([(m.id, source(5))]));
+        app.local
+            .insert(m.id, scan_ep("2", "/d/Show/Show Episode 2.mp4"));
+        app.local.entry(m.id).and_modify(|s| {
+            s.eps
+                .push(scan_ep("4", "/d/Show/Show Episode 4.mp4").eps.remove(0))
+        });
+        let ep = |title: &str, aired: &str, rating: u8| EpInfo {
+            title: title.into(),
+            about: String::new(),
+            number: None,
+            aired: Some(aired.into()),
+            season: Some(1),
+            rating: Some(rating),
+        };
+        app.ep_info.insert(
+            m.id,
+            HashMap::from([
+                ("1".into(), ep("Judgment", "2022-01-10", 68)),
+                ("2".into(), ep("Two Brothers", "2022-01-23", 86)),
+                (
+                    "3".into(),
+                    ep("From You, 2,000 Years Ago", "2022-02-06", 97),
+                ),
+                ("4".into(), ep("Secret Twist", "2022-02-13", 98)),
+            ]),
+        );
+        app.push("Episodes", View::Episodes(m.clone(), EpMode::Play));
+
+        // 80x24: watched rows trim their title for the rating; unwatched stays spoiler-free
+        let drawn = screen(&mut app, 80, 24);
+        let row = |needle: &str| {
+            drawn
+                .lines()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle} in:\n{drawn}"))
+        };
+        let left = |l: &str| l.chars().take(34).collect::<String>();
+        assert!(left(row("Episode 1")).contains("6.8"), "{drawn}");
+        assert!(
+            left(row("Episode 2")).contains("…") && left(row("Episode 2")).contains("8.6"),
+            "{drawn}"
+        );
+        assert!(
+            !left(row("Episode 2")).contains("on disk"),
+            "narrow drops on disk before cutting the rating: {drawn}"
+        );
+        assert!(left(row("Episode 3")).contains("9.7"), "{drawn}");
+        assert!(
+            !left(row("Episode 4")).contains("9.8") && left(row("Episode 4")).contains("on disk"),
+            "unwatched hides its rating and keeps on disk: {drawn}"
+        );
+        // cursor starts on watched episode 1: Preview shows its AniDB rating
+        assert!(drawn.contains("★\u{a0}6.8\u{a0}AniDB"), "{drawn}");
+        // moving to unwatched episode 4 hides its AniDB rating in Preview too
+        app.top().menu.select_key("4");
+        let unwatched = screen(&mut app, 80, 24);
+        assert!(
+            !unwatched.contains("AniDB") && !unwatched.contains("9.8"),
+            "{unwatched}"
+        );
+
+        // wide screen: watched + on disk shows both "on disk · 8.6"
+        app.top().menu.select_key("1");
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui::render(&mut app, f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let line = |y: u16| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        let find_cell = |needle: &str, token: &str| {
+            let y = (0..30).find(|&y| line(y).contains(needle)).unwrap();
+            let row = line(y);
+            let col = row[..row.find(token).unwrap()].chars().count() as u16;
+            buf[(col, y)].clone()
+        };
+        // episode 1 selected (6.8): SOFT promotes to Reset + BOLD on the cursor row
+        let c1 = find_cell("Episode 1", "6.8");
+        assert_eq!(c1.fg, Color::Reset);
+        assert!(c1.modifier.contains(Modifier::BOLD));
+        // episode 2 unselected (8.6) + on disk: both show, 8.6 in Yellow, not bold
+        let y2 = (0..30).find(|&y| line(y).contains("Episode 2")).unwrap();
+        assert!(line(y2).contains("on disk · 8.6"), "{}", line(y2));
+        let c2 = find_cell("Episode 2", "8.6");
+        assert_eq!(c2.fg, Color::Yellow);
+        assert!(!c2.modifier.contains(Modifier::BOLD));
+        // episode 3 unselected (9.7): standout is Yellow + BOLD
+        let c3 = find_cell("Episode 3", "9.7");
+        assert_eq!(c3.fg, Color::Yellow);
+        assert!(c3.modifier.contains(Modifier::BOLD));
+        // episode 1 Preview shows aired + AniDB rating
+        assert!(
+            (0..30).any(
+                |y| line(y).contains("aired 10 Jan 2022") && line(y).contains("6.8\u{a0}AniDB")
+            ),
+            "{}",
+            (0..30).map(&line).collect::<Vec<_>>().join("\n")
+        );
+        // moving cursor off episode 1 drops 6.8 back to SOFT (mid gray, >=3:1 on light & dark)
+        app.top().menu.select_key("2");
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| ui::render(&mut app, f)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let line = |y: u16| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>();
+        let y1 = (0..30).find(|&y| line(y).contains("Episode 1")).unwrap();
+        let r1 = line(y1);
+        let col1 = r1[..r1.find("6.8").unwrap()].chars().count() as u16;
+        assert_eq!(Some(buf[(col1, y1)].fg), ui::SOFT.fg);
+        // no text cell uses LINE (borders/separators only)
+        for pos in buf.area.positions() {
+            let cell = &buf[pos];
+            assert!(
+                cell.fg != ui::LINE || "─│╭╮╰╯━ ›·\u{a0}".contains(cell.symbol()),
+                "{:?} at {pos:?}",
+                cell.symbol()
+            );
+        }
+
+        // Download mode keeps download hints/sizes without episode ratings
+        app.push("Downloads", View::Episodes(m.clone(), EpMode::Download));
+        let dl_drawn = screen(&mut app, 120, 30);
+        let dl_ep2 = dl_drawn.lines().find(|l| l.contains("Episode 2")).unwrap();
+        let dl_left: String = dl_ep2.chars().take(50).collect();
+        assert!(
+            dl_left.contains("on disk") && !dl_left.contains("8.6"),
+            "{dl_left}"
+        );
+    }
+
+    #[test]
+    fn unwatched_ratings_toggle_works_globally_and_per_show() {
+        let mut app = app();
+        let a = show(50_620, 4, Some(1));
+        let b = show(50_621, 4, Some(1));
+        app.sources = Sources::knowing(HashMap::from([(a.id, source(4)), (b.id, source(4))]));
+        let ep = |title: &str, aired: &str, rating: u8| EpInfo {
+            title: title.into(),
+            about: "Spoilers.".into(),
+            number: None,
+            aired: Some(aired.into()),
+            season: Some(1),
+            rating: Some(rating),
+        };
+        let eps = HashMap::from([
+            ("1".into(), ep("Opening", "2022-01-10", 72)),
+            ("2".into(), ep("Secret Twist", "2022-01-17", 98)),
+        ]);
+        app.ep_info.insert(a.id, eps.clone());
+        app.ep_info.insert(b.id, eps);
+
+        // Settings defaults to off and explains the toggle on the right pane
+        app.push("Settings & AniList", View::Settings);
+        app.top().menu.select_key("ratings");
+        let settings = screen(&mut app, 80, 24);
+        assert!(
+            settings.contains("Unwatched ratings")
+                && settings.contains("off")
+                && settings.contains("Unwatched episode ratings")
+                && settings.contains("Off by default to avoid spoilers"),
+            "{settings}"
+        );
+        // Flip global toggle on
+        enter(&mut app);
+        assert_eq!(toast(&app), Some(("Unwatched episode ratings: on", false)));
+        app.pop(1);
+
+        // Unwatched episode 2 now shows 9.8 on the list and Preview, but still hides title/summary
+        app.push("Episodes", View::Episodes(a.clone(), EpMode::Play));
+        app.top().menu.select_key("2");
+        let drawn = screen(&mut app, 100, 24);
+        let ep2 = drawn.lines().find(|l| l.contains("Episode 2")).unwrap();
+        assert!(
+            ep2.contains("9.8") && !drawn.contains("Secret Twist") && !drawn.contains("Spoilers."),
+            "{drawn}"
+        );
+        assert!(drawn.contains("★\u{a0}9.8\u{a0}AniDB"), "{drawn}");
+        app.pop(1);
+
+        // Override off for show A only: A hides unwatched ratings (watched ep 1 still shows 7.2)
+        app.open_show(a.clone());
+        app.push("Playback", View::Playback(a.clone()));
+        app.top().menu.select_key("ratings");
+        enter(&mut app);
+        assert_eq!(
+            toast(&app),
+            Some(("Unwatched episode ratings for Show: off", false))
+        );
+        app.pop(1);
+        let show_page = screen(&mut app, 100, 24);
+        assert!(show_page.contains("ratings off"), "{show_page}");
+        app.push("Episodes", View::Episodes(a.clone(), EpMode::Play));
+        app.top().menu.select_key("2");
+        let a_drawn = screen(&mut app, 100, 24);
+        assert!(
+            a_drawn.contains("7.2") && !a_drawn.contains("9.8") && !a_drawn.contains("AniDB"),
+            "{a_drawn}"
+        );
+        app.pop(2);
+
+        // Show B still follows global on
+        app.push("Episodes", View::Episodes(b.clone(), EpMode::Play));
+        app.top().menu.select_key("2");
+        let b_drawn = screen(&mut app, 100, 24);
+        assert!(
+            b_drawn.contains("9.8") && b_drawn.contains("★\u{a0}9.8\u{a0}AniDB"),
+            "{b_drawn}"
+        );
     }
 }

@@ -5,13 +5,13 @@
 //! doesn't fit pages with shift+↑↓. The Preview keeps the posters, which page is read, and
 //! the title's glint.
 
-use crate::anilist::{EpInfo, Media};
+use crate::anilist::{EpInfo, Media, rating_text};
 use crate::entries::Entries;
 use crate::kitty::{self, Posters};
 use crate::list_label;
 use crate::progress::Progress;
 use crate::source::Source;
-use crate::ui::{ACCENT, LINE, MATCH, SOFT, cover_color, swept};
+use crate::ui::{ACCENT, LINE, MATCH, SOFT, cover_color, rating_style, swept};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Paragraph, Wrap};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -34,6 +34,8 @@ pub struct Shown<'a> {
     pub on_disk: usize,
     /// what the episode is called and about, as ani.zip has it
     pub info: Option<&'a EpInfo>,
+    /// whether unwatched episodes also show their AniDB rating (off by default to avoid spoilers)
+    pub unwatched_ratings: bool,
     /// `ep` is the one to watch next, not one the cursor is on
     pub next: bool,
 }
@@ -144,14 +146,29 @@ pub fn page(s: &Shown) -> Page {
         && let Some(i) = s.info
     {
         lines.push("".into());
-        let (title, summary) = i.told(s.progress.watched(ep));
+        let watched = s.progress.watched(ep);
+        let (title, summary) = i.told(watched);
         let heading = match title {
             "" => format!("Episode {ep}"),
             title => format!("Episode {ep} · {title}"),
         };
         lines.push(Line::styled(heading, Style::new().bold()));
+        let mut meta = Vec::new();
         if let Some(d) = i.aired.as_deref().filter(|d| !d.is_empty()) {
-            lines.push(Line::styled(format!("aired {}", day(d)), SOFT));
+            meta.push(Span::styled(format!("aired {}", day(d)), SOFT));
+        }
+        if let Some(r) = i.rated(watched || s.unwatched_ratings) {
+            if !meta.is_empty() {
+                meta.push(Span::styled("\u{a0}· ", LINE));
+            }
+            meta.push(Span::styled(
+                format!("★\u{a0}{}", rating_text(r)),
+                rating_style(r),
+            ));
+            meta.push(Span::styled("\u{a0}AniDB", SOFT));
+        }
+        if !meta.is_empty() {
+            lines.push(Line::from(meta));
         }
         about = summary.to_string();
     }
@@ -584,8 +601,9 @@ mod tests {
             number: None,
             aired: Some("2005-10-23".into()),
             season: Some(1),
+            rating: Some(86),
         };
-        let told = |ep| {
+        let told = |ep, unwatched_ratings| {
             let p = page(&Shown {
                 show: &show,
                 ep: Some(ep),
@@ -594,23 +612,48 @@ mod tests {
                 source: None,
                 on_disk: 0,
                 info: Some(&info),
+                unwatched_ratings,
                 next: false,
             });
             let head: Vec<String> = p.head.iter().map(Line::to_string).collect();
             (head, p.about)
         };
-        let (head, about) = told("1");
+        let (head, about) = told("1", false);
         assert!(head.contains(&"Episode 1 · The Green Seat".into()));
+        assert!(head.contains(&"aired 23 Oct 2005\u{a0}· ★\u{a0}8.6\u{a0}AniDB".into()));
         assert_eq!(about, "A boy's drawings come alive.");
-        let (head, about) = told("2");
+        let (head, about) = told("2", false);
         assert!(
             head.contains(&"Episode 2".into()) && about.is_empty(),
             "nothing spoils"
         );
         assert!(
             head.contains(&"aired 23 Oct 2005".into()),
-            "its date doesn't spoil"
+            "its date doesn't spoil, and its rating stays hidden"
         );
+        // with unwatched ratings on, only the rating shows; title and summary still don't spoil
+        let (head, about) = told("2", true);
+        assert!(head.contains(&"Episode 2".into()) && about.is_empty());
+        assert!(head.contains(&"aired 23 Oct 2005\u{a0}· ★\u{a0}8.6\u{a0}AniDB".into()));
+        // rating alone still shows when an episode has no air date
+        let no_date = EpInfo {
+            aired: Some(String::new()),
+            rating: Some(92),
+            ..info.clone()
+        };
+        let p = page(&Shown {
+            show: &show,
+            ep: Some("1"),
+            progress: entries.progress(&show, &[]),
+            entries: &entries,
+            source: None,
+            on_disk: 0,
+            info: Some(&no_date),
+            unwatched_ratings: false,
+            next: false,
+        });
+        let head: Vec<String> = p.head.iter().map(Line::to_string).collect();
+        assert!(head.contains(&"★\u{a0}9.2\u{a0}AniDB".into()), "{head:?}");
     }
 
     #[test]

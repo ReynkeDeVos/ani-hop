@@ -24,6 +24,8 @@ pub struct Item {
     pub group: String,
     /// the hint said shorter, for a row too narrow for it ("subtitled")
     pub short: String,
+    /// AniDB episode rating in tenths (1..=100), drawn on the row's right in Play mode
+    pub rating: Option<u8>,
 }
 
 impl Item {
@@ -37,6 +39,7 @@ impl Item {
             action: false,
             group: String::new(),
             short: String::new(),
+            rating: None,
         }
     }
 }

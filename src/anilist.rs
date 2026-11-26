@@ -284,6 +284,10 @@ pub struct EpInfo {
     /// in yet); None in a cache from before seasons, which is then fetched again
     #[serde(default)]
     pub season: Option<u32>,
+    /// its AniDB rating from ani.zip in tenths (1..=100, 0 if ani.zip has none); None in a
+    /// cache from before ratings, which is then fetched again
+    #[serde(default)]
+    pub rating: Option<u8>,
 }
 
 impl EpInfo {
@@ -294,6 +298,32 @@ impl EpInfo {
             true => (&self.title, &self.about),
             false => ("", ""),
         }
+    }
+
+    /// Its AniDB rating in tenths (1..=100) when `show` is true (watched, or the unwatched
+    /// ratings setting is on); hidden otherwise so a spike doesn't give away where a turn comes.
+    pub fn rated(&self, show: bool) -> Option<u8> {
+        show.then_some(self.rating.unwrap_or(0)).filter(|&r| r > 0)
+    }
+}
+
+/// An AniDB rating in tenths (86 -> "8.6", 100 -> "10.0").
+pub fn rating_text(tenths: u8) -> String {
+    format!("{}.{}", tenths / 10, tenths % 10)
+}
+
+/// Parses an ani.zip episode rating (e.g. "8.63" or 8.63) into tenths (1..=100), or 0 when
+/// missing or out of range.
+fn parse_rating(v: &Value) -> u8 {
+    let r = v
+        .as_str()
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .or_else(|| v.as_f64());
+    match r {
+        Some(r) if r.is_finite() && r > 0.0 && r <= 10.0 => {
+            (r * 10.0).round().clamp(1.0, 100.0) as u8
+        }
+        _ => 0,
     }
 }
 
@@ -322,6 +352,7 @@ fn episode_info(v: &Value) -> HashMap<String, EpInfo> {
             number: e["episodeNumber"].as_u64().map(|n| n as u32),
             aired: Some(tidy(e["airdate"].as_str())),
             season: Some(e["seasonNumber"].as_u64().unwrap_or(0) as u32),
+            rating: Some(parse_rating(&e["rating"])),
         };
         (ep.clone(), info)
     })
@@ -790,8 +821,12 @@ mod tests {
         let v = serde_json::json!({ "episodes": {
             "1": { "title": { "en": "The Journey`s End", "x-jat": "Bouken no Owari" },
                    "summary": "It`s over.\nSource: Crunchyroll", "airdate": "2023-09-29",
-                   "seasonNumber": 1 },
-            "2": { "title": { "x-jat": "Betsu ni" }, "overview": "Magic lessons.", "episodeNumber": 14 },
+                   "seasonNumber": 1, "rating": "8.63" },
+            "2": { "title": { "x-jat": "Betsu ni" }, "overview": "Magic lessons.", "episodeNumber": 14,
+                   "rating": "10.00" },
+            "3": { "rating": 7.0 },
+            "4": { "rating": "0.00" },
+            "5": { "rating": "bad" },
             "S1": { "title": { "en": "Episode S1" } },
         }});
         let eps = super::episode_info(&v);
@@ -807,6 +842,29 @@ mod tests {
         assert_eq!(eps["2"].aired.as_deref(), Some(""));
         // and the same for seasons: None from before them, 0 for an episode without one
         assert_eq!((eps["1"].season, eps["2"].season), (Some(1), Some(0)));
+        // and for AniDB ratings: tenths (0 when missing or invalid), hidden until watched
+        assert_eq!(
+            [
+                eps["1"].rating,
+                eps["2"].rating,
+                eps["3"].rating,
+                eps["4"].rating,
+                eps["5"].rating,
+                eps["S1"].rating,
+            ],
+            [Some(86), Some(100), Some(70), Some(0), Some(0), Some(0)]
+        );
+        assert_eq!(eps["1"].rated(true), Some(86));
+        assert_eq!(eps["1"].rated(false), None);
+        assert_eq!(eps["4"].rated(true), None);
+        assert_eq!(super::rating_text(86), "8.6");
+        assert_eq!(super::rating_text(100), "10.0");
+        assert_eq!(super::rating_text(70), "7.0");
+        // an older disk cache without rating deserializes as None so it refetches
+        let old: super::EpInfo =
+            serde_json::from_str(r#"{"title":"Old","about":"","aired":"","season":1}"#).unwrap();
+        assert_eq!(old.rating, None);
+        assert_eq!(old.rated(true), None);
         assert_eq!(
             (eps["S1"].title.as_str(), eps["S1"].about.as_str()),
             ("", "")
